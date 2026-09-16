@@ -95,14 +95,17 @@ import { MemoryGraph } from "./memory-graph";      // WRONG — breaks at runtim
 
 ```
 src/
+  index.ts   # public entry — re-exports the model
   model/     # M0 data model: types, identifiers, state machine, store
   engine/    # M1 constraint expression engine (planned)
   store/     # persistence adapters — SQLite default, graph DB later (planned)
   mcp/       # MCP server exposing the graph to agents (planned)
 test/
-  unit/      # per-module logic tests (node:test)
-  contract/  # schema.json <-> types.ts consistency tests (Ajv)
-docs/        # specs, conventions, design notes
+  model.test.ts     # per-module unit tests (node:test)
+  contract.test.ts  # schema.json <-> types.ts consistency tests (Ajv)
+docs/
+  notes/    # per-milestone technical notes + type reference (one file per M)
+  # specs, conventions, design notes
 ```
 
 New modules go under the matching `src/` subdir; their tests go under the
@@ -137,8 +140,13 @@ matching `test/` subdir.
     `explicit-module-boundary-types` scoped to exports): `error`
   - `@typescript-eslint/no-floating-promises`: `error`
   - `no-unused-vars`: `error`
-- Config files (`eslint.config.mjs`, `.prettierrc`) are added when the
-  tooling is installed. Until then, this document is the manual standard.
+- Config files (`eslint.config.mjs`, `.prettierrc`) live at the repo root and
+  are committed. Run `npm run lint` / `npm run format`.
+- Relaxations under `test/**` (configured in `eslint.config.mjs`):
+  `no-explicit-any` and `no-floating-promises` are `off` there — the former
+  because tests cast past the type system to exercise runtime validation (never
+  ships); the latter because node:test registrations return promises that are
+  intentionally not awaited (framework design, not a missing `await`).
 
 ## 12. Locked Decisions (this session)
 

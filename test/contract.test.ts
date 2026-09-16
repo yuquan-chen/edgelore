@@ -15,7 +15,13 @@ import { fileURLToPath } from "node:url";
 import AjvDefault from "ajv";
 import addFormatsDefault from "ajv-formats";
 
-import { MemoryGraph, SCHEMA_VERSION, type GraphNode, type Constraint, type GraphEdge } from "../src/model/index.js";
+import {
+  MemoryGraph,
+  SCHEMA_VERSION,
+  type GraphNode,
+  type Constraint,
+  type GraphEdge,
+} from "../src/model/index.js";
 
 // ajv is a CJS package; under `module: NodeNext` the default import resolves to
 // the module namespace, so we cast it to the constructor we actually need.
@@ -44,7 +50,8 @@ addFormats(ajv);
 const base: Record<string, unknown> = { ...schema };
 delete base.$id;
 delete base.version; // non-standard keyword; not needed for validation
-const wrap = (def: string): ValidateFn => ajv.compile({ ...base, $ref: `#/definitions/${def}` } as object);
+const wrap = (def: string): ValidateFn =>
+  ajv.compile({ ...base, $ref: `#/definitions/${def}` } as object);
 const validateNode = wrap("node");
 const validateEdge = wrap("edge");
 const validateConstraint = wrap("constraint");
@@ -59,8 +66,19 @@ test("contract: schema version matches SCHEMA_VERSION", () => {
 test("contract: objects produced by the real store validate against schema", () => {
   const g = new MemoryGraph();
 
-  const dim = g.addNode({ type: "core:dimension", created_by: HUMAN, key: "design_cost", project_id: "P1" });
-  const stmt = g.addNode({ type: "core:statement", created_by: HUMAN, dimension_id: dim.id, value: 5000, unit: "CNY" });
+  const dim = g.addNode({
+    type: "core:dimension",
+    created_by: HUMAN,
+    key: "design_cost",
+    project_id: "P1",
+  });
+  const stmt = g.addNode({
+    type: "core:statement",
+    created_by: HUMAN,
+    dimension_id: dim.id,
+    value: 5000,
+    unit: "CNY",
+  });
   const proj = g.addNode({ type: "core:project", created_by: AGENT });
   const edge = g.addEdge({ type: "core:belongs_to", from: dim.id, to: proj.id, created_by: AGENT });
   const c = g.addConstraint({
@@ -70,17 +88,30 @@ test("contract: objects produced by the real store validate against schema", () 
   });
 
   assert.ok(validateNode(dim), `dimension should validate: ${ajv.errorsText(validateNode.errors)}`);
-  assert.ok(validateNode(stmt), `statement should validate: ${ajv.errorsText(validateNode.errors)}`);
+  assert.ok(
+    validateNode(stmt),
+    `statement should validate: ${ajv.errorsText(validateNode.errors)}`,
+  );
   assert.ok(validateEdge(edge), `edge should validate: ${ajv.errorsText(validateEdge.errors)}`);
-  assert.ok(validateConstraint(c), `constraint should validate: ${ajv.errorsText(validateConstraint.errors)}`);
+  assert.ok(
+    validateConstraint(c),
+    `constraint should validate: ${ajv.errorsText(validateConstraint.errors)}`,
+  );
 });
 
 test("contract: a constraint activated by a human still validates", () => {
   const g = new MemoryGraph();
-  const c = g.addConstraint({ participants: ["node:core:dimension:x"], bindings: { x1: "node:core:dimension:x" }, created_by: AGENT });
+  const c = g.addConstraint({
+    participants: ["node:core:dimension:x"],
+    bindings: { x1: "node:core:dimension:x" },
+    created_by: AGENT,
+  });
   g.transitionConstraintState(c.id, "active", { approved_by: HUMAN });
   const active = g.getConstraint(c.id)!;
-  assert.ok(validateConstraint(active), `active constraint should validate: ${ajv.errorsText(validateConstraint.errors)}`);
+  assert.ok(
+    validateConstraint(active),
+    `active constraint should validate: ${ajv.errorsText(validateConstraint.errors)}`,
+  );
 });
 
 test("contract: invalid objects are rejected by the schema", () => {

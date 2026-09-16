@@ -146,12 +146,24 @@ export class MemoryGraph {
     switch (input.type) {
       case "core:dimension":
         if (!input.key) throw new ModelError("core:dimension requires `key`");
-        node = { ...base, type: "core:dimension", key: input.key, project_id: input.project_id, phase_id: input.phase_id };
+        node = {
+          ...base,
+          type: "core:dimension",
+          key: input.key,
+          project_id: input.project_id,
+          phase_id: input.phase_id,
+        };
         break;
       case "core:statement":
         if (!input.dimension_id) throw new ModelError("core:statement requires `dimension_id`");
         if (input.value === undefined) throw new ModelError("core:statement requires `value`");
-        node = { ...base, type: "core:statement", dimension_id: input.dimension_id, value: input.value, unit: input.unit };
+        node = {
+          ...base,
+          type: "core:statement",
+          dimension_id: input.dimension_id,
+          value: input.value,
+          unit: input.unit,
+        };
         break;
       default:
         node = base;
@@ -186,8 +198,10 @@ export class MemoryGraph {
     assertValidCreatedBy(input.created_by);
     assertValidId(input.from, "edge.from");
     assertValidId(input.to, "edge.to");
-    if (!this.nodes.has(input.from)) throw new ModelError(`edge.from references unknown node: ${input.from}`);
-    if (!this.nodes.has(input.to)) throw new ModelError(`edge.to references unknown node: ${input.to}`);
+    if (!this.nodes.has(input.from))
+      throw new ModelError(`edge.from references unknown node: ${input.from}`);
+    if (!this.nodes.has(input.to))
+      throw new ModelError(`edge.to references unknown node: ${input.to}`);
 
     const edge: GraphEdge = {
       id: edgeId(),
@@ -223,10 +237,11 @@ export class MemoryGraph {
 
     // Q01 governance: a constraint may only be created `active` if a human
     // already approved it. No silent self-activation by an agent.
-    let approved_by: string | null = input.approved_by ?? null;
+    const approved_by: string | null = input.approved_by ?? null;
     let approved_at: string | null = null;
     if (activation_state === "active") {
-      if (!approved_by) throw new ModelError("Q01: a constraint cannot go `active` without approved_by");
+      if (!approved_by)
+        throw new ModelError("Q01: a constraint cannot go `active` without approved_by");
       if (!validateCreatedBy(approved_by).ok || !approved_by.startsWith("human:")) {
         throw new ModelError("Q01: approved_by must be a human:<id>");
       }
@@ -266,7 +281,11 @@ export class MemoryGraph {
    * Transition a constraint's activation state. Going to `active` requires a
    * human approver (Q01 governance point) the first time.
    */
-  transitionConstraintState(id: string, to: ConstraintState, opts?: { approved_by?: string }): Constraint {
+  transitionConstraintState(
+    id: string,
+    to: ConstraintState,
+    opts?: { approved_by?: string },
+  ): Constraint {
     const c = this.constraints.get(id);
     if (!c) throw new ModelError(`constraint not found: ${id}`);
     if (!canTransitionConstraint(c.activation_state, to)) {
@@ -276,7 +295,8 @@ export class MemoryGraph {
     }
     if (to === "active" && !c.approved_by) {
       const approver = opts?.approved_by;
-      if (!approver) throw new ModelError("Q01: activating a constraint requires approved_by (a human:<id>)");
+      if (!approver)
+        throw new ModelError("Q01: activating a constraint requires approved_by (a human:<id>)");
       if (!validateCreatedBy(approver).ok || !approver.startsWith("human:")) {
         throw new ModelError("Q01: approved_by must be a human:<id>");
       }

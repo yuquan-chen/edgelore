@@ -37,14 +37,25 @@ test("M0: open-world type accepted (codex:task), defaults applied", () => {
 test("M0: core:dimension requires `key`; core:statement requires dimension_id + value", () => {
   const g = new MemoryGraph();
   assert.throws(() => g.addNode({ type: "core:dimension", created_by: AGENT }), ModelError);
-  const dim = g.addNode({ type: "core:dimension", created_by: AGENT, key: "design_cost", project_id: "P1" });
+  const dim = g.addNode({
+    type: "core:dimension",
+    created_by: AGENT,
+    key: "design_cost",
+    project_id: "P1",
+  });
   assert.ok(dim.id);
 
   assert.throws(
     () => g.addNode({ type: "core:statement", created_by: AGENT, dimension_id: dim.id } as any),
     ModelError,
   );
-  const stmt = g.addNode({ type: "core:statement", created_by: HUMAN, dimension_id: dim.id, value: 5000, unit: "CNY" });
+  const stmt = g.addNode({
+    type: "core:statement",
+    created_by: HUMAN,
+    dimension_id: dim.id,
+    value: 5000,
+    unit: "CNY",
+  });
   assert.equal((stmt as any).value, 5000);
 });
 
@@ -95,7 +106,10 @@ test("M0: Q01 — constraint cannot go active without a human approver", () => {
     created_by: AGENT,
   });
   assert.equal(c.activation_state, "proposed");
-  assert.throws(() => g.transitionConstraintState(c.id, "active", { approved_by: AGENT }), ModelError);
+  assert.throws(
+    () => g.transitionConstraintState(c.id, "active", { approved_by: AGENT }),
+    ModelError,
+  );
 
   // activated by a human -> ok
   g.transitionConstraintState(c.id, "active", { approved_by: HUMAN });
@@ -109,7 +123,11 @@ test("M0: constraint participants are N-ary (the honest hyperedge)", () => {
   const g = new MemoryGraph();
   const c = g.addConstraint({
     participants: ["node:core:dimension:a", "node:core:dimension:b", "node:core:dimension:c"],
-    bindings: { x1: "node:core:dimension:a", x2: "node:core:dimension:b", x3: "node:core:dimension:c" },
+    bindings: {
+      x1: "node:core:dimension:a",
+      x2: "node:core:dimension:b",
+      x3: "node:core:dimension:c",
+    },
     created_by: AGENT,
   });
   assert.equal(c.participants.length, 3);
@@ -132,7 +150,13 @@ test("M0: edge requires existing endpoints", () => {
   const e = g.addEdge({ type: "core:belongs_to", from: a.id, to: b.id, created_by: AGENT });
   assert.ok(e.id.startsWith("edge:"));
   assert.throws(
-    () => g.addEdge({ type: "core:belongs_to", from: "node:core:actor:ghost", to: b.id, created_by: AGENT }),
+    () =>
+      g.addEdge({
+        type: "core:belongs_to",
+        from: "node:core:actor:ghost",
+        to: b.id,
+        created_by: AGENT,
+      }),
     ModelError,
   );
 });

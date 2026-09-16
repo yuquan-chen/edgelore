@@ -1,0 +1,130 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/yuquan-chen/edgelore/schema.json",
+  "title": "edgelore shared memory graph — M0 data model",
+  "description": "Open contract for the edgelore shared memory graph (M0: data model & state machine). Keep in sync with src/model/types.ts. See docs/shared-memory-m0-spec.md.",
+  "version": "m0.1",
+  "definitions": {
+    "namespacedType": {
+      "type": "string",
+      "pattern": "^[\\w.-]+:[\\w.-]+$",
+      "description": "Open-world type: <scope>:<name> (e.g. core:actor, codex:task). Not a closed enum."
+    },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "project_id": { "type": "string" },
+        "phase_id": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["created_by", "created_at", "schema_version", "source_refs"],
+      "properties": {
+        "created_by": {
+          "type": "string",
+          "pattern": "^(agent|human):[\\w.-]+(:[\\w.-]+)?$",
+          "description": "agent:<name>:<id> or human:<id>"
+        },
+        "created_at": { "type": "string", "format": "date-time" },
+        "schema_version": { "type": "string" },
+        "source_refs": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "factNodeState": {
+      "type": "string",
+      "enum": ["tentative", "accepted", "conflict", "superseded", "rejected"]
+    },
+    "constraintState": {
+      "type": "string",
+      "enum": ["proposed", "active", "retired", "deprecated"]
+    },
+    "node": {
+      "allOf": [
+        { "$ref": "#/definitions/provenance" },
+        {
+          "type": "object",
+          "required": ["id", "type", "state", "attributes", "tags", "updated_at"],
+          "properties": {
+            "id": { "type": "string", "pattern": "^node:[\\w.-]+:[\\w.-]+:[\\w.-]+$" },
+            "type": { "$ref": "#/definitions/namespacedType" },
+            "updated_at": { "type": "string", "format": "date-time" },
+            "scope": { "$ref": "#/definitions/scope" },
+            "state": { "$ref": "#/definitions/factNodeState" },
+            "attributes": { "type": "object" },
+            "tags": { "type": "array", "items": { "type": "string" } },
+            "key": { "type": "string", "description": "required for core:dimension" },
+            "project_id": { "type": "string" },
+            "phase_id": { "type": "string" },
+            "dimension_id": { "type": "string", "description": "required for core:statement" },
+            "value": {},
+            "unit": { "type": "string" }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "edge": {
+      "allOf": [
+        { "$ref": "#/definitions/provenance" },
+        {
+          "type": "object",
+          "required": ["id", "type", "from", "to", "attributes", "tags"],
+          "properties": {
+            "id": { "type": "string", "pattern": "^edge:[\\w.-]+$" },
+            "type": { "$ref": "#/definitions/namespacedType" },
+            "from": { "type": "string" },
+            "to": { "type": "string" },
+            "scope": { "$ref": "#/definitions/scope" },
+            "attributes": { "type": "object" },
+            "tags": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "constraint": {
+      "allOf": [
+        { "$ref": "#/definitions/provenance" },
+        {
+          "type": "object",
+          "required": [
+            "id", "kind", "revision_id", "participants", "bindings",
+            "activation_state", "approved_by", "approved_at", "attributes", "tags"
+          ],
+          "properties": {
+            "id": { "type": "string", "pattern": "^constraint:[\\w.-]+$" },
+            "kind": { "$ref": "#/definitions/namespacedType" },
+            "revision_id": { "type": "string", "pattern": "^constraint-revision:[0-9]+$" },
+            "name": { "type": "string" },
+            "scope": { "$ref": "#/definitions/scope" },
+            "participants": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "pattern": "^node:[\\w.-]+:[\\w.-]+:[\\w.-]+$" }
+            },
+            "bindings": { "type": "object", "additionalProperties": { "type": "string" } },
+            "parameter_types": { "type": "object", "additionalProperties": { "type": "string" } },
+            "expression": { "type": "object" },
+            "activation_state": { "$ref": "#/definitions/constraintState" },
+            "approved_by": { "type": ["string", "null"] },
+            "approved_at": { "type": ["string", "null"], "format": "date-time" },
+            "retired_at": { "type": ["string", "null"], "format": "date-time" },
+            "attributes": { "type": "object" },
+            "tags": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": true
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "properties": {
+    "nodes": { "type": "array", "items": { "$ref": "#/definitions/node" } },
+    "edges": { "type": "array", "items": { "$ref": "#/definitions/edge" } },
+    "constraints": { "type": "array", "items": { "$ref": "#/definitions/constraint" } }
+  },
+  "additionalProperties": true
+}

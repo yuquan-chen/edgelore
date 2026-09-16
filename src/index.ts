@@ -1,5 +1,10 @@
 // edgelore — shared memory graph for AI agents.
-// See docs/ for the design spec (M0 data model & state machine is frozen).
+//
+// M0 is frozen: this package exposes the data model (types), the identifier /
+// namespace validators, the state machines, and an in-memory reference store.
+// See docs/shared-memory-m0-spec.md and schema.json for the contract.
+
+export * from "./model/index.js";
 
 export const name = "edgelore";
 export const version = "0.0.1";

@@ -1,0 +1,14 @@
+{
+  "name": "edgelore",
+  "version": "0.0.1",
+  "description": "Shared memory graph for AI agents with multi-constraint checking",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test"
+  }
+}

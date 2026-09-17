@@ -119,9 +119,12 @@ function assertValidId(id: string, label = "id"): void {
 }
 
 export class MemoryGraph {
-  private nodes = new Map<string, GraphNode>();
-  private edges = new Map<string, GraphEdge>();
-  private constraints = new Map<string, Constraint>();
+  // `protected` (not `private`) so the M2 durable backend (SqliteGraph) can
+  // extend this reference implementation: it loads persisted rows into these
+  // maps and writes through on every mutation. See src/store/sqlite.ts.
+  protected nodes = new Map<string, GraphNode>();
+  protected edges = new Map<string, GraphEdge>();
+  protected constraints = new Map<string, Constraint>();
 
   // ---------------------------------------------------------------- nodes
 

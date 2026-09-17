@@ -5,6 +5,7 @@
 // See docs/shared-memory-m0-spec.md and schema.json for the contract.
 
 export * from "./model/index.js";
+export * from "./store/sqlite.js";
 
 export const name = "edgelore";
 export const version = "0.0.1";

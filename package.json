@@ -4,6 +4,9 @@
   "description": "Shared memory graph for AI agents with multi-constraint checking",
   "license": "MIT",
   "type": "module",
+  "bin": {
+    "edgelore": "dist/src/cli.js"
+  },
   "engines": {
     "node": ">=22"
   },

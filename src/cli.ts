@@ -8,8 +8,11 @@
 //
 // Usage: edgelore [--db path.db] <command>  (see docs/shared-memory-m2-spec.md)
 
+import { readFileSync } from "node:fs";
 import { SqliteGraph } from "./store/sqlite.js";
 import { capture, type CaptureContent, type CaptureContext } from "./agent/capture.js";
+import { OpenAiCompatDriver } from "./agent/openai-compat-driver.js";
+import { processTurn } from "./agent/runtime.js";
 import type { AddConstraintInput, AddEdgeInput, AddNodeInput } from "./model/store.js";
 import type { ExpressionNode } from "./model/types.js";
 
@@ -67,14 +70,33 @@ function emit(value: unknown): void {
   process.stdout.write(JSON.stringify(value) + "\n");
 }
 
-function main(): void {
+/**
+ * Load a `.env`-style file into process.env, WITHOUT overriding variables
+ * already set in the real environment. Missing file is silently ignored.
+ * Keeps API keys out of shell history and out of git (.env* is gitignored).
+ */
+function loadDotEnv(path: string): void {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return;
+  }
+  for (const line of raw.split(/\r?\n/)) {
+    if (line.trim().startsWith("#")) continue;
+    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
+  }
+}
+
+async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const flags = parseFlags(argv);
   const pos = positionals(argv);
   const dbPath = flags.get("db") ?? "./edgelore.db";
 
   const [entity, action, target] = pos;
-  if (!entity) throw new Error("missing command (node|edge|constraint|evaluate|get)");
+  if (!entity) throw new Error("missing command (node|edge|constraint|evaluate|get|capture|remember)");
 
   const g = new SqliteGraph(dbPath);
   try {
@@ -184,17 +206,44 @@ function main(): void {
         break;
       }
 
+      case "remember": {
+        // The full memory pipeline entry point: human language in, graph
+        // mutations out. provenance comes from --created-by (runtime-read,
+        // never LLM-authored); the LLM key/model come from env / .env.local.
+        const text = pos
+          .slice(1)
+          .join(" ")
+          .trim();
+        if (!text) {
+          throw new Error(
+            'usage: remember "text" --created-by human:x [--model m] [--base-url u] [--api-key k]',
+          );
+        }
+        loadDotEnv(".env.local");
+        const driver = OpenAiCompatDriver.fromEnv(process.env, {
+          ...(flags.has("api-key") ? { apiKey: flags.get("api-key") } : {}),
+          ...(flags.has("base-url") ? { baseUrl: flags.get("base-url") } : {}),
+          ...(flags.has("model") ? { model: flags.get("model") } : {}),
+        });
+        const context: CaptureContext = {
+          created_by: req(flags, "created-by"),
+          source_refs: flags.has("source-refs")
+            ? (parseJson(req(flags, "source-refs"), false) as string[])
+            : [],
+        };
+        emit(await processTurn(g, text, driver, context));
+        break;
+      }
+
       default:
-        throw new Error(`unknown command: ${entity} (node|edge|constraint|evaluate|get)`);
+        throw new Error(`unknown command: ${entity} (node|edge|constraint|evaluate|get|capture|remember)`);
     }
   } finally {
     g.close();
   }
 }
 
-try {
-  main();
-} catch (err) {
+main().catch((err: unknown) => {
   process.stderr.write(JSON.stringify({ error: (err as Error).message }) + "\n");
   process.exit(1);
-}
+});

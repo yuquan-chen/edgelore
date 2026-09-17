@@ -37,7 +37,9 @@ import {
   type GraphNode,
   type NamespacedType,
   type Scope,
+  type StatementNode,
 } from "./types.js";
+import { evaluate, type EvalContext, type EvaluationResult } from "../engine/evaluate.js";
 
 /** Thrown on any model-level validation failure. */
 export class ModelError extends Error {
@@ -275,6 +277,44 @@ export class MemoryGraph {
 
   getConstraint(id: string): Constraint | undefined {
     return this.constraints.get(id);
+  }
+
+  /**
+   * Evaluate a constraint's rule body against the live graph (M1).
+   *
+   * The store resolves each binding name to the numeric values of every
+   * `core:statement` node attached to that binding's dimension, then delegates
+   * to the whitelisted engine. A binding that is not declared yields `error`;
+   * a dimension with no numeric statements yields `indeterminate` (data not
+   * yet supplied). Statement state filtering is intentionally out of M1 scope
+   * and is noted as a future refinement in the M1 spec.
+   *
+   * @param id the constraint id
+   * @returns one of the four evaluation states
+   */
+  evaluateConstraint(id: string): EvaluationResult {
+    const c = this.constraints.get(id);
+    if (!c) throw new ModelError(`constraint not found: ${id}`);
+    if (!c.expression) return "error"; // no rule body to evaluate
+
+    const ctx: EvalContext = {
+      resolveRef: (name: string): number[] | null => {
+        const dimId = c.bindings[name];
+        if (!dimId) return null; // undeclared binding
+        const values: number[] = [];
+        for (const n of this.nodes.values()) {
+          if (n.type === "core:statement") {
+            const stmt = n as StatementNode;
+            if (stmt.dimension_id === dimId) {
+              const v = stmt.value;
+              if (typeof v === "number") values.push(v);
+            }
+          }
+        }
+        return values; // [] => indeterminate upstream
+      },
+    };
+    return evaluate(c.expression, ctx);
   }
 
   /**

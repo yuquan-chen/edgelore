@@ -83,6 +83,15 @@ export interface BaseNode extends Provenance {
   attributes: Record<string, unknown>;
   /** Open labels — the other extension point. */
   tags: string[];
+  /**
+   * Cardinality — how many accepted statements a dimension may hold.
+   * Carried on every node for model flatness (everything is a Node, no
+   * special-cased type); only `core:dimension` actually uses it.
+   *   - "single": at most one accepted value (a new conflicting value is
+   *     flagged, never silently overwritten)
+   *   - "multi" | undefined: many accepted values allowed (default)
+   */
+  cardinality?: "single" | "multi";
 }
 
 export interface ActorNode extends BaseNode {

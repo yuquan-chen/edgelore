@@ -68,6 +68,7 @@ export interface AddNodeInput {
   dimension_id?: string;
   value?: unknown;
   unit?: string;
+  cardinality?: "single" | "multi";
 }
 
 export interface AddEdgeInput {
@@ -118,7 +119,26 @@ function assertValidId(id: string, label = "id"): void {
   if (!r.ok) throw new ModelError(`${label}: ${r.reason!}`);
 }
 
-export class MemoryGraph {
+/**
+ * Minimal store surface required by the M3 capture primitive (and any future
+ * agent-facing writer). Both `MemoryGraph` (in-memory) and `SqliteGraph`
+ * (durable) satisfy it, so `capture` is backend-agnostic.
+ */
+export interface GraphQueryFilter {
+  type?: NamespacedType;
+  state?: FactNodeState;
+  project_id?: string;
+  phase_id?: string;
+}
+
+export interface GraphStore {
+  addNode(input: AddNodeInput): GraphNode;
+  getNode(id: string): GraphNode | undefined;
+  queryNodes(filter: GraphQueryFilter): GraphNode[];
+  transitionNodeState(id: string, to: FactNodeState): GraphNode;
+}
+
+export class MemoryGraph implements GraphStore {
   // `protected` (not `private`) so the M2 durable backend (SqliteGraph) can
   // extend this reference implementation: it loads persisted rows into these
   // maps and writes through on every mutation. See src/store/sqlite.ts.
@@ -155,6 +175,7 @@ export class MemoryGraph {
           ...base,
           type: "core:dimension",
           key: input.key,
+          cardinality: input.cardinality,
           project_id: input.project_id,
           phase_id: input.phase_id,
         };
@@ -354,12 +375,7 @@ export class MemoryGraph {
   // --------------------------------------------------------------- queries
 
   /** Simple filter over nodes. Pass `undefined` for a field to ignore it. */
-  queryNodes(filter: {
-    type?: NamespacedType;
-    state?: FactNodeState;
-    project_id?: string;
-    phase_id?: string;
-  }): GraphNode[] {
+  queryNodes(filter: GraphQueryFilter): GraphNode[] {
     const out: GraphNode[] = [];
     for (const n of this.nodes.values()) {
       if (filter.type && n.type !== filter.type) continue;

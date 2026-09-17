@@ -9,6 +9,7 @@
 // Usage: edgelore [--db path.db] <command>  (see docs/shared-memory-m2-spec.md)
 
 import { SqliteGraph } from "./store/sqlite.js";
+import { capture, type CaptureContent, type CaptureContext } from "./agent/capture.js";
 import type { AddConstraintInput, AddEdgeInput, AddNodeInput } from "./model/store.js";
 import type { ExpressionNode } from "./model/types.js";
 
@@ -163,6 +164,23 @@ function main(): void {
         const found = g.getNode(action) ?? g.getEdge(action) ?? g.getConstraint(action);
         if (!found) throw new Error(`not found: ${action}`);
         emit(found);
+        break;
+      }
+
+      case "capture": {
+        // The storage-layer entry point: Agent Memory already produced the
+        // structured JSON (CaptureContent); the runtime supplies provenance.
+        const content = parseJson(req(flags, "content"), false) as CaptureContent;
+        if (typeof content?.dimensionKey !== "string" || !("value" in content)) {
+          throw new Error("capture requires --content with {dimensionKey, value}");
+        }
+        const context: CaptureContext = {
+          created_by: req(flags, "created-by"),
+          source_refs: flags.has("source-refs")
+            ? (parseJson(req(flags, "source-refs"), false) as string[])
+            : [],
+        };
+        emit(capture(g, content, context));
         break;
       }
 

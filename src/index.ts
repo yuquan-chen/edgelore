@@ -6,6 +6,7 @@
 
 export * from "./model/index.js";
 export * from "./store/sqlite.js";
+export * from "./agent/capture.js";
 
 export const name = "edgelore";
 export const version = "0.0.1";

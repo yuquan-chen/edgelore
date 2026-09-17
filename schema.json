@@ -55,6 +55,11 @@
             "state": { "$ref": "#/definitions/factNodeState" },
             "attributes": { "type": "object" },
             "tags": { "type": "array", "items": { "type": "string" } },
+            "cardinality": {
+              "type": "string",
+              "enum": ["single", "multi"],
+              "description": "Max accepted statements a dimension may hold. Only meaningful for core:dimension; optional, defaults to multi."
+            },
             "key": { "type": "string", "description": "required for core:dimension" },
             "project_id": { "type": "string" },
             "phase_id": { "type": "string" },
@@ -91,8 +96,16 @@
         {
           "type": "object",
           "required": [
-            "id", "kind", "revision_id", "participants", "bindings",
-            "activation_state", "approved_by", "approved_at", "attributes", "tags"
+            "id",
+            "kind",
+            "revision_id",
+            "participants",
+            "bindings",
+            "activation_state",
+            "approved_by",
+            "approved_at",
+            "attributes",
+            "tags"
           ],
           "properties": {
             "id": { "type": "string", "pattern": "^constraint:[\\w.-]+$" },

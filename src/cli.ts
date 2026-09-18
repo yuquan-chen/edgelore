@@ -15,6 +15,7 @@ import { OpenAiCompatDriver } from "./agent/openai-compat-driver.js";
 import { OpenAiCompatEmbeddingDriver } from "./agent/embedding-driver.js";
 import { processTurn, type RetrievalConfig } from "./agent/runtime.js";
 import { expandHit, retrieveRelevant, SqliteVectorStore, type RetrievalMode } from "./agent/retrieval.js";
+import { autoResolveConstraintGuided, listConflicts, resolveConflict } from "./agent/conflicts.js";
 import type { AddConstraintInput, AddEdgeInput, AddNodeInput } from "./model/store.js";
 import type { ExpressionNode } from "./model/types.js";
 
@@ -112,7 +113,9 @@ async function main(): Promise<void> {
 
   const [entity, action, target] = pos;
   if (!entity) {
-    throw new Error("missing command (node|edge|constraint|evaluate|get|capture|remember|search)");
+    throw new Error(
+      "missing command (node|edge|constraint|evaluate|get|capture|remember|search|conflicts|resolve|autoresolve)",
+    );
   }
 
   const g = new SqliteGraph(dbPath);
@@ -278,9 +281,39 @@ async function main(): Promise<void> {
         break;
       }
 
+      case "conflicts": {
+        // The docket: every conflicted dimension with its facing statements.
+        emit(listConflicts(g));
+        break;
+      }
+
+      case "resolve": {
+        // Human adjudication: winner accepted, losers superseded (audit via
+        // core:supersedes edges attributed to the human resolver).
+        if (!action || !target) {
+          throw new Error("usage: resolve <dimension-id> <winner-statement-id> --by human:x [--note t]");
+        }
+        emit(
+          resolveConflict(g, action, target, {
+            resolvedBy: req(flags, "by"),
+            note: flags.get("note"),
+          }),
+        );
+        break;
+      }
+
+      case "autoresolve": {
+        // Constraint-guided auto resolution: the M1 engine referees. Only
+        // fires when a rule unambiguously separates the candidates; else it
+        // escalates (status: "escalated") and the conflict stays pending.
+        if (!action) throw new Error("usage: autoresolve <dimension-id>");
+        emit(autoResolveConstraintGuided(g, action));
+        break;
+      }
+
       default:
         throw new Error(
-          `unknown command: ${entity} (node|edge|constraint|evaluate|get|capture|remember|search)`,
+          `unknown command: ${entity} (node|edge|constraint|evaluate|get|capture|remember|search|conflicts|resolve|autoresolve)`,
         );
     }
   } finally {

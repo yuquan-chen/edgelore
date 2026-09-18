@@ -16,8 +16,10 @@ import { OpenAiCompatEmbeddingDriver } from "./agent/embedding-driver.js";
 import { processTurn, type RetrievalConfig } from "./agent/runtime.js";
 import { expandHit, retrieveRelevant, SqliteVectorStore, type RetrievalMode } from "./agent/retrieval.js";
 import { autoResolveConstraintGuided, listConflicts, resolveConflict } from "./agent/conflicts.js";
+import { startMcpServer } from "./mcp/server.js";
+import { answerQuestion } from "./agent/ask.js";
 import type { AddConstraintInput, AddEdgeInput, AddNodeInput } from "./model/store.js";
-import type { ExpressionNode } from "./model/types.js";
+import type { DimensionNode, ExpressionNode, StatementNode } from "./model/types.js";
 
 /** Parse `--key value` pairs (value-less flags become "true"). */
 function parseFlags(args: string[]): Map<string, string> {
@@ -114,7 +116,7 @@ async function main(): Promise<void> {
   const [entity, action, target] = pos;
   if (!entity) {
     throw new Error(
-      "missing command (node|edge|constraint|evaluate|get|capture|remember|search|conflicts|resolve|autoresolve)",
+      "missing command (node|edge|constraint|evaluate|get|capture|remember|search|ask|conflicts|resolve|autoresolve|digest|mcp)",
     );
   }
 
@@ -311,9 +313,88 @@ async function main(): Promise<void> {
         break;
       }
 
+      case "ask": {
+        // The answering layer: grounded in retrieved memories, abstains when
+        // they are insufficient (never invents from outside knowledge).
+        const question = pos
+          .slice(1)
+          .join(" ")
+          .trim();
+        if (!question) throw new Error('usage: ask "question" [--db path] [--k n]');
+        loadDotEnv(".env.local");
+        const driver = OpenAiCompatDriver.fromEnv(process.env);
+        const retrieval = retrievalFromEnv(g, flags);
+        emit(
+          await answerQuestion(g, question, driver, {
+            retrieval,
+            k: flags.has("k") ? Number(flags.get("k")) : undefined,
+          }),
+        );
+        break;
+      }
+
+      case "digest": {
+        // Channel B (progressive disclosure): a compact markdown summary of
+        // accepted memories, active rules, and pending conflicts — meant to
+        // be imported from CLAUDE.md / AGENTS.md via `@file`. Raw markdown
+        // output (documented exception to the JSON-only convention).
+        const lines: string[] = ["# edgelore memory digest", ""];
+        const dims = g.queryNodes({ type: "core:dimension" }) as DimensionNode[];
+        const stmts = g.queryNodes({ type: "core:statement" }) as StatementNode[];
+        for (const d of dims) {
+          const mine = stmts.filter((s) => s.dimension_id === d.id);
+          const accepted = mine.filter((s) => s.state === "accepted");
+          const flagged = mine.filter((s) => s.state !== "accepted");
+          const desc = typeof d.attributes?.description === "string" ? d.attributes.description : d.key;
+          if (accepted.length > 0) {
+            const vals = accepted
+              .map((s) => `${JSON.stringify(s.value)}${s.unit ? ` ${s.unit}` : ""}`)
+              .join("; ");
+            lines.push(`- **${d.key}**（${desc}）: ${vals}`);
+          }
+          const pendingJ = flagged.filter((s) => s.state === "tentative" || s.state === "conflict");
+          const retired = flagged.filter((s) => s.state === "superseded" || s.state === "rejected");
+          if (pendingJ.length > 0) {
+            lines.push(
+              `  - ⚠ 待裁决: ${pendingJ.map((s) => `${JSON.stringify(s.value)}[${s.state}]`).join(", ")}`,
+            );
+          }
+          if (retired.length > 0) {
+            lines.push(
+              `  - 📜 历史: ${retired.map((s) => `${JSON.stringify(s.value)}[${s.state}]`).join(", ")}`,
+            );
+          }
+        }
+        for (const c of g.getAllConstraints()) {
+          if (c.activation_state === "active") {
+            lines.push(`- 规则 **${c.name ?? c.id}**: ${g.evaluateConstraint(c.id)}`);
+          }
+        }
+        const pending = listConflicts(g);
+        if (pending.length > 0) {
+          lines.push(`- ⚠ ${pending.length} 个维度存在待裁决冲突（edgelore conflicts 查看）`);
+        }
+        process.stdout.write(lines.join("\n") + "\n");
+        break;
+      }
+
+      case "mcp": {
+        // Channel A infra: stdio MCP server (Claude Code / Codex / any MCP host).
+        loadDotEnv(".env.local");
+        const chatDriver = process.env.EDGELORE_MODEL
+          ? OpenAiCompatDriver.fromEnv(process.env)
+          : undefined; // memory_remember reports the missing config when called
+        await startMcpServer(g, {
+          createdBy: flags.get("created-by") ?? "human:local",
+          chatDriver,
+          retrieval: retrievalFromEnv(g, flags),
+        });
+        break;
+      }
+
       default:
         throw new Error(
-          `unknown command: ${entity} (node|edge|constraint|evaluate|get|capture|remember|search|conflicts|resolve|autoresolve)`,
+          `unknown command: ${entity} (node|edge|constraint|evaluate|get|capture|remember|search|ask|conflicts|resolve|autoresolve|digest|mcp)`,
         );
     }
   } finally {

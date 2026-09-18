@@ -80,3 +80,10 @@ test("mockDriver: exhausted queue throws AgentError", async () => {
   await assert.rejects(driver.complete("second"), AgentError);
   assert.equal(driver.remaining, 0);
 });
+
+test("gate: oversized input fails loud with guidance (turn-scoped boundary)", async () => {
+  const driver = new MockDriver([]); // must NOT be called
+  const huge = "很长的文档".repeat(10_000); // > MAX_TURN_CHARS
+  await assert.rejects(runGate(huge, driver), /turn-scoped/);
+  assert.equal(driver.remaining, 0); // no model call wasted on garbage input
+});

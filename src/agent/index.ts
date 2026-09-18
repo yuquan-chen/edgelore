@@ -17,3 +17,4 @@ export * from "./embedding-driver.js";
 export * from "./http.js";
 export * from "./retrieval.js";
 export * from "./conflicts.js";
+export * from "./ask.js";

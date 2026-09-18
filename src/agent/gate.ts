@@ -26,6 +26,14 @@ export interface GateOptions {
 }
 
 /**
+ * Turn-size guard. The pipeline is TURN-scoped (a sentence / exchange), not a
+ * document store: oversized inputs ride in every prompt (cost) and degrade
+ * extraction quality. Documents should be summarized or referenced first
+ * (core:source + source_refs); full-text doc ingestion is a separate module.
+ */
+export const MAX_TURN_CHARS = 20_000;
+
+/**
  * Run the gate: decide whether a conversation turn is worth storing.
  *
  * @param text the conversation turn (already cleared by the future trigger
@@ -37,6 +45,12 @@ export interface GateOptions {
  *   candidates, or candidates are not strings
  */
 export async function runGate(text: string, driver: LlmDriver, opts?: GateOptions): Promise<GateResult> {
+  if (text.length > MAX_TURN_CHARS) {
+    throw new AgentError(
+      `input is ${text.length} chars — the memory pipeline is turn-scoped (max ${MAX_TURN_CHARS}). ` +
+        "Summarize the document and store the key facts, or store a reference to it instead.",
+    );
+  }
   const reply = await driver.complete(buildGatePrompt({ text, extraFragments: opts?.extraFragments }));
   const parsed = parseJsonReply(reply) as Record<string, unknown>;
   if (typeof parsed.store !== "boolean") {

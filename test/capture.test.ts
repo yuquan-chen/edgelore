@@ -149,3 +149,24 @@ test("capture: survives close + reopen on SqliteGraph", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// 8. description rides into dimension attributes on CREATE only.
+test("capture: description is stored as attributes.description on new dimensions", () => {
+  forBackend((g) => {
+    const r = capture(g, { dimensionKey: "owner", value: "charles", description: "项目负责人" }, ctx);
+    const dim = g.getNode(r.dimensionId) as { attributes: Record<string, unknown> };
+    assert.equal(dim.attributes.description, "项目负责人");
+    // description on an EXISTING dimension is ignored (no overwrite)
+    capture(g, { dimensionKey: "owner", value: "alice", description: "another meaning" }, ctx);
+    const dim2 = g.getNode(r.dimensionId) as { attributes: Record<string, unknown> };
+    assert.equal(dim2.attributes.description, "项目负责人");
+  });
+});
+
+test("capture: no description -> attributes stay empty", () => {
+  forBackend((g) => {
+    const r = capture(g, { dimensionKey: "author", value: "charles" }, ctx);
+    const dim = g.getNode(r.dimensionId) as { attributes: Record<string, unknown> };
+    assert.deepEqual(dim.attributes, {});
+  });
+});

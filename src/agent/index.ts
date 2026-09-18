@@ -13,3 +13,6 @@ export * from "./gate.js";
 export * from "./extract.js";
 export * from "./runtime.js";
 export * from "./openai-compat-driver.js";
+export * from "./embedding-driver.js";
+export * from "./http.js";
+export * from "./retrieval.js";

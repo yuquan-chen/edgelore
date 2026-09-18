@@ -218,3 +218,38 @@ test("extract: prompt injects dimensions, context, candidates, text, and key pol
   assert.match(p, /NEVER a quoted "5000"/); // value shape contradiction fixed
   assert.match(p, /"value": 5000/); // few-shot shows the unquoted-number shape
 });
+
+test("extract: dimensionDescription becomes content.description (anti-drift)", async () => {
+  const driver = contentsDriver([
+    { dimensionKey: "NEW:owner", value: "charles", dimensionDescription: "项目负责人" },
+  ]);
+  const r = await runExtract({
+    text: "负责人是 charles",
+    candidates: ["负责人是 charles"],
+    knownDimensions: [],
+    contextMemories: [],
+    driver,
+  });
+  assert.equal(r.contents?.[0]?.description, "项目负责人");
+});
+
+test("extract: non-string dimensionDescription throws AgentError", async () => {
+  const driver = contentsDriver([{ dimensionKey: "NEW:owner", value: "x", dimensionDescription: 42 }]);
+  await assert.rejects(
+    runExtract({ text: "t", candidates: ["c"], knownDimensions: [], contextMemories: [], driver }),
+    AgentError,
+  );
+});
+
+test("extract: similarDimensions are injected into the prompt with reuse pressure", () => {
+  const p = buildExtractPrompt({
+    text: "t",
+    candidates: ["c"],
+    knownDimensions: [],
+    similarDimensions: [{ key: "owner", description: "项目负责人", cardinality: "single" }],
+    contextMemories: [],
+  });
+  assert.match(p, /SAME slot, REUSE its key/);
+  assert.match(p, /"owner"/);
+  assert.match(p, /项目负责人/);
+});

@@ -28,6 +28,10 @@ export interface CaptureContent {
   cardinality?: "single" | "multi";
   /** Optional unit, e.g. "CNY". */
   unit?: string;
+  /** Human-language description of the slot — ONLY used when CREATING a new
+   * dimension, stored as `attributes.description`. This is what later sessions'
+   * extractors read to map phrases onto the same key (anti-drift). */
+  description?: string;
 }
 
 /** ① Provenance — populated by the runtime (reads context), NOT by the Agent. */
@@ -71,6 +75,9 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
       type: "core:dimension",
       key: content.dimensionKey,
       cardinality: content.cardinality ?? "multi",
+      // description rides in open metadata (M0 §1.3: narrow state, wide
+      // metadata) — it is what future extractors match phrases against.
+      attributes: content.description ? { description: content.description } : {},
       created_by: ctx.created_by,
       source_refs: ctx.source_refs,
     });

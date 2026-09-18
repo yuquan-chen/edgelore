@@ -27,6 +27,9 @@ export interface ExtractInput {
   candidates: string[];
   /** Dimension slots read from the graph by the runtime. */
   knownDimensions: KnownDimension[];
+  /** Dimensions that own the retrieved context — if a candidate is the SAME
+   * slot, their key MUST be reused instead of minting a NEW one. */
+  similarDimensions?: KnownDimension[];
   /** Relevant stored memories, for judging duplicates / contradictions. */
   contextMemories: string[];
   /** The LLM driver (MockDriver in tests). */
@@ -66,6 +69,7 @@ export async function runExtract(input: ExtractInput): Promise<ExtractResult> {
       text: input.text,
       candidates: input.candidates,
       knownDimensions: input.knownDimensions,
+      similarDimensions: input.similarDimensions,
       contextMemories: input.contextMemories,
       extraFragments: input.extraFragments,
     }),
@@ -111,6 +115,14 @@ function toCaptureContent(raw: unknown, knownKeys: ReadonlySet<string>): Capture
   }
 
   const content: CaptureContent = { dimensionKey, value: normalizeNumericValue(entry.value) };
+  if (entry.dimensionDescription !== undefined) {
+    if (typeof entry.dimensionDescription !== "string" || entry.dimensionDescription.trim().length === 0) {
+      throw new AgentError(
+        `extract reply: content "${dimensionKey}" dimensionDescription must be a non-empty string`,
+      );
+    }
+    content.description = entry.dimensionDescription.trim();
+  }
   if (entry.cardinality !== undefined) {
     if (entry.cardinality !== "single" && entry.cardinality !== "multi") {
       throw new AgentError(

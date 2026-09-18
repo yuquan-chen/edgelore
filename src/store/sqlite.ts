@@ -51,6 +51,11 @@ CREATE TABLE IF NOT EXISTS constraints (
   state TEXT NOT NULL,
   data  TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS embeddings (
+  node_id TEXT PRIMARY KEY,
+  dim     INTEGER NOT NULL,
+  vector  BLOB NOT NULL
+);
 `;
 
 /** Row shape returned by `SELECT data ...` queries. */
@@ -157,5 +162,29 @@ export class SqliteGraph extends MemoryGraph {
     this.db
       .prepare("INSERT OR REPLACE INTO constraints (id, kind, state, data) VALUES (?, ?, ?, ?)")
       .run(c.id, c.kind, c.activation_state, JSON.stringify(c));
+  }
+
+  // ------------------------------------------------------------ embeddings
+  // Vectors are DERIVED data (rebuildable from node text), stored in their
+  // own additive table so existing databases upgrade without migration.
+  // Float32 BLOB: 4 bytes per dimension — 4 KB for a 1024-dim vector.
+
+  /** Store (or replace) the vector for one node id. */
+  putVector(nodeId: string, vector: number[]): void {
+    const blob = Buffer.from(new Float32Array(vector).buffer);
+    this.db
+      .prepare("INSERT OR REPLACE INTO embeddings (node_id, dim, vector) VALUES (?, ?, ?)")
+      .run(nodeId, vector.length, blob);
+  }
+
+  /** Load every stored vector. Retrieval ranks them in memory (brute force). */
+  allVectors(): Array<{ nodeId: string; vector: number[] }> {
+    const rows = this.db
+      .prepare("SELECT node_id, dim, vector FROM embeddings")
+      .all() as unknown as Array<{ node_id: string; dim: number; vector: Buffer }>;
+    return rows.map((r) => ({
+      nodeId: r.node_id,
+      vector: Array.from(new Float32Array(r.vector.buffer, r.vector.byteOffset, r.vector.byteLength / 4)),
+    }));
   }
 }

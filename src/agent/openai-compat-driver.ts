@@ -1,4 +1,4 @@
-// edgelore · Agent Memory layer — real LLM driver (OpenAI-compatible).
+// edgelore · Agent Memory layer — real LLM driver (OpenAI-compatible chat).
 //
 // The first real `LlmDriver` implementation: a thin fetch over any
 // OpenAI-compatible chat endpoint (official OpenAI, relays like dogrouter,
@@ -11,6 +11,7 @@
 
 import { AgentError } from "./errors.js";
 import type { LlmDriver } from "./llm-driver.js";
+import { postJsonWithRetry } from "./http.js";
 
 /** Construction options for {@link OpenAiCompatDriver}. */
 export interface OpenAiCompatOptions {
@@ -27,9 +28,6 @@ export interface OpenAiCompatOptions {
   /** Extra attempts after the first on transient failures. Default 1. */
   maxRetries?: number;
 }
-
-/** Marks retryable failures (network errors, 429, 5xx). Internal only. */
-class TransientError extends Error {}
 
 /**
  * `LlmDriver` over an OpenAI-compatible `/chat/completions` endpoint.
@@ -83,42 +81,18 @@ export class OpenAiCompatDriver implements LlmDriver {
   }
 
   async complete(prompt: string): Promise<string> {
-    let lastError: Error = new AgentError("unreachable");
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      if (attempt > 0) await sleep(500 * attempt);
-      try {
-        return await this.completeOnce(prompt);
-      } catch (err) {
-        if (!(err instanceof TransientError)) throw err;
-        lastError = err;
-      }
-    }
-    throw new AgentError(
-      `OpenAI-compatible endpoint failed after ${this.maxRetries + 1} attempts: ${lastError.message}`,
-    );
-  }
-
-  /** One request attempt; throws TransientError for retryable failures. */
-  private async completeOnce(prompt: string): Promise<string> {
-    let res: Response;
-    try {
-      res = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.apiKey}` },
-        body: JSON.stringify({
-          model: this.model,
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0,
-          max_tokens: this.maxTokens,
-        }),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-    } catch (err) {
-      throw new TransientError((err as Error).message);
-    }
-    if (res.status === 429 || res.status >= 500) {
-      throw new TransientError(`API ${res.status}`);
-    }
+    const res = await postJsonWithRetry({
+      url: `${this.baseUrl}/chat/completions`,
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+      body: {
+        model: this.model,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0,
+        max_tokens: this.maxTokens,
+      },
+      timeoutMs: this.timeoutMs,
+      maxRetries: this.maxRetries,
+    });
     if (!res.ok) {
       throw new AgentError(`API ${res.status}: ${(await res.text()).slice(0, 300)}`);
     }
@@ -129,9 +103,4 @@ export class OpenAiCompatDriver implements LlmDriver {
     }
     return content;
   }
-}
-
-/** Small linear backoff between retry attempts. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

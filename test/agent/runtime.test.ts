@@ -10,7 +10,10 @@ import assert from "node:assert/strict";
 import { MemoryGraph } from "../../src/model/store.js";
 import { MockDriver } from "../../src/agent/llm-driver.js";
 import { capture } from "../../src/agent/capture.js";
-import { contextMemoriesOf, knownDimensionsOf, processTurn } from "../../src/agent/runtime.js";
+import { AgentError } from "../../src/agent/errors.js";
+import { MockEmbedder, type EmbeddingDriver } from "../../src/agent/embedding-driver.js";
+import { InMemoryVectorStore } from "../../src/agent/retrieval.js";
+import { contextMemoriesOf, contextMemoriesViaRetrieval, knownDimensionsOf, processTurn } from "../../src/agent/runtime.js";
 
 const ctx = { created_by: "human:charles", source_refs: ["t:1"] };
 
@@ -109,4 +112,94 @@ test("runtime: contextMemoriesOf formats key=value[state] lines and caps by limi
   const capped = contextMemoriesOf(graph, 1);
   assert.equal(capped.length, 1);
   assert.match(capped[0] ?? "", /author/); // newest kept
+});
+
+test("runtime: retrieval config embeds new statements after capture", async () => {
+  const graph = new MemoryGraph();
+  const vectors = new InMemoryVectorStore();
+  const driver = new MockDriver([
+    JSON.stringify({ store: true, candidates: ["预算 5000"] }),
+    JSON.stringify({
+      contents: [{ dimensionKey: "NEW:budget", value: 5000, cardinality: "single", unit: "CNY" }],
+    }),
+  ]);
+  const outcome = await processTurn(graph, "项目预算 5000 元", driver, ctx, {
+    retrieval: { embedder: new MockEmbedder(8), vectors },
+  });
+  assert.equal(outcome.indexed, 1);
+  assert.equal(outcome.indexError, undefined);
+  const stored = vectors.all();
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0]?.vector.length, 8);
+});
+
+test("runtime: embedding failure after capture does NOT fail the turn", async () => {
+  const graph = new MemoryGraph();
+  const vectors = new InMemoryVectorStore();
+  const driver = new MockDriver([
+    JSON.stringify({ store: true, candidates: ["预算 5000"] }),
+    JSON.stringify({ contents: [{ dimensionKey: "NEW:budget", value: 5000 }] }),
+  ]);
+  const boom: EmbeddingDriver = {
+    dimensions: 8,
+    embed: async () => {
+      throw new AgentError("embedding endpoint down");
+    },
+  };
+  const outcome = await processTurn(graph, "项目预算 5000 元", driver, ctx, {
+    retrieval: { embedder: boom, vectors },
+  });
+  assert.equal(outcome.captures.length, 1); // memory IS stored
+  assert.equal(outcome.indexed, 0);
+  assert.match(outcome.indexError ?? "", /embedding endpoint down/);
+});
+
+test("runtime: retrieval-based context carries conflict posture and constraint verdicts", async () => {
+  const graph = new MemoryGraph();
+  const vectors = new InMemoryVectorStore();
+  const embedder = new MockEmbedder(8);
+  const retrieval = { embedder, vectors };
+  // Turn 1: budget 5000 (indexed).
+  const first = await processTurn(graph, "预算 5000", new MockDriver([
+    JSON.stringify({ store: true, candidates: ["预算 5000"] }),
+    JSON.stringify({ contents: [{ dimensionKey: "NEW:budget", value: 5000, cardinality: "single" }] }),
+  ]), ctx, { retrieval });
+  assert.equal(first.indexed, 1);
+  // Active constraint on the budget dimension.
+  const constraint = graph.addConstraint({
+    participants: [first.captures[0]?.dimensionId as string],
+    bindings: { x1: first.captures[0]?.dimensionId as string },
+    expression: { op: "<=", args: [{ op: "avg", args: [{ ref: "x1" }] }, 6000] },
+    created_by: "human:charles",
+  });
+  graph.transitionConstraintState(constraint.id, "active", { approved_by: "human:charles" });
+
+  const lines = await contextMemoriesViaRetrieval(graph, "预算", retrieval);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0] ?? "", /budget = 5000 /);
+  assert.match(lines[0] ?? "", /constraint ".+" -> (satisfied|violated|indeterminate|error)/);
+});
+
+test("runtime: deduplicated capture embeds nothing new", async () => {
+  const graph = new MemoryGraph();
+  const vectors = new InMemoryVectorStore();
+  const retrieval = { embedder: new MockEmbedder(8), vectors };
+  const replies = [
+    JSON.stringify({ store: true, candidates: ["作者是 charles"] }),
+    JSON.stringify({ contents: [{ dimensionKey: "NEW:author", value: "charles" }] }),
+  ];
+  await processTurn(graph, "作者是 charles", new MockDriver(replies), ctx, { retrieval });
+  const second = await processTurn(graph, "作者是 charles", new MockDriver(replies), ctx, { retrieval });
+  assert.equal(second.captures[0]?.deduplicated, true);
+  assert.equal(second.indexed, 0); // nothing new to embed
+  assert.equal(vectors.all().length, 1);
+});
+
+test("runtime: knownDimensionsOf surfaces stored descriptions (anti-drift signal)", () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "owner", value: "charles", description: "项目负责人" }, ctx);
+  capture(graph, { dimensionKey: "tags", value: "a" }, ctx);
+  const known = knownDimensionsOf(graph);
+  assert.equal(known.find((k) => k.key === "owner")?.description, "项目负责人");
+  assert.equal(known.find((k) => k.key === "tags")?.description, "tags"); // fallback = key
 });

@@ -12,7 +12,9 @@ import { readFileSync } from "node:fs";
 import { SqliteGraph } from "./store/sqlite.js";
 import { capture, type CaptureContent, type CaptureContext } from "./agent/capture.js";
 import { OpenAiCompatDriver } from "./agent/openai-compat-driver.js";
-import { processTurn } from "./agent/runtime.js";
+import { OpenAiCompatEmbeddingDriver } from "./agent/embedding-driver.js";
+import { processTurn, type RetrievalConfig } from "./agent/runtime.js";
+import { expandHit, retrieveRelevant, SqliteVectorStore, type RetrievalMode } from "./agent/retrieval.js";
 import type { AddConstraintInput, AddEdgeInput, AddNodeInput } from "./model/store.js";
 import type { ExpressionNode } from "./model/types.js";
 
@@ -47,6 +49,19 @@ function positionals(args: string[]): string[] {
     out.push(a);
   }
   return out;
+}
+
+/**
+ * Build retrieval plumbing from env / .env.local when an embedding model is
+ * configured; undefined otherwise (processTurn then degrades to "latest 50").
+ */
+function retrievalFromEnv(g: SqliteGraph, flags: Map<string, string>): RetrievalConfig | undefined {
+  if (!process.env.EDGELORE_EMBEDDING_MODEL) return undefined;
+  return {
+    embedder: OpenAiCompatEmbeddingDriver.fromEnv(process.env),
+    vectors: new SqliteVectorStore(g),
+    mode: flags.has("mode") ? (flags.get("mode") as RetrievalMode) : undefined,
+  };
 }
 
 /** Require a flag, or throw with a usage-style message. */
@@ -96,7 +111,9 @@ async function main(): Promise<void> {
   const dbPath = flags.get("db") ?? "./edgelore.db";
 
   const [entity, action, target] = pos;
-  if (!entity) throw new Error("missing command (node|edge|constraint|evaluate|get|capture|remember)");
+  if (!entity) {
+    throw new Error("missing command (node|edge|constraint|evaluate|get|capture|remember|search)");
+  }
 
   const g = new SqliteGraph(dbPath);
   try {
@@ -231,12 +248,40 @@ async function main(): Promise<void> {
             ? (parseJson(req(flags, "source-refs"), false) as string[])
             : [],
         };
-        emit(await processTurn(g, text, driver, context));
+        const retrieval = retrievalFromEnv(g, flags);
+        emit(await processTurn(g, text, driver, context, retrieval ? { retrieval } : undefined));
+        break;
+      }
+
+      case "search": {
+        // Retrieval debugger: shows what the extractor would see as context,
+        // with graph expansion (conflict counterparts + constraint verdicts).
+        const query = pos
+          .slice(1)
+          .join(" ")
+          .trim();
+        if (!query) {
+          throw new Error('usage: search "query" [--k n] [--mode hybrid|vector|lexical]');
+        }
+        loadDotEnv(".env.local");
+        const embedder = OpenAiCompatEmbeddingDriver.fromEnv(process.env);
+        const mode = flags.has("mode") ? (flags.get("mode") as RetrievalMode) : undefined;
+        const k = flags.has("k") ? Number(flags.get("k")) : undefined;
+        const hits = await retrieveRelevant(g, {
+          query,
+          embedder,
+          vectors: new SqliteVectorStore(g),
+          mode,
+          k,
+        });
+        emit({ hits: hits.map((h) => ({ ...h, expansion: expandHit(g, h) })) });
         break;
       }
 
       default:
-        throw new Error(`unknown command: ${entity} (node|edge|constraint|evaluate|get|capture|remember)`);
+        throw new Error(
+          `unknown command: ${entity} (node|edge|constraint|evaluate|get|capture|remember|search)`,
+        );
     }
   } finally {
     g.close();

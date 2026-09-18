@@ -1,0 +1,279 @@
+// edgelore · Agent Memory layer — hybrid retrieval over the memory graph.
+//
+// Replaces the "latest 50" context recipe with relevance: three candidate
+// routes fused by Reciprocal Rank Fusion, in the Zep/Graphiti style that
+// the retrieval research confirmed as the industry pattern:
+//
+//   ① vector route  — cosine over statement embeddings (needs an
+//                     EmbeddingDriver + a VectorStore; skipped otherwise)
+//   ② lexical route — character-bigram containment over "key + value"
+//                     text; always available, works on both backends, and
+//                     handles proper nouns (charles, PostgreSQL) that
+//                     embeddings are insensitive to
+//   ③ RRF fusion    — 1/(60 + rank) summed across routes; rank-based, so
+//                     incompatible score scales never mix
+//
+// Hits carry their GRAPH ADDRESS (statementId / dimensionId / key / value /
+// state) — position is native to a graph, not inferred from text chunks.
+// `expandHit` walks one hop: sibling statements (conflict counterparts!)
+// and active constraints binding the dimension, with the M1 engine's
+// current verdict.
+//
+// Mode is an explicit ablation switch ("hybrid" | "vector" | "lexical")
+// because the industry has never published a hybrid-vs-single-signal
+// ablation — we measure on our own eval sets.
+
+import { AgentError } from "./errors.js";
+import type { GraphStore, MemoryGraph } from "../model/store.js";
+import type { SqliteGraph } from "../store/sqlite.js";
+import type { DimensionNode, FactNodeState, GraphNode, StatementNode } from "../model/types.js";
+import type { EvaluationResult } from "../engine/evaluate.js";
+import type { EmbeddingDriver } from "./embedding-driver.js";
+
+/** How many retrieval routes to run. Ablation switch, default "hybrid". */
+export type RetrievalMode = "hybrid" | "vector" | "lexical";
+
+/** Where vectors live. Implemented by SqliteGraph-backed and in-memory stores. */
+export interface VectorStore {
+  /** Store (or replace) the vector for one node id. */
+  put(id: string, vector: number[]): void;
+  /** Every stored vector (retrieval ranks them in memory, brute force). */
+  all(): Array<{ id: string; vector: number[] }>;
+}
+
+/** In-memory vector store — for tests and for graphs without SQLite. */
+export class InMemoryVectorStore implements VectorStore {
+  private readonly map = new Map<string, number[]>();
+
+  put(id: string, vector: number[]): void {
+    this.map.set(id, vector);
+  }
+
+  all(): Array<{ id: string; vector: number[] }> {
+    return [...this.map.entries()].map(([id, vector]) => ({ id, vector }));
+  }
+}
+
+/** Vector store backed by the SQLite `embeddings` table (Float32 BLOBs). */
+export class SqliteVectorStore implements VectorStore {
+  private readonly graph: SqliteGraph;
+
+  /** @param graph an open SqliteGraph (the table is created on open) */
+  constructor(graph: SqliteGraph) {
+    this.graph = graph;
+  }
+
+  put(id: string, vector: number[]): void {
+    this.graph.putVector(id, vector);
+  }
+
+  all(): Array<{ id: string; vector: number[] }> {
+    return this.graph.allVectors().map((e) => ({ id: e.nodeId, vector: e.vector }));
+  }
+}
+
+/** One retrieval result: a graph ADDRESS, not a text chunk. */
+export interface RetrievalHit {
+  statementId: string;
+  dimensionId: string;
+  dimensionKey: string;
+  value: unknown;
+  state: FactNodeState;
+  /** Fused RRF score — for ranking only, not comparable across queries. */
+  score: number;
+  /** Which routes surfaced this hit. */
+  via: string[];
+}
+
+/** One hop of graph context around a hit. */
+export interface HitExpansion {
+  /** Other statements on the same dimension — the conflict counterparts. */
+  siblings: Array<{ statementId: string; value: unknown; state: FactNodeState; createdBy: string; createdAt: string }>;
+  /** Active constraints binding this dimension, with the M1 engine's verdict. */
+  constraints: Array<{ id: string; name?: string; evaluation: EvaluationResult }>;
+}
+
+/** Input for {@link retrieveRelevant}. */
+export interface RetrievalInput {
+  query: string;
+  /** Max hits returned. Default 8. */
+  k?: number;
+  /** Route selection. Default "hybrid". */
+  mode?: RetrievalMode;
+  /** Required for the vector route. */
+  embedder?: EmbeddingDriver;
+  /** Required for the vector route. */
+  vectors?: VectorStore;
+}
+
+/**
+ * Retrieve the statements most relevant to a query, fused across routes.
+ *
+ * @param graph any graph backend (lexical route works everywhere)
+ * @param input query, k, mode, and optional embedding plumbing
+ * @returns up to k hits, best fused score first
+ * @throws AgentError when mode is "vector" but no embedder/store is given
+ */
+export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput): Promise<RetrievalHit[]> {
+  const mode = input.mode ?? "hybrid";
+  const k = input.k ?? 8;
+  // Fail loud on impossible configuration BEFORE any early return.
+  if (mode === "vector" && (!input.embedder || !input.vectors)) {
+    throw new AgentError('retrieval mode "vector" requires an embedder and a vector store');
+  }
+  const stmts = graph.queryNodes({ type: "core:statement" }) as StatementNode[];
+  if (stmts.length === 0) return [];
+  const dims = new Map<string, GraphNode>(
+    graph.queryNodes({ type: "core:dimension" }).map((d) => [d.id, d]),
+  );
+
+  const routes: Array<{ name: string; ranked: string[] }> = [];
+
+  // Lexical route — always available, zero dependencies.
+  const queryBigrams = bigrams(input.query);
+  if (queryBigrams.size > 0) {
+    const scored = stmts
+      .map((s) => ({ id: s.id, score: lexicalScore(queryBigrams, statementText(graph, s)) }))
+      .filter((d) => d.score > 0)
+      .sort((a, b) => b.score - a.score);
+    routes.push({ name: "lexical", ranked: scored.map((d) => d.id) });
+  }
+
+  // Vector route — only when plumbing is provided.
+  if (mode !== "lexical") {
+    if (!input.embedder || !input.vectors) {
+      if (mode === "vector") {
+        throw new AgentError('retrieval mode "vector" requires an embedder and a vector store');
+      }
+      // hybrid degrades gracefully to lexical-only
+    } else {
+      const [queryVector] = await input.embedder.embed([input.query]);
+      const stored = new Map(input.vectors.all().map((e) => [e.id, e.vector]));
+      const scored = stmts
+        .filter((s) => stored.has(s.id))
+        .map((s) => ({ id: s.id, score: cosine(queryVector, stored.get(s.id) as number[]) }))
+        .filter((d) => d.score > 0)
+        .sort((a, b) => b.score - a.score);
+      routes.push({ name: "vector", ranked: scored.map((d) => d.id) });
+    }
+  }
+
+  const usable = routes.filter((r) =>
+    mode === "vector" ? r.name === "vector" : mode === "lexical" ? r.name === "lexical" : true,
+  );
+  const fused = fuseRRF(usable);
+  return [...fused.entries()]
+    .sort((a, b) => b[1].score - a[1].score)
+    .slice(0, k)
+    .map(([statementId, meta]) => {
+      const stmt = stmts.find((s) => s.id === statementId) as StatementNode;
+      const dim = dims.get(stmt.dimension_id) as DimensionNode | undefined;
+      return {
+        statementId,
+        dimensionId: stmt.dimension_id,
+        dimensionKey: dim?.key ?? "?",
+        value: stmt.value,
+        state: stmt.state,
+        score: meta.score,
+        via: meta.via,
+      };
+    });
+}
+
+/**
+ * One-hop graph expansion around a hit: the dimension's other statements
+ * (conflict counterparts) and active constraints bound to the dimension,
+ * each with the M1 engine's current four-state verdict.
+ *
+ * @param graph a concrete MemoryGraph (constraint access needs the full store)
+ * @param hit the hit to expand
+ * @param maxSiblings cap on sibling statements (default 5 — structured
+ *   context helps, but flooding hurts; see the StructRAG counter-evidence)
+ * @returns siblings and constraint verdicts
+ */
+export function expandHit(graph: MemoryGraph, hit: RetrievalHit, maxSiblings = 5): HitExpansion {
+  const siblings = (graph.queryNodes({ type: "core:statement" }) as StatementNode[])
+    .filter((s) => s.dimension_id === hit.dimensionId && s.id !== hit.statementId)
+    .slice(0, maxSiblings)
+    .map((s) => ({
+      statementId: s.id,
+      value: s.value,
+      state: s.state,
+      createdBy: s.created_by,
+      createdAt: s.created_at,
+    }));
+  const constraints = graph
+    .getAllConstraints()
+    .filter((c) => c.activation_state === "active")
+    .filter(
+      (c) =>
+        Object.values(c.bindings).includes(hit.dimensionId) || c.participants.includes(hit.dimensionId),
+    )
+    .map((c) => ({ id: c.id, name: c.name, evaluation: graph.evaluateConstraint(c.id) }));
+  return { siblings, constraints };
+}
+
+/** Canonical text a statement is embedded / lexically matched against. */
+export function statementText(graph: GraphStore, stmt: StatementNode): string {
+  const dim = graph.getNode(stmt.dimension_id) as DimensionNode | undefined;
+  return `${dim?.key ?? ""} ${JSON.stringify(stmt.value)}${stmt.unit ? ` ${stmt.unit}` : ""}`;
+}
+
+// --- routes ------------------------------------------------------------------
+
+/** Character bigrams (whitespace collapsed) — CJK-safe lexical features. */
+function bigrams(text: string): Set<string> {
+  const s = text.toLowerCase().replace(/\s+/g, "");
+  const out = new Set<string>();
+  if (s.length === 1) {
+    out.add(s);
+    return out;
+  }
+  for (let i = 0; i < s.length - 1; i++) out.add(s.slice(i, i + 2));
+  return out;
+}
+
+/** Containment of the query's bigrams in the document's — 0..1, rankable. */
+function lexicalScore(queryBigrams: Set<string>, docText: string): number {
+  const doc = bigrams(docText);
+  let hits = 0;
+  for (const b of queryBigrams) {
+    if (doc.has(b)) hits++;
+  }
+  return hits / queryBigrams.size;
+}
+
+/** Cosine similarity; zero-norm vectors score 0. */
+function cosine(a: number[], b: number[]): number {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return na === 0 || nb === 0 ? 0 : dot / Math.sqrt(na * nb);
+}
+
+/**
+ * Reciprocal Rank Fusion: score = Σ 1/(k + rank). Rank-based, so the three
+ * routes' incompatible score scales never mix; appearing mid-list on several
+ * routes beats topping a single one. k=60 is the standard smoothing constant.
+ */
+function fuseRRF(
+  routes: Array<{ name: string; ranked: string[] }>,
+  smoothing = 60,
+): Map<string, { score: number; via: string[] }> {
+  const fused = new Map<string, { score: number; via: string[] }>();
+  for (const route of routes) {
+    route.ranked.forEach((id, index) => {
+      const entry = fused.get(id) ?? { score: 0, via: [] };
+      entry.score += 1 / (smoothing + index + 1);
+      if (!entry.via.includes(route.name)) entry.via.push(route.name);
+      fused.set(id, entry);
+    });
+  }
+  return fused;
+}

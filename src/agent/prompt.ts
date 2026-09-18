@@ -113,14 +113,16 @@ const EXTRACT_RULES = [
   "2. Never invent information that is not in the input text.",
   '3. dimensionKey is a subject-free address of the graph ("budget", not "p1_budget" or "my_project_budget"); project/scope context is NOT your business.',
   "4. A dimensionKey must be either an existing key from knownDimensions, or NEW: followed by lowerCamelCase English (letters and digits, starting with a lowercase letter).",
-  "5. If contextMemories already contain an equivalent value, still output the entry (capture deduplicates). If one contradicts, still output it (capture flags the conflict) — resolving conflicts is not your job.",
-  "6. One entry per candidate, in order; each entry is independent.",
+  "5. If similarDimensions are provided and a candidate is the SAME slot as one of them, you MUST reuse that dimension's key — never mint a NEW key for an existing concept (key drift fragments the memory graph).",
+  "6. If contextMemories already contain an equivalent value, still output the entry (capture deduplicates). If one contradicts, still output it (capture flags the conflict) — resolving conflicts is not your job.",
+  "7. One entry per candidate, in order; each entry is independent.",
 ].join("\n");
 
 const EXTRACT_ENTRY_SHAPE = `For each candidate, output exactly one entry object:
 {
   "dimensionKey": "<a key from knownDimensions, or NEW:camelCaseKey if no existing key fits>",
   "value": <a bare NUMBER for quantities — e.g. 5000, NEVER a quoted "5000" — otherwise a short string in the speaker's language verbatim>,
+  "dimensionDescription": "optional but STRONGLY RECOMMENDED for NEW: keys — one short line in the speaker's language saying what this slot means (e.g. \\"项目负责人\\" for owner), so later sessions map the same concept onto this key; omit when reusing an existing dimension",
   "cardinality": "optional — ONLY for NEW: keys: "single" if the slot holds one value at a time, "multi" otherwise; omit when reusing an existing dimension (it already has one)",
   "unit": "optional, e.g. CNY, days, ms; reuse the existing dimension's unit when present"
 }
@@ -137,6 +139,9 @@ export interface ExtractPromptInput {
   candidates: readonly string[];
   /** Dimension slots read from the graph by the runtime. */
   knownDimensions: readonly KnownDimension[];
+  /** Dimensions owning the retrieved context — same-slot candidates must
+   * reuse their keys (anti-drift, layer 2). */
+  similarDimensions?: readonly KnownDimension[];
   /** Relevant stored memories, for judging duplicates / contradictions. */
   contextMemories: readonly string[];
   /** Extra scenario fragments spliced in before the output contract (§4.3). */
@@ -146,14 +151,19 @@ export interface ExtractPromptInput {
 /**
  * Assemble the extract prompt (candidates -> structured entries).
  *
- * @param input the turn, candidates, dimension slots, and stored-memory context
+ * @param input the turn, candidates, dimension slots, similar dimensions,
+ *   and stored-memory context
  * @returns the fully assembled prompt text
  */
 export function buildExtractPrompt(input: ExtractPromptInput): string {
   const dimensions =
     input.knownDimensions.length > 0
       ? input.knownDimensions.map((d) => JSON.stringify(d)).join("\n")
-      : "(none yet — every new key must use the NEW: prefix)";
+      : "(none yet — every new key must use the NEW: prefix, with a dimensionDescription)";
+  const similar =
+    input.similarDimensions && input.similarDimensions.length > 0
+      ? input.similarDimensions.map((d) => JSON.stringify(d)).join("\n")
+      : "(none)";
   const context =
     input.contextMemories.length > 0
       ? input.contextMemories.map((m) => `- ${m}`).join("\n")
@@ -161,6 +171,7 @@ export function buildExtractPrompt(input: ExtractPromptInput): string {
   const blocks = [
     EXTRACT_ROLE,
     `Known dimensions (prefer reusing one of these keys):\n${dimensions}`,
+    `Similar dimensions (retrieved as likely-relevant; if a candidate is the SAME slot, REUSE its key — never mint a new one):\n${similar}`,
     `Relevant stored memories (for judging duplicates / contradictions):\n${context}`,
     `Candidate facts (verbatim fragments):\n${input.candidates.map((c) => `- ${c}`).join("\n")}`,
     `Input text (the full conversation turn):\n${input.text}`,

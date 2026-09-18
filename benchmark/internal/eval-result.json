@@ -1,0 +1,321 @@
+{
+  "summary": {
+    "passed": 18,
+    "total": 29,
+    "byCategory": {
+      "reject-greeting": {
+        "pass": 4,
+        "total": 4
+      },
+      "reject-transient": {
+        "pass": 3,
+        "total": 3
+      },
+      "reject-process": {
+        "pass": 1,
+        "total": 1
+      },
+      "fact": {
+        "pass": 3,
+        "total": 6
+      },
+      "constraint": {
+        "pass": 2,
+        "total": 6
+      },
+      "preference": {
+        "pass": 4,
+        "total": 4
+      },
+      "lesson": {
+        "pass": 0,
+        "total": 2
+      },
+      "conflict": {
+        "pass": 1,
+        "total": 3
+      }
+    }
+  },
+  "results": [
+    {
+      "id": "R1-greeting",
+      "category": "reject-greeting",
+      "ok": true,
+      "notes": [
+        "正确拒绝"
+      ],
+      "ms": 6189
+    },
+    {
+      "id": "R2-politeness",
+      "category": "reject-greeting",
+      "ok": true,
+      "notes": [
+        "正确拒绝"
+      ],
+      "ms": 10074
+    },
+    {
+      "id": "R3-ack",
+      "category": "reject-greeting",
+      "ok": true,
+      "notes": [
+        "正确拒绝"
+      ],
+      "ms": 12629
+    },
+    {
+      "id": "R4-transient",
+      "category": "reject-transient",
+      "ok": true,
+      "notes": [
+        "正确拒绝"
+      ],
+      "ms": 15266
+    },
+    {
+      "id": "R5-transient",
+      "category": "reject-transient",
+      "ok": true,
+      "notes": [
+        "正确拒绝"
+      ],
+      "ms": 20816
+    },
+    {
+      "id": "R6-chatter",
+      "category": "reject-greeting",
+      "ok": true,
+      "notes": [
+        "正确拒绝"
+      ],
+      "ms": 24446
+    },
+    {
+      "id": "R7-process",
+      "category": "reject-process",
+      "ok": true,
+      "notes": [
+        "正确拒绝"
+      ],
+      "ms": 26760
+    },
+    {
+      "id": "R8-transient",
+      "category": "reject-transient",
+      "ok": true,
+      "notes": [
+        "正确拒绝"
+      ],
+      "ms": 29421
+    },
+    {
+      "id": "F1-owner",
+      "category": "fact",
+      "ok": true,
+      "notes": [
+        "key✓(owner)",
+        "value✓"
+      ],
+      "ms": 36808
+    },
+    {
+      "id": "F2-budget",
+      "category": "constraint",
+      "ok": true,
+      "notes": [
+        "key✓(budget)",
+        "value✓"
+      ],
+      "ms": 58968
+    },
+    {
+      "id": "F3-database",
+      "category": "fact",
+      "ok": true,
+      "notes": [
+        "key✓(database)",
+        "value✓"
+      ],
+      "ms": 66327
+    },
+    {
+      "id": "F4-meeting",
+      "category": "fact",
+      "ok": false,
+      "notes": [
+        "key✗(期望~meetingSchedule/weeklyMeeting/teamMeeting, 实得meetingTime)",
+        "value✓"
+      ],
+      "ms": 75123
+    },
+    {
+      "id": "F5-deadline",
+      "category": "fact",
+      "ok": true,
+      "notes": [
+        "key✓(deadline)",
+        "value✓"
+      ],
+      "ms": 82619
+    },
+    {
+      "id": "F6-stack",
+      "category": "fact",
+      "ok": false,
+      "notes": [
+        "key✗(期望~frontend/frontendStack/uiFramework, 实得frontendFramework)",
+        "value✓"
+      ],
+      "ms": 97052
+    },
+    {
+      "id": "F7-infra",
+      "category": "fact",
+      "ok": false,
+      "notes": [
+        "key✗(期望~deployment/cloudProvider/serverRegion, 实得deploymentRegion)",
+        "value✓"
+      ],
+      "ms": 108805
+    },
+    {
+      "id": "F8-sla",
+      "category": "constraint",
+      "ok": true,
+      "notes": [
+        "key✓(apiLatency)",
+        "value✓"
+      ],
+      "ms": 116534
+    },
+    {
+      "id": "P1-language",
+      "category": "preference",
+      "ok": true,
+      "notes": [
+        "key✓(replyLanguage)",
+        "value✓"
+      ],
+      "ms": 122555
+    },
+    {
+      "id": "P2-style",
+      "category": "preference",
+      "ok": true,
+      "notes": [
+        "key✓(replyStyle)",
+        "value✓"
+      ],
+      "ms": 133962
+    },
+    {
+      "id": "P3-code",
+      "category": "preference",
+      "ok": true,
+      "notes": [
+        "key✓(commentLanguage)",
+        "value✓"
+      ],
+      "ms": 141609
+    },
+    {
+      "id": "P4-meeting",
+      "category": "preference",
+      "ok": true,
+      "notes": [
+        "key✓(meetingPreference)",
+        "value✓"
+      ],
+      "ms": 167037
+    },
+    {
+      "id": "C1-cost",
+      "category": "constraint",
+      "ok": false,
+      "notes": [
+        "key✗(期望~serverCost/monthlyServerCost, 实得monthlyServerBudget)",
+        "value✓"
+      ],
+      "ms": 175703
+    },
+    {
+      "id": "C2-mirror",
+      "category": "constraint",
+      "ok": false,
+      "notes": [
+        "key✗(期望~dependencySource/packageMirror, 实得dependencyMirror)",
+        "value✓"
+      ],
+      "ms": 183077
+    },
+    {
+      "id": "C3-security",
+      "category": "constraint",
+      "ok": false,
+      "notes": [
+        "key✗(期望~releaseCheck/securityScan, 实得securityScanRequired)",
+        "value✓"
+      ],
+      "ms": 193692
+    },
+    {
+      "id": "C4-compliance",
+      "category": "constraint",
+      "ok": false,
+      "notes": [
+        "key✗(期望~logPolicy/sensitiveData, 实得sensitiveDataLoggingPolicy)",
+        "value✓"
+      ],
+      "ms": 206469
+    },
+    {
+      "id": "L1-release",
+      "category": "lesson",
+      "ok": false,
+      "notes": [
+        "key✗(期望~releaseLesson/grayRelease/deployLesson, 实得incidentCause/releasePolicy)",
+        "value✓"
+      ],
+      "ms": 229513
+    },
+    {
+      "id": "L2-mock",
+      "category": "lesson",
+      "ok": false,
+      "notes": [
+        "key✗(期望~dbTestLesson/migrationLesson, 实得testStrategy)",
+        "value✓"
+      ],
+      "ms": 237121
+    },
+    {
+      "id": "K1-owner-conflict",
+      "category": "conflict",
+      "ok": true,
+      "notes": [
+        "key✓(owner)",
+        "value✓",
+        "conflict✓"
+      ],
+      "ms": 293525
+    },
+    {
+      "id": "K2-budget-conflict",
+      "category": "conflict",
+      "ok": false,
+      "notes": [
+        "extract reply: dimensionKey \"budget\" is neither a known dimension nor NEW:lowerCamelCase"
+      ]
+    },
+    {
+      "id": "K3-db-conflict",
+      "category": "conflict",
+      "ok": false,
+      "notes": [
+        "extract reply: dimensionKey \"database\" is neither a known dimension nor NEW:lowerCamelCase"
+      ]
+    }
+  ]
+}

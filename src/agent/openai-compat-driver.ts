@@ -27,6 +27,8 @@ export interface OpenAiCompatOptions {
   timeoutMs?: number;
   /** Extra attempts after the first on transient failures. Default 1. */
   maxRetries?: number;
+  /** Vendor-specific request params (escape hatch), shallow-merged into the request body. */
+  extraBody?: Record<string, unknown>;
 }
 
 /**
@@ -42,6 +44,7 @@ export class OpenAiCompatDriver implements LlmDriver {
   private readonly maxTokens: number;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
+  private readonly extraBody: Record<string, unknown>;
 
   /** @param options endpoint config; unset optional fields take defaults. */
   constructor(options: OpenAiCompatOptions) {
@@ -51,6 +54,7 @@ export class OpenAiCompatDriver implements LlmDriver {
     this.maxTokens = options.maxTokens ?? 700;
     this.timeoutMs = options.timeoutMs ?? 60_000;
     this.maxRetries = options.maxRetries ?? 1;
+    this.extraBody = options.extraBody ?? {};
   }
 
   /**
@@ -89,6 +93,7 @@ export class OpenAiCompatDriver implements LlmDriver {
         messages: [{ role: "user", content: prompt }],
         temperature: 0,
         max_tokens: this.maxTokens,
+        ...this.extraBody,
       },
       timeoutMs: this.timeoutMs,
       maxRetries: this.maxRetries,

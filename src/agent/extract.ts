@@ -109,9 +109,24 @@ function toCaptureContent(raw: unknown, knownKeys: ReadonlySet<string>): Capture
     }
     dimensionKey = key;
   } else if (!knownKeys.has(dimensionKey)) {
-    throw new AgentError(
-      `extract reply: dimensionKey "${dimensionKey}" is neither a known dimension nor NEW:lowerCamelCase`,
+    // Anti-drift alias guard v0: the model often forgets the NEW: prefix or
+    // shortens a known key ("budget" vs "budgetCap"). If the unknown key is a
+    // PREFIX of (or extends) exactly one known key, map it there. Anything
+    // else fails loud — synonyms need an explicit alias table (deferred).
+    const prefixMatches = [...knownKeys].filter(
+      (k) => k.startsWith(dimensionKey) || dimensionKey.startsWith(k),
     );
+    if (prefixMatches.length === 1) {
+      dimensionKey = prefixMatches[0];
+    } else if (prefixMatches.length > 1) {
+      throw new AgentError(
+        `extract reply: dimensionKey "${dimensionKey}" ambiguously matches known keys: ${prefixMatches.join(", ")}`,
+      );
+    } else {
+      throw new AgentError(
+        `extract reply: dimensionKey "${dimensionKey}" is neither a known dimension nor NEW:lowerCamelCase`,
+      );
+    }
   }
 
   const content: CaptureContent = { dimensionKey, value: normalizeNumericValue(entry.value) };

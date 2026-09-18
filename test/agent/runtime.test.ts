@@ -107,8 +107,8 @@ test("runtime: contextMemoriesOf formats key=value[state] lines and caps by limi
   capture(graph, { dimensionKey: "author", value: "charles" }, ctx);
   const lines = contextMemoriesOf(graph);
   assert.equal(lines.length, 2);
-  assert.match(lines[0] ?? "", /budget = 5000 CNY \[accepted\]/);
-  assert.match(lines[1] ?? "", /author = "charles" \[accepted\]/);
+  assert.match(lines[0] ?? "", /budget = 5000 CNY \[accepted @\d{4}-\d{2}-\d{2}\]/);
+  assert.match(lines[1] ?? "", /author = "charles" \[accepted @\d{4}-\d{2}-\d{2}\]/);
   const capped = contextMemoriesOf(graph, 1);
   assert.equal(capped.length, 1);
   assert.match(capped[0] ?? "", /author/); // newest kept

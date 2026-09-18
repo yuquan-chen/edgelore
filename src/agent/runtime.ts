@@ -193,7 +193,8 @@ export function contextMemoriesOf(graph: GraphStore, limit = 50): string[] {
     keys.set(d.id, d.key);
   }
   const lines = (graph.queryNodes({ type: "core:statement" }) as StatementNode[]).map(
-    (s) => `${keys.get(s.dimension_id) ?? "?"} = ${JSON.stringify(s.value)}${s.unit ? ` ${s.unit}` : ""} [${s.state}]`,
+    (s) =>
+      `${keys.get(s.dimension_id) ?? "?"} = ${JSON.stringify(s.value)}${s.unit ? ` ${s.unit}` : ""} [${s.state} @${s.created_at.slice(0, 10)}]`,
   );
   return lines.length > limit ? lines.slice(lines.length - limit) : lines;
 }
@@ -229,11 +230,16 @@ export async function retrievalContext(
     vectors: config.vectors,
   });
   const lines = hits.map((hit) => {
-    const parts = [`${hit.dimensionKey} = ${JSON.stringify(hit.value)} [${hit.state}]`];
+    // Short date rides along: temporal reasoning needs to know WHEN a fact was said.
+    const stmt = graph.getNode(hit.statementId) as StatementNode | undefined;
+    const day = stmt ? stmt.created_at.slice(0, 10) : "?";
+    const parts = [`${hit.dimensionKey} = ${JSON.stringify(hit.value)} [${hit.state} @${day}]`];
     const expansion = expandHit(graph, hit);
     if (expansion.siblings.length > 0) {
       parts.push(
-        `competing: ${expansion.siblings.map((s) => `${JSON.stringify(s.value)}[${s.state}]`).join(" vs ")}`,
+        `competing: ${expansion.siblings
+          .map((s) => `${JSON.stringify(s.value)}[${s.state} @${s.createdAt.slice(0, 10)}]`)
+          .join(" vs ")}`,
       );
     }
     for (const c of expansion.constraints) {

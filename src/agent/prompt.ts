@@ -112,7 +112,7 @@ const EXTRACT_RULES = [
   "1. NEVER output provenance (created_by / source_refs / created_at) — the runtime injects it.",
   "2. Never invent information that is not in the input text.",
   '3. dimensionKey is a subject-free address of the graph ("budget", not "p1_budget" or "my_project_budget"); project/scope context is NOT your business.',
-  "4. A dimensionKey must be either an existing key from knownDimensions, or NEW: followed by lowerCamelCase English (letters and digits, starting with a lowercase letter).",
+  "4. A dimensionKey must be either an existing key from knownDimensions, or NEW: followed by lowerCamelCase English (letters and digits, starting with a lowercase letter). BEFORE minting a NEW: key, scan knownDimensions carefully — the same concept almost always already has a key.",
   "5. If similarDimensions are provided and a candidate is the SAME slot as one of them, you MUST reuse that dimension's key — never mint a NEW key for an existing concept (key drift fragments the memory graph).",
   "6. If contextMemories already contain an equivalent value, still output the entry (capture deduplicates). If one contradicts, still output it (capture flags the conflict) — resolving conflicts is not your job.",
   "7. One entry per candidate, in order; each entry is independent.",

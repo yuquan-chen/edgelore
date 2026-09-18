@@ -40,6 +40,9 @@ export interface CaptureContext {
   created_by: string;
   /** Resolved source references (message / conversation ids). */
   source_refs: string[];
+  /** When the fact was actually said — for importing historical data. Omit
+   * for live captures (defaults to now). ISO-8601. */
+  createdAt?: string;
 }
 
 export interface CaptureResult {
@@ -79,6 +82,7 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
       // metadata) — it is what future extractors match phrases against.
       attributes: content.description ? { description: content.description } : {},
       created_by: ctx.created_by,
+      created_at: ctx.createdAt,
       source_refs: ctx.source_refs,
     });
     created = true;
@@ -118,6 +122,7 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
     unit: content.unit,
     state: newState,
     created_by: ctx.created_by,
+    created_at: ctx.createdAt,
     source_refs: ctx.source_refs,
   }) as StatementNode;
 

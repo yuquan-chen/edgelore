@@ -4,3 +4,6 @@ dist/
 .env*
 !.env.example
 .DS_Store
+benchmark/longmemeval/data/
+benchmark/longmemeval/.venv-mem0/
+benchmark/longmemeval/data/mem0-qdrant/

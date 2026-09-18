@@ -1,0 +1,55 @@
+{
+  "version": "1.0",
+  "description": "edgelore 内部评测集：写入管线的金标准句子集。gate = 期望门控判定；facts = 期望抽取的维度（keyAnyOf 为可接受的同义 key，value 为期望值）；conflict = 期望第二次陈述触发冲突标记。",
+  "cases": [
+    { "id": "R1-greeting", "category": "reject-greeting", "turns": [{ "text": "你好呀！" }], "expect": { "gate": "reject" } },
+    { "id": "R2-politeness", "category": "reject-greeting", "turns": [{ "text": "谢谢啦，辛苦了" }], "expect": { "gate": "reject" } },
+    { "id": "R3-ack", "category": "reject-greeting", "turns": [{ "text": "好的，明白了" }], "expect": { "gate": "reject" } },
+    { "id": "R4-transient", "category": "reject-transient", "turns": [{ "text": "我今天有点累" }], "expect": { "gate": "reject" } },
+    { "id": "R5-transient", "category": "reject-transient", "turns": [{ "text": "网速好慢啊" }], "expect": { "gate": "reject" } },
+    { "id": "R6-chatter", "category": "reject-greeting", "turns": [{ "text": "哈哈哈笑死我了" }], "expect": { "gate": "reject" } },
+    { "id": "R7-process", "category": "reject-process", "turns": [{ "text": "帮我看看这个文件" }], "expect": { "gate": "reject" } },
+    { "id": "R8-transient", "category": "reject-transient", "turns": [{ "text": "外面下雨了" }], "expect": { "gate": "reject" } },
+
+    { "id": "F1-owner", "category": "fact", "turns": [{ "text": "项目负责人是 charles" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["owner", "projectOwner", "projectLeader", "leader"], "value": "charles" }] } },
+    { "id": "F2-budget", "category": "constraint", "turns": [{ "text": "项目的预算上限是 5000 元" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["budget", "budgetCap", "budgetLimit", "projectBudget"], "value": 5000 }] } },
+    { "id": "F3-database", "category": "fact", "turns": [{ "text": "数据库我们决定用 PostgreSQL" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["database", "dbChoice", "databaseChoice"], "value": "PostgreSQL" }] } },
+    { "id": "F4-meeting", "category": "fact", "turns": [{ "text": "团队每周五下午开例会" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["meetingSchedule", "weeklyMeeting", "teamMeeting"], "value": "周五" }] } },
+    { "id": "F5-deadline", "category": "fact", "turns": [{ "text": "客户要求项目月底前交付" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["deadline", "deliveryDeadline", "deliveryDate"], "value": "月底" }] } },
+    { "id": "F6-stack", "category": "fact", "turns": [{ "text": "前端我们决定用 React" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["frontend", "frontendStack", "uiFramework"], "value": "React" }] } },
+    { "id": "F7-infra", "category": "fact", "turns": [{ "text": "服务器部署在阿里云上海区域" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["deployment", "cloudProvider", "serverRegion"], "value": "阿里云上海" }] } },
+    { "id": "F8-sla", "category": "constraint", "turns": [{ "text": "API 的响应时间必须控制在 200 毫秒以内" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["apiLatency", "responseTime", "apiResponseTime"], "value": 200 }] } },
+
+    { "id": "P1-language", "category": "preference", "turns": [{ "text": "以后回复我都用中文" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["replyLanguage", "communicationLanguage", "language"], "value": "中文" }] } },
+    { "id": "P2-style", "category": "preference", "turns": [{ "text": "我喜欢简洁的回复，不要废话" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["replyStyle", "responseStyle"], "value": "简洁" }] } },
+    { "id": "P3-code", "category": "preference", "turns": [{ "text": "代码注释用英文写" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["commentLanguage", "codeCommentLanguage"], "value": "英文" }] } },
+    { "id": "P4-meeting", "category": "preference", "turns": [{ "text": "我不喜欢开会，能用文档沟通就用文档" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["meetingPreference", "communicationPreference"], "value": "文档" }] } },
+
+    { "id": "C1-cost", "category": "constraint", "turns": [{ "text": "每月的服务器开销不能超过 3000 块" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["serverCost", "monthlyServerCost"], "value": 3000 }] } },
+    { "id": "C2-mirror", "category": "constraint", "turns": [{ "text": "所有依赖必须通过内部镜像源下载" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["dependencySource", "packageMirror"], "value": "内部镜像源" }] } },
+    { "id": "C3-security", "category": "constraint", "turns": [{ "text": "上线前必须通过安全扫描" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["releaseCheck", "securityScan"], "value": "安全扫描" }] } },
+    { "id": "C4-compliance", "category": "constraint", "turns": [{ "text": "敏感数据不能出现在日志里" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["logPolicy", "sensitiveData"], "value": "敏感数据" }] } },
+
+    { "id": "L1-release", "category": "lesson", "turns": [{ "text": "上次线上事故是因为没有做灰度发布，以后上线都要先灰度" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["releaseLesson", "grayRelease", "deployLesson"], "value": "灰度" }] } },
+    { "id": "L2-mock", "category": "lesson", "turns": [{ "text": "mock 测试没测出数据库迁移问题，以后要用真实数据库验证" }], "expect": { "gate": "store", "facts": [{ "keyAnyOf": ["dbTestLesson", "migrationLesson"], "value": "真实数据库" }] } },
+
+    { "id": "K1-owner-conflict", "category": "conflict", "turns": [
+        { "text": "项目负责人是 charles" },
+        { "text": "负责人换成 alice 了" }
+      ],
+      "expect": { "gate": "store", "conflict": true, "facts": [{ "keyAnyOf": ["owner", "projectOwner", "projectLeader", "leader"], "value": "alice" }] }
+    },
+    { "id": "K2-budget-conflict", "category": "conflict", "turns": [
+        { "text": "项目预算上限是 5000 元" },
+        { "text": "预算改成 8000 了" }
+      ],
+      "expect": { "gate": "store", "conflict": true, "facts": [{ "keyAnyOf": ["budget", "budgetCap", "budgetLimit", "projectBudget"], "value": 8000 }] }
+    },
+    { "id": "K3-db-conflict", "category": "conflict", "turns": [
+        { "text": "数据库我们用 MySQL" },
+        { "text": "还是换成 PostgreSQL 吧，最终决定用 PostgreSQL" }
+      ],
+      "expect": { "gate": "store", "conflict": true, "facts": [{ "keyAnyOf": ["database", "dbChoice", "databaseChoice"], "value": "PostgreSQL" }] }
+    }
+  ]
+}

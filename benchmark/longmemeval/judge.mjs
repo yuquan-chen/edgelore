@@ -7,40 +7,57 @@
 // set EDGELORE_JUDGE_MODEL (the strongest model available) and document it:
 // judge quality bounds the measured score's credibility.
 //
-// Usage: node benchmark/longmemeval/judge.mjs [--limit N]
+// Verdict cache keys are `${question_id}:${sha256(hypothesis)[:12]}` — the
+// old plain question_id key silently reused verdicts after the answers
+// changed, freezing the score to a stale run.
+//
+// Usage:
+//   node benchmark/longmemeval/judge.mjs --tag s1
+//     -> reads hypotheses-s1.jsonl, writes judge-verdicts-s1.json + judge-result-s1.json
+//   node benchmark/longmemeval/judge.mjs --hypotheses data/hypotheses-s1.jsonl --tag s1
+//   node benchmark/longmemeval/judge.mjs                (legacy untagged filenames)
 
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { OpenAiCompatDriver } from "../../dist/src/index.js";
+import { boot, requireChat } from "../lib/boot.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-
-function loadEnv(path) {
-  const env = {};
-  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-    if (line.trim().startsWith("#")) continue;
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m) env[m[1]] = m[2];
-  }
-  return env;
-}
-const env = loadEnv(join(here, "..", "..", ".env.local"));
-const BASE = env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
-const KEY = env.OPENAI_API_KEY;
-const JUDGE_MODEL = env.EDGELORE_JUDGE_MODEL ?? env.EDGELORE_MODEL ?? "deepseek-v4-flash-0731";
-
 const dataDir = join(here, "data");
+const { cfg } = boot();
+
+// --- args ----------------------------------------------------------------------
+
+const args = process.argv;
+function argVal(name) {
+  const i = args.indexOf(name);
+  return i !== -1 ? args[i + 1] : undefined;
+}
+const tag = argVal("--tag");
+const hypArg = argVal("--hypotheses");
+const limitIdx = args.indexOf("--limit");
+const maxN = limitIdx !== -1 ? Number(args[limitIdx + 1]) : Infinity;
+
+// --- inputs ----------------------------------------------------------------------
+
 const dataset = JSON.parse(readFileSync(join(dataDir, "longmemeval_oracle.json"), "utf8"));
-const hypPath = join(dataDir, "hypotheses.jsonl");
+const ref = new Map(dataset.map((q) => [q.question_id, q]));
+const hypPath = hypArg
+  ? (existsSync(hypArg) ? hypArg : join(dataDir, hypArg))
+  : join(dataDir, tag ? `hypotheses-${tag}.jsonl` : "hypotheses.jsonl");
 if (!existsSync(hypPath)) {
-  console.error("no hypotheses.jsonl — run answer.mjs first");
+  console.error(`no hypotheses file: ${hypPath} — run answer.mjs first`);
   process.exit(1);
 }
 const hyps = readFileSync(hypPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
-const ref = new Map(dataset.map((q) => [q.question_id, q]));
 
-const judge = new OpenAiCompatDriver({ baseUrl: BASE, apiKey: KEY, model: JUDGE_MODEL, maxTokens: 10, maxRetries: 2 });
+const JUDGE_MODEL = cfg.judgeModel ?? cfg.llm?.model;
+if (!JUDGE_MODEL) {
+  console.error("no judge model: set EDGELORE_JUDGE_MODEL (or EDGELORE_MODEL) in .env.local");
+  process.exit(1);
+}
+const judge = requireChat(cfg, { model: JUDGE_MODEL, maxTokens: 10, maxRetries: 2 });
 
 // --- official templates (verbatim from evaluate_qa.py) ------------------------
 
@@ -69,26 +86,28 @@ function anscheckPrompt(task, question, answer, response, abstention) {
   return `${T_ABSTENTION}\n\nQuestion: ${question}\n\nExplanation: ${answer}\n\nModel Response: ${response}\n\nDoes the model correctly identify the question as unanswerable? Answer yes or no only.`;
 }
 
-// --- resumable verdicts --------------------------------------------------------
+// --- resumable verdicts (keyed by question_id + answer content) -----------------
 
-const cachePath = join(dataDir, "judge-verdicts.json");
+const cachePath = join(dataDir, tag ? `judge-verdicts-${tag}.json` : "judge-verdicts.json");
 const verdicts = existsSync(cachePath) ? JSON.parse(readFileSync(cachePath, "utf8")) : {};
 
-const args = process.argv;
-const limitIdx = args.indexOf("--limit");
-const maxN = limitIdx !== -1 ? Number(args[limitIdx + 1]) : Infinity;
+function verdictKey(questionId, hypothesis) {
+  const h = createHash("sha256").update(hypothesis ?? "").digest("hex").slice(0, 12);
+  return `${questionId}:${h}`;
+}
 
 let judged = 0;
 for (const h of hyps) {
   if (judged >= maxN) break;
-  if (verdicts[h.question_id] !== undefined) continue;
+  const key = verdictKey(h.question_id, h.hypothesis);
+  if (verdicts[key] !== undefined) continue;
   const q = ref.get(h.question_id);
   if (!q) continue;
   const abstention = h.question_id.endsWith("_abs");
   const prompt = anscheckPrompt(q.question_type, q.question, q.answer, h.hypothesis, abstention);
   try {
     const resp = (await judge.complete(prompt)).trim().toLowerCase();
-    verdicts[h.question_id] = resp.includes("yes") ? 1 : 0;
+    verdicts[key] = resp.includes("yes") ? 1 : 0;
     judged += 1;
     if (judged % 25 === 0) {
       writeFileSync(cachePath, JSON.stringify(verdicts));
@@ -105,23 +124,40 @@ writeFileSync(cachePath, JSON.stringify(verdicts));
 const byType = {};
 let total = 0;
 let correct = 0;
-for (const q of dataset) {
-  const v = verdicts[q.question_id];
+for (const h of hyps) {
+  const v = verdicts[verdictKey(h.question_id, h.hypothesis)];
   if (v === undefined) continue;
+  const q = ref.get(h.question_id);
+  if (!q) continue;
   total += 1;
   correct += v;
-  const t = q.question_id.endsWith("_abs") ? "abstention" : q.question_type;
+  const t = h.question_id.endsWith("_abs") ? "abstention" : q.question_type;
   byType[t] = byType[t] ?? { n: 0, correct: 0 };
   byType[t].n += 1;
   byType[t].correct += v;
 }
+if (total === 0) {
+  console.error("no verdicts found — nothing judged yet");
+  process.exit(1);
+}
 console.log(`\njudge model: ${JUDGE_MODEL}`);
+console.log(`hypotheses: ${hypPath}`);
 console.log(`OVERALL: ${((correct / total) * 100).toFixed(1)}%  (${correct}/${total})`);
 for (const [t, s] of Object.entries(byType).sort((a, b) => b[1].n - a[1].n)) {
   console.log(`  ${t}: ${((s.correct / s.n) * 100).toFixed(1)}%  (${s.correct}/${s.n})`);
 }
+const resultPath = join(dataDir, tag ? `judge-result-${tag}.json` : "judge-result.json");
 writeFileSync(
-  join(dataDir, "judge-result.json"),
-  JSON.stringify({ judge_model: JUDGE_MODEL, overall: { correct, total }, by_type: byType }, null, 2),
+  resultPath,
+  JSON.stringify(
+    {
+      judge_model: JUDGE_MODEL,
+      hypotheses: hypPath,
+      overall: { correct, total },
+      by_type: byType,
+    },
+    null,
+    2,
+  ),
 );
-console.log("saved: data/judge-result.json");
+console.log(`saved: ${resultPath}`);

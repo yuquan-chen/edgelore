@@ -6,35 +6,20 @@
 //
 // Usage: node benchmark/longmemeval/reindex.mjs [--batch 32]
 
-import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   SqliteGraph,
-  OpenAiCompatEmbeddingDriver,
   SqliteVectorStore,
 } from "../../dist/src/index.js";
+import { boot, requireEmbedding } from "../lib/boot.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-function loadEnv(path) {
-  const env = {};
-  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-    if (line.trim().startsWith("#")) continue;
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m) env[m[1]] = m[2];
-  }
-  return env;
-}
-const env = loadEnv(join(here, "..", "..", ".env.local"));
+const { cfg } = boot();
 const graph = new SqliteGraph(join(here, "data", "memory.db"));
 const vectors = new SqliteVectorStore(graph);
-const embedder = new OpenAiCompatEmbeddingDriver({
-  baseUrl: env.OPENAI_EMBEDDING_BASE_URL ?? env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
-  apiKey: env.OPENAI_EMBEDDING_API_KEY ?? env.OPENAI_API_KEY,
-  model: env.EDGELORE_EMBEDDING_MODEL,
-  dimensions: Number(env.EDGELORE_EMBEDDING_DIMENSIONS ?? 1024),
-});
+const embedder = requireEmbedding(cfg);
 
 const have = new Set(vectors.all().map((e) => e.id));
 const all = (graph.queryNodes({ type: "core:statement" }) ?? []).filter((s) => !have.has(s.id));

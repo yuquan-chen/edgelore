@@ -13,32 +13,22 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   SqliteGraph,
-  OpenAiCompatDriver,
-  OpenAiCompatEmbeddingDriver,
   SqliteVectorStore,
+  embeddingDriver,
   parseJsonReply,
   capture,
+  buildBatchExtractionPrompt,
+  normalizeBatchContents,
 } from "../../dist/src/index.js";
+import { boot, requireChat } from "../lib/boot.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
 // --- env ---------------------------------------------------------------------
 
-function loadEnv(path) {
-  const env = {};
-  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-    if (line.trim().startsWith("#")) continue;
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m) env[m[1]] = m[2];
-  }
-  return env;
-}
-const env = loadEnv(join(here, "..", "..", ".env.local"));
-const BASE = env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
-const KEY = env.OPENAI_API_KEY;
-const MODEL = env.EDGELORE_MODEL ?? "deepseek-v4-flash-0731";
-if (!KEY) {
-  console.error("missing OPENAI_API_KEY");
+const { cfg } = boot();
+if (!cfg.llm) {
+  console.error("missing OPENAI_API_KEY / EDGELORE_MODEL (check .env.local at repo root)");
   process.exit(1);
 }
 
@@ -86,17 +76,10 @@ function checkpoint(sid) {
 
 // --- extraction --------------------------------------------------------------
 
-const driver = new OpenAiCompatDriver({ baseUrl: BASE, apiKey: KEY, model: MODEL, maxTokens: 16000, extraBody: { thinking: { type: "disabled" } } }); // 抽取是机械活：关思考省预算提速
+const driver = requireChat(cfg, { maxTokens: 16000, extraBody: { thinking: { type: "disabled" } } }); // 抽取是机械活：关思考省预算提速
 const graph = new SqliteGraph(dbPath);
 const vectors = new SqliteVectorStore(graph);
-const embedder = env.EDGELORE_EMBEDDING_MODEL
-  ? new OpenAiCompatEmbeddingDriver({
-      baseUrl: env.OPENAI_EMBEDDING_BASE_URL ?? BASE,
-      apiKey: env.OPENAI_EMBEDDING_API_KEY ?? env.OPENAI_API_KEY,
-      model: env.EDGELORE_EMBEDDING_MODEL,
-      dimensions: Number(env.EDGELORE_EMBEDDING_DIMENSIONS ?? 1024),
-    })
-  : undefined;
+const embedder = cfg.embedding ? embeddingDriver(cfg) : undefined;
 const ctx = { created_by: "human:longmemeval_user", source_refs: [] };
 
 function knownDimensions() {
@@ -105,39 +88,6 @@ function knownDimensions() {
     description: typeof d.attributes?.description === "string" ? d.attributes.description : d.key,
     cardinality: d.cardinality ?? "multi",
   }));
-}
-
-function batchPrompt(transcript, known) {
-  const knownStr = known.length ? known.map((k) => JSON.stringify(k)).join("\n") : "(none yet)";
-  return [
-    "You are extracting durable long-term memories from ONE session of a conversation",
-    "between a user and an assistant. Extract every fact worth remembering months later:",
-    "decisions, preferences, constraints, facts, plans, lessons. Skip greetings, small",
-    "talk, transient chatter, and assistant hedging.",
-    "",
-    "Known dimensions (REUSE one of these keys if a fact is the same slot — never mint",
-    "a new key for an existing concept):",
-    knownStr,
-    "",
-    "For each fact output one object:",
-    '{ "dimensionKey": "<known key, or NEW:lowerCamelCase>",',
-    '  "value": <bare NUMBER for quantities (e.g. 5000, never "5000"), else a short',
-    '           string in the original language verbatim>,',
-    '  "dimensionDescription": "<one short line in the original language, NEW: only>",',
-    '  "cardinality": "<single|multi, NEW: only>",',
-    '  "unit": "<optional, e.g. CNY, days, km>" }',
-    "",
-    "Notes: attribute facts to the USER's life/project (the assistant only helps);",
-    "if the user CORRECTS an earlier statement in this session, extract the final",
-    "corrected value only.",
-    "",
-    "Session transcript:",
-    transcript,
-    "",
-    'Respond with ONLY one JSON object, no fences: { "contents": [ ... ] }',
-    "Extract at most 12 facts per session - prefer the most durable and important.",
-    "If nothing is worth remembering, respond { \"contents\": [] }.",
-  ].join("\n");
 }
 
 function captureContents(contents, sessionId, date) {
@@ -212,36 +162,15 @@ for (const [sid, session] of sessions) {
   }
 
   try {
-    const reply = await driver.complete(batchPrompt(transcript, knownDimensions()));
+    const reply = await driver.complete(
+      buildBatchExtractionPrompt({
+        transcript,
+        knownDimensions: knownDimensions(),
+        maxFacts: cfg.extraction.maxFactsPerSession,
+      }),
+    );
     const parsed = parseJsonReply(reply);
-    const contents = (parsed.contents ?? []).map((c) => {
-      // strip NEW: prefix + validate minimally (mirrors runExtract contract)
-      if (typeof c.dimensionKey !== "string" || c.value === undefined || c.value === null) {
-        throw new Error(`bad content: ${JSON.stringify(c).slice(0, 120)}`);
-      }
-      let key = c.dimensionKey;
-      if (key.startsWith("NEW:")) {
-        key = key.slice(4);
-        if (!/^[a-z][a-zA-Z0-9]*$/.test(key)) throw new Error(`bad NEW key: ${c.dimensionKey}`);
-      } else {
-        const known = knownDimensions().find((k) => k.key === key);
-        if (!known) {
-          // the model meant a new key but forgot the NEW: prefix — accept
-          // valid camelCase as new, reject anything malformed
-          if (!/^[a-z][a-zA-Z0-9]*$/.test(key)) throw new Error(`malformed key: ${key}`);
-        }
-      }
-      const out = { dimensionKey: key, value: c.value };
-      if (typeof c.value === "string" && /^-?(0|[1-9]\d*)(\.\d+)?$/.test(c.value.trim())) {
-        out.value = Number(c.value.trim());
-      }
-      if (c.cardinality === "single" || c.cardinality === "multi") out.cardinality = c.cardinality;
-      if (typeof c.unit === "string" && c.unit) out.unit = c.unit;
-      if (typeof c.dimensionDescription === "string" && c.dimensionDescription.trim()) {
-        out.description = c.dimensionDescription.trim();
-      }
-      return out;
-    });
+    const contents = normalizeBatchContents(parsed.contents ?? []);
     ctx.source_refs = [sid];
     const stored = captureContents(contents, sid, session.date);
     workerFacts += stored;

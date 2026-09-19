@@ -10,32 +10,16 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   MemoryGraph,
-  OpenAiCompatDriver,
   runGate,
   runExtract,
   capture,
 } from "../../dist/src/index.js";
+import { boot, requireChat } from "../lib/boot.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-function loadEnv(path) {
-  const env = {};
-  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-    if (line.trim().startsWith("#")) continue;
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m) env[m[1]] = m[2];
-  }
-  return env;
-}
-const env = loadEnv(join(here, "..", "..", ".env.local"));
-const BASE = env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
-const KEY = env.OPENAI_API_KEY;
-const MODEL = env.EDGELORE_MODEL ?? "deepseek-v4-flash-0731";
-if (!KEY || !MODEL) {
-  console.error("missing OPENAI_API_KEY / EDGELORE_MODEL in .env.local");
-  process.exit(1);
-}
-const driver = new OpenAiCompatDriver({ baseUrl: BASE, apiKey: KEY, model: MODEL });
+const { cfg } = boot();
+const driver = requireChat(cfg);
 
 const golden = JSON.parse(readFileSync(join(here, "golden-set.json"), "utf8")).cases;
 const limitIdx = process.argv.indexOf("--limit");

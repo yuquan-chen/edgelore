@@ -2,48 +2,35 @@
 // 从 missing-sessions.json 读取缺失列表，逐个抽取+入库。
 // Usage: node benchmark/longmemeval/fill-gaps.mjs
 
-import { readFileSync, appendFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   SqliteGraph,
-  OpenAiCompatDriver,
-  OpenAiCompatEmbeddingDriver,
   SqliteVectorStore,
+  embeddingDriver,
   parseJsonReply,
   capture,
+  buildBatchExtractionPrompt,
+  normalizeBatchContents,
 } from "../../dist/src/index.js";
+import { boot, requireChat } from "../lib/boot.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-function loadEnv(path) {
-  const env = {};
-  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-    if (line.trim().startsWith("#")) continue;
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m) env[m[1]] = m[2];
-  }
-  return env;
+const { cfg } = boot();
+if (!cfg.llm) {
+  console.error("missing OPENAI_API_KEY / EDGELORE_MODEL (check .env.local at repo root)");
+  process.exit(1);
 }
-const env = loadEnv(join(here, "..", "..", ".env.local"));
-const BASE = env.OPENAI_BASE_URL ?? "https://api.dogrouter.ai/v1";
-const KEY = env.OPENAI_API_KEY;
-const MODEL = env.EDGELORE_MODEL ?? "deepseek-v4-flash-0731";
 
 const dataset = JSON.parse(readFileSync(join(here, "data", "longmemeval_oracle.json"), "utf8"));
 const missingIds = new Set(JSON.parse(readFileSync(join(here, "data", "missing-sessions.json"), "utf8")));
 
 const graph = new SqliteGraph(join(here, "data", "memory.db"));
-const driver = new OpenAiCompatDriver({ baseUrl: BASE, apiKey: KEY, model: MODEL, maxTokens: 16000, extraBody: { thinking: { type: "disabled" } } });
+const driver = requireChat(cfg, { maxTokens: 16000, extraBody: { thinking: { type: "disabled" } } });
 const vectors = new SqliteVectorStore(graph);
-const embedder = env.EDGELORE_EMBEDDING_MODEL
-  ? new OpenAiCompatEmbeddingDriver({
-      baseUrl: env.OPENAI_EMBEDDING_BASE_URL ?? BASE,
-      apiKey: env.OPENAI_EMBEDDING_API_KEY ?? KEY,
-      model: env.EDGELORE_EMBEDDING_MODEL,
-      dimensions: Number(env.EDGELORE_EMBEDDING_DIMENSIONS ?? 1024),
-    })
-  : undefined;
+const embedder = cfg.embedding ? embeddingDriver(cfg) : undefined;
 
 // 收集缺失会话的数据
 const targets = [];
@@ -71,29 +58,6 @@ function knownDims() {
   }));
 }
 
-function batchPrompt(transcript, known) {
-  const knownStr = known.length ? known.map((k) => JSON.stringify(k)).join("\n") : "(none yet)";
-  return [
-    "You are extracting durable long-term memories from ONE session of a conversation.",
-    "Extract every fact worth remembering months later. Skip greetings and transient chatter.",
-    "",
-    "Known dimensions (REUSE if same slot):",
-    knownStr,
-    "",
-    "For each fact output one object:",
-    '{ "dimensionKey": "<known key or NEW:lowerCamelCase>",',
-    '  "value": <bare NUMBER for quantities, else short string in original language>,',
-    '  "dimensionDescription": "<one line in original language, NEW: only>",',
-    '  "cardinality": "<single|multi, NEW: only>",',
-    '  "unit": "<optional>" }',
-    "",
-    "Extract at most 12 facts. If nothing worth remembering, respond { \"contents\": [] }.",
-    "",
-    "Session transcript:",
-    transcript,
-  ].join("\n");
-}
-
 let stored = 0, errors = 0;
 const t0 = Date.now();
 
@@ -107,18 +71,15 @@ for (let i = 0; i < targets.length; i++) {
 
   try {
     ctx.source_refs = [t.sid];
-    const reply = await driver.complete(batchPrompt(transcript, knownDims()));
+    const reply = await driver.complete(
+      buildBatchExtractionPrompt({
+        transcript,
+        knownDimensions: knownDims(),
+        maxFacts: cfg.extraction.maxFactsPerSession,
+      }),
+    );
     const parsed = parseJsonReply(reply);
-    const contents = (parsed.contents ?? []).map((c) => {
-      let key = c.dimensionKey;
-      if (key.startsWith("NEW:")) key = key.slice(4);
-      const out = { dimensionKey: key, value: c.value };
-      if (c.cardinality === "single" || c.cardinality === "multi") out.cardinality = c.cardinality;
-      if (typeof c.unit === "string" && c.unit) out.unit = c.unit;
-      if (typeof c.dimensionDescription === "string" && c.dimensionDescription.trim()) out.description = c.dimensionDescription.trim();
-      if (typeof out.value === "string" && /^-?(0|[1-9]\d*)(\.\d+)?$/.test(out.value.trim())) out.value = Number(out.value.trim());
-      return out;
-    });
+    const contents = normalizeBatchContents(parsed.contents ?? []);
 
     for (const c of contents) {
       capture(graph, c, { ...ctx, createdAt: t.date || undefined });

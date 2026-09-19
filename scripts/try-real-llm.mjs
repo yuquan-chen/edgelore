@@ -8,61 +8,17 @@
 // Usage:  npm run build && node scripts/try-real-llm.mjs
 // Config: reads .env.local (DOGROUTER_API_KEY / DOGROUTER_BASE_URL / EDGELORE_MODEL)
 
-import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
 import { MemoryGraph, runGate, runExtract, capture } from "../dist/src/index.js";
-
-const here = dirname(fileURLToPath(import.meta.url));
+import { boot, requireChat } from "../benchmark/lib/boot.mjs";
 
 // --- env -------------------------------------------------------------------
 
-function loadEnv(path) {
-  const env = {};
-  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-    if (line.trim().startsWith("#")) continue;
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m) env[m[1]] = m[2];
-  }
-  return env;
-}
-
-const env = loadEnv(join(here, "..", ".env.local"));
-const BASE_URL = env.OPENAI_BASE_URL ?? env.DOGROUTER_BASE_URL ?? "https://api.dogrouter.ai/v1";
-const API_KEY = env.OPENAI_API_KEY ?? env.DOGROUTER_API_KEY;
-const MODEL = env.EDGELORE_MODEL ?? "deepseek-v4-flash-0731";
-if (!API_KEY) {
-  console.error("missing OPENAI_API_KEY in .env.local");
+const { cfg } = boot();
+if (!cfg.llm) {
+  console.error("missing OPENAI_API_KEY / EDGELORE_MODEL (check .env.local at repo root)");
   process.exit(1);
 }
-
-// --- LlmDriver over an OpenAI-compatible chat endpoint -----------------------
-// Same shape as src/agent/llm-driver.ts LlmDriver: complete(prompt) -> string.
-
-function makeDriver() {
-  return {
-    async complete(prompt) {
-      const res = await fetch(`${BASE_URL}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEY}` },
-        body: JSON.stringify({
-          model: MODEL,
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0,
-          max_tokens: 700,
-        }),
-        signal: AbortSignal.timeout(60_000),
-      });
-      if (!res.ok) throw new Error(`API ${res.status}: ${(await res.text()).slice(0, 300)}`);
-      const data = await res.json();
-      const content = data.choices?.[0]?.message?.content;
-      if (typeof content !== "string") {
-        throw new Error(`unexpected API shape: ${JSON.stringify(data).slice(0, 300)}`);
-      }
-      return content;
-    },
-  };
-}
+const driver = requireChat(cfg);
 
 // --- runtime context recipes (what the future runtime.ts will do) ------------
 
@@ -101,11 +57,10 @@ const TURNS = [
 
 // --- main --------------------------------------------------------------------
 
-const driver = makeDriver();
 const graph = new MemoryGraph();
 const ctx = { created_by: "human:charles", source_refs: [] };
 
-console.log(`model: ${MODEL}\nendpoint: ${BASE_URL}\n`);
+console.log(`model: ${cfg.llm.model}\nendpoint: ${cfg.llm.baseUrl}\n`);
 
 // smoke ping first — fail fast on bad key / bad model name
 try {

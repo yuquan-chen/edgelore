@@ -7,7 +7,7 @@
 //
 // Usage: node benchmark/longmemeval/coverage.mjs
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SqliteGraph } from "../../dist/src/index.js";
@@ -26,8 +26,9 @@ for (const s of graph.queryNodes({ type: "core:statement" })) {
 }
 
 const missing = [...sessionIds].filter((sid) => !covered.has(sid));
+const coveredCount = [...covered].filter((s) => sessionIds.has(s)).length;
 console.log(`数据集唯一会话: ${sessionIds.size}`);
-console.log(`已覆盖: ${covered.size & sessionIds.size ? [...covered].filter((s) => sessionIds.has(s)).length : 0}`);
+console.log(`已覆盖: ${coveredCount}`);
 console.log(`缺失: ${missing.length}`);
 if (missing.length > 0 && missing.length <= 50) {
   console.log("缺失会话 ID:");

@@ -11,25 +11,13 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { OpenAiCompatDriver } from "../../dist/src/index.js";
+import { boot, requireChat } from "../lib/boot.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-function loadEnv(path) {
-  const env = {};
-  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-    if (line.trim().startsWith("#")) continue;
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m) env[m[1]] = m[2];
-  }
-  return env;
-}
-const env = loadEnv(join(here, "..", "..", ".env.local"));
-const BASE = env.OPENAI_BASE_URL ?? "https://api.dogrouter.ai/v1";
-const KEY = env.OPENAI_API_KEY;
-const MODEL = env.EDGELORE_MODEL ?? "deepseek-v4-flash-0731";
-
-const driver = new OpenAiCompatDriver({ baseUrl: BASE, apiKey: KEY, model: MODEL, maxTokens: 16000 });
+const { cfg } = boot();
+const driver = requireChat(cfg, { maxTokens: 16000 });
+const MODEL = cfg.llm?.model ?? "(unset)";
 
 const dataset = JSON.parse(readFileSync(join(here, "data", "longmemeval_oracle.json"), "utf8"));
 const temporal = dataset.filter((q) => q.question_type === "temporal-reasoning");

@@ -3,107 +3,199 @@
 // For each dataset question: retrieve from the shared memory store and answer
 // strictly grounded in it (abstains with 不知道 when insufficient — the
 // benchmark's abstention questions test exactly this). Resumable: already-
-// answered question_ids in the JSONL are skipped.
+// answered question_ids in the tagged JSONL are skipped.
 //
-// Usage: node benchmark/longmemeval/answer.mjs [--limit N] [--k 10]
+// Sampling is SEEDED (mulberry32): the same --seed picks the same subset, so
+// a before/after comparison compares the same exam. The old Math.random
+// sampling made every run a different exam — historical cross-run numbers
+// were not paired. `--random` is kept as a deprecated alias.
+//
+// Each question's `question_date` is passed to the answering layer as "now"
+// (pure string transform — never through new Date(), whose UTC conversion
+// shifts pre-08:00 timestamps a day back on UTC+8 machines).
+//
+// Usage:
+//   node benchmark/longmemeval/answer.mjs --sample 100 --seed 20260919 --tag s1
+//   node benchmark/longmemeval/answer.mjs --ids data/stage1-ids.txt --tag s1
+//   node benchmark/longmemeval/answer.mjs --limit 50              (sequential head)
+//   node benchmark/longmemeval/answer.mjs --ids ... --dry-run     (zero API calls)
+//
+// --tag NAME writes hypotheses-NAME.jsonl + answer-meta-NAME.json (and
+// resumes from the tagged JSONL); without it the legacy filenames are used.
 
-import { readFileSync, existsSync, appendFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readFileSync, existsSync, appendFileSync, writeFileSync } from "node:fs";
+import { join, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
+import { boot, requireChat } from "../lib/boot.mjs";
 import {
   SqliteGraph,
-  OpenAiCompatDriver,
-  OpenAiCompatEmbeddingDriver,
   SqliteVectorStore,
+  embeddingDriver,
   answerQuestion,
 } from "../../dist/src/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-
-function loadEnv(path) {
-  const env = {};
-  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-    if (line.trim().startsWith("#")) continue;
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m) env[m[1]] = m[2];
-  }
-  return env;
-}
-const env = loadEnv(join(here, "..", "..", ".env.local"));
-const BASE = env.OPENAI_BASE_URL ?? "https://api.dogrouter.ai/v1";
-const KEY = env.OPENAI_API_KEY;
-const MODEL = env.EDGELORE_MODEL ?? "deepseek-v4-flash-0731";
-if (!KEY || !MODEL) {
-  console.error("missing OPENAI_API_KEY / EDGELORE_MODEL");
-  process.exit(1);
-}
-
 const dataDir = join(here, "data");
-const dataset = JSON.parse(readFileSync(join(dataDir, "longmemeval_oracle.json"), "utf8"));
-const graph = new SqliteGraph(join(dataDir, "memory.db"));
-const driver = new OpenAiCompatDriver({ baseUrl: BASE, apiKey: KEY, model: MODEL, maxTokens: 16000 });
+const { cfg } = boot();
 
-const retrieval = env.EDGELORE_EMBEDDING_MODEL
-  ? {
-      embedder: new OpenAiCompatEmbeddingDriver({
-        baseUrl: env.OPENAI_EMBEDDING_BASE_URL ?? BASE,
-        apiKey: env.OPENAI_EMBEDDING_API_KEY ?? KEY,
-        model: env.EDGELORE_EMBEDDING_MODEL,
-        dimensions: Number(env.EDGELORE_EMBEDDING_DIMENSIONS ?? 1024),
-      }),
-      vectors: new SqliteVectorStore(graph),
-    }
-  : undefined;
-
-// resume support
-const hypPath = join(dataDir, "hypotheses.jsonl");
-const answered = new Set();
-if (existsSync(hypPath)) {
-  for (const line of readFileSync(hypPath, "utf8").split("\n")) {
-    if (!line.trim()) continue;
-    try { answered.add(JSON.parse(line).question_id); } catch {}
-  }
-}
+// --- args ----------------------------------------------------------------------
 
 const args = process.argv;
-function argVal(name, fallback) {
+function argVal(name) {
   const i = args.indexOf(name);
-  return i !== -1 ? Number(args[i + 1]) : fallback;
+  return i !== -1 ? args[i + 1] : undefined;
 }
-const k = argVal("--k", 10);
+const k = Number(argVal("--k") ?? 10);
+const seed = Number(argVal("--seed") ?? 20260919);
+const idsArg = argVal("--ids");
+const tag = argVal("--tag");
+const dryRun = args.includes("--dry-run");
 const limitIdx = args.indexOf("--limit");
 const maxQ = limitIdx !== -1 ? Number(args[limitIdx + 1]) : Infinity;
-const randomSample = args.includes("--random");
+const legacyRandom = args.includes("--random");
+const sampleArg = argVal("--sample");
+const sampleSize = sampleArg !== undefined ? Number(sampleArg) : legacyRandom ? maxQ : undefined;
+if (legacyRandom) {
+  console.warn(
+    "[warn] --random is deprecated (it was unseeded — every run a different exam); use --sample N --seed S",
+  );
+}
 
-// --random 时打乱题目顺序（均匀覆盖五种能力）
-function shuffle(arr) {
+// --- subset selection: --ids wins, then --sample (seeded), else sequential --limit
+
+const dataset = JSON.parse(readFileSync(join(dataDir, "longmemeval_oracle.json"), "utf8"));
+
+/** "2023/04/10 (Mon) 23:07" -> "2023-04-10". Pure string transform on purpose. */
+function isoDay(raw) {
+  const m = /^(\d{4})\/(\d{2})\/(\d{2})/.exec(raw ?? "");
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : undefined;
+}
+
+/** Deterministic PRNG + Fisher-Yates: same seed -> same permutation. */
+function mulberry32(s) {
+  let a = s >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function seededShuffle(arr, rand) {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = Math.floor(rand() * (i + 1));
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
 }
-const questions = randomSample ? shuffle(dataset).slice(0, maxQ) : dataset;
 
-// --- tqdm-style progress bar ---
+let mode = "sequential";
+let questions;
+if (idsArg) {
+  mode = "ids";
+  const candidates = [idsArg, join(dataDir, idsArg)].filter((p) => isAbsolute(p) || existsSync(p));
+  const idsPath = candidates.find((p) => existsSync(p));
+  if (!idsPath) {
+    console.error(`--ids file not found: ${idsArg}`);
+    process.exit(1);
+  }
+  const byId = new Map(dataset.map((q) => [q.question_id, q]));
+  const wanted = readFileSync(idsPath, "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"));
+  const unknown = wanted.filter((id) => !byId.has(id));
+  if (unknown.length > 0) {
+    console.error(`--ids file has ${unknown.length} ids not in the dataset, e.g. ${unknown[0]}`);
+    process.exit(1);
+  }
+  questions = wanted.map((id) => byId.get(id));
+} else if (sampleSize !== undefined) {
+  mode = "sample";
+  questions = seededShuffle(dataset, mulberry32(seed)).slice(0, sampleSize);
+} else {
+  questions = Number.isFinite(maxQ) ? dataset.slice(0, maxQ) : dataset;
+}
+
+// --- tagged output paths ---------------------------------------------------------
+
+const hypPath = tag ? join(dataDir, `hypotheses-${tag}.jsonl`) : join(dataDir, "hypotheses.jsonl");
+const metaPath = tag ? join(dataDir, `answer-meta-${tag}.json`) : join(dataDir, "answer-meta.json");
+
+// --- meta (written for both dry-run and real runs: the exam paper of record) -----
+
+const meta = {
+  tag: tag ?? null,
+  mode,
+  seed: mode === "sample" ? seed : null,
+  sample_size: mode === "sample" ? sampleSize : null,
+  ids_file: idsArg ?? null,
+  k,
+  model: cfg.llm?.model ?? null,
+  base_url: cfg.llm?.baseUrl ?? null,
+  embedding_model: cfg.embedding?.model ?? null,
+  dataset_size: dataset.length,
+  selected_ids: questions.map((q) => q.question_id),
+  started_at: new Date().toISOString(),
+};
+
+if (dryRun) {
+  const byType = {};
+  for (const q of questions) {
+    const t = q.question_id.endsWith("_abs") ? "abstention" : q.question_type;
+    byType[t] = (byType[t] ?? 0) + 1;
+  }
+  console.log(`[dry-run] mode=${mode}${mode === "sample" ? ` seed=${seed}` : ""} 题数=${questions.length}`);
+  console.log(`能力分布: ${JSON.stringify(byType)}`);
+  console.log(`将写入: ${hypPath}`);
+  console.log(`meta -> ${metaPath}`);
+  writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+  process.exit(0);
+}
+
+// --- plumbing --------------------------------------------------------------------
+
+requireChat(cfg, { maxTokens: 16000 }); // fail fast with a readable message
+const driver = requireChat(cfg, { maxTokens: 16000 });
+const graph = new SqliteGraph(join(dataDir, "memory.db"));
+const retrieval = cfg.embedding
+  ? { embedder: embeddingDriver(cfg), vectors: new SqliteVectorStore(graph) }
+  : undefined;
+
+// resume support
+const answered = new Set();
+if (existsSync(hypPath)) {
+  for (const line of readFileSync(hypPath, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      answered.add(JSON.parse(line).question_id);
+    } catch {}
+  }
+}
+const todo = questions.filter((q) => !answered.has(q.question_id));
+console.log(`待回答: ${todo.length}/${questions.length} 题 | 模型: ${cfg.llm?.model} | mode=${mode}\n`);
+
+// --- tqdm-style progress bar -------------------------------------------------------
+
 const t0 = Date.now();
 function bar(current, total, extra = "") {
   const w = 25;
-  const filled = Math.min(w, Math.round(w * current / total));
-  const bar = "█".repeat(filled) + "░".repeat(w - filled);
-  const pct = ((current / total) * 100).toFixed(1);
+  const filled = Math.min(w, Math.round((w * current) / Math.max(total, 1)));
+  const fill = "█".repeat(filled) + "░".repeat(w - filled);
+  const pct = ((current / Math.max(total, 1)) * 100).toFixed(1);
   const elapsed = (Date.now() - t0) / 1000;
   const rate = current > 0 ? current / elapsed : 0;
   const eta = current > 0 ? Math.round((total - current) / rate) : 0;
   const etaStr = eta > 60 ? `${Math.floor(eta / 60)}m${eta % 60}s` : `${eta}s`;
   const elStr = elapsed > 60 ? `${Math.floor(elapsed / 60)}m${Math.round(elapsed % 60)}s` : `${Math.round(elapsed)}s`;
-  process.stdout.write(`\r${bar} ${pct}% | ${current}/${total} | ${rate.toFixed(1)} q/s | 已用 ${elStr} 剩余~${etaStr} | ${extra}`);
+  process.stdout.write(
+    `\r${fill} ${pct}% | ${current}/${total} | ${rate.toFixed(1)} q/s | 已用 ${elStr} 剩余~${etaStr} | ${extra}`,
+  );
 }
 
-// --- main loop ---
-const todo = (randomSample ? shuffle(dataset).slice(0, maxQ) : dataset).filter((q) => !answered.has(q.question_id));
-console.log(`待回答: ${todo.length}/${dataset.length} 题 | 模型: ${MODEL}\n`);
+// --- main loop ----------------------------------------------------------------------
 
 let done = 0;
 let abstain = 0;
@@ -111,7 +203,11 @@ let errors = 0;
 for (const q of todo) {
   if (done >= maxQ) break;
   try {
-    const r = await answerQuestion(graph, q.question, driver, { retrieval, k });
+    const r = await answerQuestion(graph, q.question, driver, {
+      retrieval,
+      k,
+      now: isoDay(q.question_date), // honored by the answering layer (W4); ignored before
+    });
     appendFileSync(hypPath, JSON.stringify({ question_id: q.question_id, hypothesis: r.answer }) + "\n");
     done += 1;
     if (r.answer === "不知道") abstain += 1;
@@ -119,7 +215,15 @@ for (const q of todo) {
     errors += 1;
     process.stdout.write(`\n[warn] ${q.question_id}: ${err.message.slice(0, 80)}\n`);
   }
-  bar(done + errors, Math.min(todo.length + errors, 500), `${abstain} 拒答 ${errors} 错误`);
+  bar(done + errors, todo.length, `${abstain} 拒答 ${errors} 错误`);
 }
 
+meta.finished_at = new Date().toISOString();
+meta.answered = done;
+meta.abstained = abstain;
+meta.errors = errors;
+writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+
 console.log(`\n\n完成: ${done} 回答 | ${abstain} 拒答 | ${errors} 错误`);
+console.log(`hypotheses -> ${hypPath}`);
+console.log(`meta -> ${metaPath}`);

@@ -172,3 +172,38 @@ test("in-memory vector store roundtrips", () => {
   assert.equal(all.length, 2);
   assert.deepEqual(all.find((e) => e.id === "a")?.vector, [4, 5, 6]);
 });
+
+// --- W4: candidate pre-filters (states / date window) -------------------------
+
+test("retrieval: states filter restricts candidates before scoring", async () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "owner", value: "alice", cardinality: "single" }, ctx); // accepted
+  capture(graph, { dimensionKey: "owner", value: "bob", cardinality: "single" }, ctx); // tentative (clash)
+  const all = await retrieveRelevant(graph, { query: "alice bob", mode: "lexical" });
+  assert.equal(all.length, 2);
+  const acceptedOnly = await retrieveRelevant(graph, { query: "alice bob", mode: "lexical", states: ["accepted"] });
+  assert.equal(acceptedOnly.length, 1);
+  assert.equal(acceptedOnly[0]?.value, "alice");
+});
+
+test("retrieval: dateFrom/dateTo window filters candidates inclusively", async () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "trip", value: "旧金山" }, { ...ctx, createdAt: "2023-01-05T10:00:00Z" });
+  capture(graph, { dimensionKey: "trip", value: "夏威夷" }, { ...ctx, createdAt: "2023-06-05T10:00:00Z" });
+  const windowed = await retrieveRelevant(graph, {
+    query: "旧金山 夏威夷",
+    mode: "lexical",
+    dateFrom: "2023-06-01",
+    dateTo: "2023-12-31",
+  });
+  assert.equal(windowed.length, 1);
+  assert.equal(windowed[0]?.value, "夏威夷");
+  // inclusive bounds: the exact boundary day is kept
+  const edge = await retrieveRelevant(graph, {
+    query: "夏威夷",
+    mode: "lexical",
+    dateFrom: "2023-06-05",
+    dateTo: "2023-06-05",
+  });
+  assert.equal(edge.length, 1);
+});

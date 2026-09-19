@@ -170,3 +170,95 @@ test("capture: no description -> attributes stay empty", () => {
     assert.deepEqual(dim.attributes, {});
   });
 });
+
+// --- W2: saidBy content-axis attribution + trust policy -----------------------
+
+// 9. Assistant-authored statement -> tentative, dimension NOT flagged conflict.
+test("capture: saidBy=assistant enters tentative without flagging conflict", () => {
+  forBackend((g) => {
+    const r = capture(g, { dimensionKey: "db_choice", value: "PostgreSQL", saidBy: "assistant" }, ctx);
+    assert.equal(r.state, "tentative");
+    assert.equal(r.conflict, false);
+    const stmt = g.getNode(r.statementId!) as { state: string; saidBy?: string };
+    assert.equal(stmt.state, "tentative");
+    assert.equal(stmt.saidBy, "assistant");
+  });
+});
+
+// 10. Assistant claim clashing with an accepted incumbent: tentative, but the
+//     dimension stays OUT of the human adjudication queue.
+test("capture: assistant clash on single-cardinality dimension does not flag conflict", () => {
+  forBackend((g) => {
+    const r1 = capture(g, { dimensionKey: "db", value: "MySQL", cardinality: "single" }, ctx);
+    const r2 = capture(g, { dimensionKey: "db", value: "PostgreSQL", saidBy: "assistant" }, ctx);
+    assert.equal(r2.state, "tentative");
+    assert.equal(r2.conflict, false);
+    const dim = g.getNode(r1.dimensionId) as { state: string };
+    assert.notEqual(dim.state, "conflict");
+  });
+});
+
+// 11. saidBy=user keeps the legacy accepted path (trust policy keys off saidBy).
+test("capture: saidBy=user keeps the legacy accepted path", () => {
+  forBackend((g) => {
+    const r = capture(g, { dimensionKey: "owner", value: "alice", saidBy: "user" }, ctx);
+    assert.equal(r.state, "accepted");
+    assert.equal(r.conflict, false);
+    const stmt = g.getNode(r.statementId!) as { state: string; saidBy?: string };
+    assert.equal(stmt.state, "accepted");
+    assert.equal(stmt.saidBy, "user");
+  });
+});
+
+// 12. User restating an assistant's tentative value = confirmation (flip).
+test("capture: user restating an assistant value confirms it (tentative -> accepted)", () => {
+  forBackend((g) => {
+    const a = capture(g, { dimensionKey: "db", value: "PostgreSQL", saidBy: "assistant" }, ctx);
+    assert.equal(a.state, "tentative");
+    const u = capture(g, { dimensionKey: "db", value: "PostgreSQL" }, ctx);
+    assert.equal(u.deduplicated, true);
+    assert.equal(u.state, "accepted");
+    const stmt = g.getNode(u.statementId!) as { state: string };
+    assert.equal(stmt.state, "accepted");
+  });
+});
+
+// 13. ...but the flip never mints a second accepted on a single dimension:
+//     restating against an incumbent flags the conflict for resolve instead.
+test("capture: user restatement clashing with an incumbent flags conflict", () => {
+  forBackend((g) => {
+    const u1 = capture(g, { dimensionKey: "db", value: "MySQL", cardinality: "single" }, ctx);
+    const a = capture(g, { dimensionKey: "db", value: "PostgreSQL", saidBy: "assistant" }, ctx);
+    const u2 = capture(g, { dimensionKey: "db", value: "PostgreSQL" }, ctx);
+    assert.equal(u2.deduplicated, true);
+    assert.equal(u2.conflict, true);
+    assert.equal(u2.state, "tentative"); // NOT promoted — a clash needs resolve
+    const dim = g.getNode(u1.dimensionId) as { state: string };
+    assert.equal(dim.state, "conflict");
+    const pg = g.getNode(a.statementId!) as { state: string };
+    assert.equal(pg.state, "tentative"); // untouched, awaiting resolve
+  });
+});
+
+// 14. No flip while an adjudication is already running (dimension conflict).
+test("capture: no confirmation flip while the dimension is in conflict", () => {
+  forBackend((g) => {
+    const r1 = capture(g, { dimensionKey: "budget", value: 5000, cardinality: "single" }, ctx);
+    capture(g, { dimensionKey: "budget", value: 8000, cardinality: "single" }, ctx); // user clash
+    const dim = g.getNode(r1.dimensionId) as { state: string };
+    assert.equal(dim.state, "conflict");
+    const a = capture(g, { dimensionKey: "budget", value: 8000, saidBy: "assistant" }, ctx);
+    assert.equal(a.deduplicated, true);
+    assert.equal(a.state, "tentative"); // the user-vs-user clash stays as-is
+  });
+});
+
+// 15. Invalid attribution fails loud at the boundary.
+test("capture: invalid saidBy is rejected", () => {
+  forBackend((g) => {
+    assert.throws(
+      () => capture(g, { dimensionKey: "db", value: "x", saidBy: "system" as never }, ctx),
+      /saidBy/,
+    );
+  });
+});

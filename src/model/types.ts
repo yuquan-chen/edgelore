@@ -119,6 +119,18 @@ export interface SourceNode extends BaseNode {
   attributes: Record<string, unknown>;
 }
 
+/**
+ * Content-axis attribution: who said this IN THE CONVERSATION. Distinct from
+ * the system-axis provenance `created_by` (which records which principal
+ * wrote the object to the graph — runtime-injected, never agent-authored).
+ * `saidBy` is CONTENT (who spoke the words is part of what the fact IS), so
+ * it belongs to the agent-authored side of the frozen field trichotomy:
+ * provenance system-injected / content agent-filled / states system-generated.
+ * capture() validates it at the boundary; widen the union deliberately if a
+ * third conversational role ever appears.
+ */
+export type SaidBy = "user" | "assistant";
+
 /** Dimension identity, e.g. "design cost of project P". */
 export interface DimensionNode extends BaseNode {
   type: "core:dimension";
@@ -135,6 +147,10 @@ export interface StatementNode extends BaseNode {
   dimension_id: string;
   value: unknown;
   unit?: string;
+  /** In-conversation speaker (content axis — see {@link SaidBy}). Absent on
+   * legacy rows; capture() defaults its trust policy off it (assistant
+   * statements enter `tentative` pending user confirmation). */
+  saidBy?: SaidBy;
   attributes: Record<string, unknown>;
 }
 

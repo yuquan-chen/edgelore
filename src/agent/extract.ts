@@ -130,10 +130,22 @@ function toCaptureContent(raw: unknown, knownKeys: ReadonlySet<string>): Capture
   }
 
   const content: CaptureContent = { dimensionKey, value: normalizeNumericValue(entry.value) };
+  applyOptionalContentFields(content, entry);
+  return content;
+}
+
+/**
+ * Fill the optional entry fields (dimensionDescription / cardinality / unit /
+ * saidBy) onto a CaptureContent, validating each. Shared by the strict
+ * per-turn narrow ({@link toCaptureContent}) and the lenient batch narrow
+ * ({@link normalizeBatchContents}) so the two paths cannot drift apart.
+ */
+function applyOptionalContentFields(content: CaptureContent, entry: Record<string, unknown>): void {
+  const label = content.dimensionKey;
   if (entry.dimensionDescription !== undefined) {
     if (typeof entry.dimensionDescription !== "string" || entry.dimensionDescription.trim().length === 0) {
       throw new AgentError(
-        `extract reply: content "${dimensionKey}" dimensionDescription must be a non-empty string`,
+        `extract reply: content "${label}" dimensionDescription must be a non-empty string`,
       );
     }
     content.description = entry.dimensionDescription.trim();
@@ -141,18 +153,73 @@ function toCaptureContent(raw: unknown, knownKeys: ReadonlySet<string>): Capture
   if (entry.cardinality !== undefined) {
     if (entry.cardinality !== "single" && entry.cardinality !== "multi") {
       throw new AgentError(
-        `extract reply: content "${dimensionKey}" cardinality must be "single" or "multi"`,
+        `extract reply: content "${label}" cardinality must be "single" or "multi"`,
       );
     }
     content.cardinality = entry.cardinality;
   }
   if (entry.unit !== undefined) {
     if (typeof entry.unit !== "string" || entry.unit.length === 0) {
-      throw new AgentError(`extract reply: content "${dimensionKey}" unit must be a non-empty string`);
+      throw new AgentError(`extract reply: content "${label}" unit must be a non-empty string`);
     }
     content.unit = entry.unit;
   }
-  return content;
+  if (entry.saidBy !== undefined) {
+    if (entry.saidBy !== "user" && entry.saidBy !== "assistant") {
+      throw new AgentError(
+        `extract reply: content "${label}" saidBy must be "user" or "assistant", got: ${JSON.stringify(entry.saidBy)}`,
+      );
+    }
+    content.saidBy = entry.saidBy;
+  }
+}
+
+/**
+ * Narrow a BATCH extraction reply's contents (the session-level bulk-import
+ * path used by the benchmark harnesses). Deliberately more lenient than
+ * {@link toCaptureContent}: a bare lowerCamelCase key without the NEW:
+ * prefix is ACCEPTED as a new key (batch sessions mint many keys; the alias
+ * guard's ambiguity checks matter less than not losing a whole session to
+ * one strict failure). Everything else — value normalization, optional
+ * fields, saidBy — follows the exact same contract.
+ *
+ * @param raw the parsed reply's `contents` array (each entry an object)
+ * @param knownKeys keys of dimensions already in the graph (informational;
+ *   unknown keys are accepted as new when well-formed)
+ * @returns one CaptureContent per entry, order preserved
+ * @throws AgentError on malformed entries (missing key/value, bad enum)
+ */
+export function normalizeBatchContents(
+  raw: readonly unknown[],
+  knownKeys?: ReadonlySet<string>,
+): CaptureContent[] {
+  return raw.map((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new AgentError("batch extract: each content must be a JSON object");
+    }
+    const rec = entry as Record<string, unknown>;
+    if (typeof rec.dimensionKey !== "string" || rec.dimensionKey.length === 0) {
+      throw new AgentError("batch extract: content.dimensionKey must be a non-empty string");
+    }
+    if (rec.value === undefined || rec.value === null) {
+      throw new AgentError(`batch extract: content "${rec.dimensionKey}" is missing a value`);
+    }
+    let dimensionKey = rec.dimensionKey;
+    if (dimensionKey.startsWith(NEW_PREFIX)) {
+      const key = dimensionKey.slice(NEW_PREFIX.length);
+      if (!LOWER_CAMEL_CASE.test(key)) {
+        throw new AgentError(`batch extract: "${rec.dimensionKey}" is not NEW:lowerCamelCase`);
+      }
+      dimensionKey = key;
+    } else if (!knownKeys?.has(dimensionKey) && !LOWER_CAMEL_CASE.test(dimensionKey)) {
+      // Lenient path: an unknown key is fine when well-formed (the model
+      // meant a new key and forgot NEW:); anything malformed fails loud.
+      throw new AgentError(`batch extract: malformed dimensionKey "${dimensionKey}"`);
+    }
+    const content: CaptureContent = { dimensionKey, value: normalizeNumericValue(rec.value) };
+    applyOptionalContentFields(content, rec);
+    return content;
+  });
 }
 
 /**

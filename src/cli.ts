@@ -8,16 +8,14 @@
 //
 // Usage: edgelore [--db path.db] <command>  (see docs/shared-memory-m2-spec.md)
 
-import { readFileSync } from "node:fs";
 import { SqliteGraph } from "./store/sqlite.js";
 import { capture, type CaptureContent, type CaptureContext } from "./agent/capture.js";
-import { OpenAiCompatDriver } from "./agent/openai-compat-driver.js";
-import { OpenAiCompatEmbeddingDriver } from "./agent/embedding-driver.js";
 import { processTurn, type RetrievalConfig } from "./agent/runtime.js";
 import { expandHit, retrieveRelevant, SqliteVectorStore, type RetrievalMode } from "./agent/retrieval.js";
-import { autoResolveConstraintGuided, listConflicts, resolveConflict } from "./agent/conflicts.js";
+import { autoResolveConstraintGuided, confirmStatement, listConflicts, resolveConflict } from "./agent/conflicts.js";
 import { startMcpServer } from "./mcp/server.js";
 import { answerQuestion } from "./agent/ask.js";
+import { chatDriver, configFromEnv, embeddingDriver, loadDotEnv, type EdgeloreConfig } from "./config.js";
 import type { AddConstraintInput, AddEdgeInput, AddNodeInput } from "./model/store.js";
 import type { DimensionNode, ExpressionNode, StatementNode } from "./model/types.js";
 
@@ -55,15 +53,23 @@ function positionals(args: string[]): string[] {
 }
 
 /**
- * Build retrieval plumbing from env / .env.local when an embedding model is
- * configured; undefined otherwise (processTurn then degrades to "latest 50").
+ * Build retrieval plumbing from the resolved config when an embedding model
+ * is configured; undefined otherwise (processTurn then degrades to "latest
+ * 50"). CLI flags win over config for per-invocation tuning.
  */
-function retrievalFromEnv(g: SqliteGraph, flags: Map<string, string>): RetrievalConfig | undefined {
-  if (!process.env.EDGELORE_EMBEDDING_MODEL) return undefined;
+function retrievalFromConfig(
+  g: SqliteGraph,
+  cfg: EdgeloreConfig,
+  flags: Map<string, string>,
+): RetrievalConfig | undefined {
+  if (!cfg.embedding) return undefined;
   return {
-    embedder: OpenAiCompatEmbeddingDriver.fromEnv(process.env),
+    embedder: embeddingDriver(cfg),
     vectors: new SqliteVectorStore(g),
-    mode: flags.has("mode") ? (flags.get("mode") as RetrievalMode) : undefined,
+    mode: flags.has("mode") ? (flags.get("mode") as RetrievalMode) : cfg.retrieval.mode,
+    rrfSmoothing: cfg.retrieval.rrfSmoothing,
+    maxEntriesPerDimension: cfg.retrieval.maxEntriesPerDimension,
+    maxContextLines: cfg.retrieval.maxContextLines,
   };
 }
 
@@ -88,35 +94,21 @@ function emit(value: unknown): void {
   process.stdout.write(JSON.stringify(value) + "\n");
 }
 
-/**
- * Load a `.env`-style file into process.env, WITHOUT overriding variables
- * already set in the real environment. Missing file is silently ignored.
- * Keeps API keys out of shell history and out of git (.env* is gitignored).
- */
-function loadDotEnv(path: string): void {
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch {
-    return;
-  }
-  for (const line of raw.split(/\r?\n/)) {
-    if (line.trim().startsWith("#")) continue;
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
-  }
-}
-
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const flags = parseFlags(argv);
   const pos = positionals(argv);
   const dbPath = flags.get("db") ?? "./edgelore.db";
 
+  // One env load + config resolution for the whole process; local-only
+  // commands never touch cfg.llm/cfg.embedding, so they work with no .env.
+  loadDotEnv(".env.local");
+  const cfg = configFromEnv();
+
   const [entity, action, target] = pos;
   if (!entity) {
     throw new Error(
-      "missing command (node|edge|constraint|evaluate|get|capture|remember|search|ask|conflicts|resolve|autoresolve|digest|mcp)",
+      "missing command (node|edge|constraint|evaluate|get|capture|remember|search|ask|conflicts|resolve|autoresolve|confirm|digest|mcp)",
     );
   }
 
@@ -241,8 +233,7 @@ async function main(): Promise<void> {
             'usage: remember "text" --created-by human:x [--model m] [--base-url u] [--api-key k]',
           );
         }
-        loadDotEnv(".env.local");
-        const driver = OpenAiCompatDriver.fromEnv(process.env, {
+        const driver = chatDriver(cfg, {
           ...(flags.has("api-key") ? { apiKey: flags.get("api-key") } : {}),
           ...(flags.has("base-url") ? { baseUrl: flags.get("base-url") } : {}),
           ...(flags.has("model") ? { model: flags.get("model") } : {}),
@@ -253,7 +244,7 @@ async function main(): Promise<void> {
             ? (parseJson(req(flags, "source-refs"), false) as string[])
             : [],
         };
-        const retrieval = retrievalFromEnv(g, flags);
+        const retrieval = retrievalFromConfig(g, cfg, flags);
         emit(await processTurn(g, text, driver, context, retrieval ? { retrieval } : undefined));
         break;
       }
@@ -268,8 +259,7 @@ async function main(): Promise<void> {
         if (!query) {
           throw new Error('usage: search "query" [--k n] [--mode hybrid|vector|lexical]');
         }
-        loadDotEnv(".env.local");
-        const embedder = OpenAiCompatEmbeddingDriver.fromEnv(process.env);
+        const embedder = embeddingDriver(cfg);
         const mode = flags.has("mode") ? (flags.get("mode") as RetrievalMode) : undefined;
         const k = flags.has("k") ? Number(flags.get("k")) : undefined;
         const hits = await retrieveRelevant(g, {
@@ -313,6 +303,22 @@ async function main(): Promise<void> {
         break;
       }
 
+      case "confirm": {
+        // Human confirmation of a tentative statement (typically an
+        // assistant-authored fact awaiting the user's nod — W2 trust
+        // policy). Distinct from resolve: no conflict, nothing superseded.
+        if (!action) {
+          throw new Error("usage: confirm <statement-id> --by human:x [--note t]");
+        }
+        emit(
+          confirmStatement(g, action, {
+            confirmedBy: req(flags, "by"),
+            note: flags.get("note"),
+          }),
+        );
+        break;
+      }
+
       case "ask": {
         // The answering layer: grounded in retrieved memories, abstains when
         // they are insufficient (never invents from outside knowledge).
@@ -320,14 +326,14 @@ async function main(): Promise<void> {
           .slice(1)
           .join(" ")
           .trim();
-        if (!question) throw new Error('usage: ask "question" [--db path] [--k n]');
-        loadDotEnv(".env.local");
-        const driver = OpenAiCompatDriver.fromEnv(process.env);
-        const retrieval = retrievalFromEnv(g, flags);
+        if (!question) throw new Error('usage: ask "question" [--db path] [--k n] [--today YYYY-MM-DD]');
+        const driver = chatDriver(cfg);
+        const retrieval = retrievalFromConfig(g, cfg, flags);
         emit(
           await answerQuestion(g, question, driver, {
             retrieval,
             k: flags.has("k") ? Number(flags.get("k")) : undefined,
+            now: flags.get("today"),
           }),
         );
         break;
@@ -356,7 +362,9 @@ async function main(): Promise<void> {
           const retired = flagged.filter((s) => s.state === "superseded" || s.state === "rejected");
           if (pendingJ.length > 0) {
             lines.push(
-              `  - ⚠ 待裁决: ${pendingJ.map((s) => `${JSON.stringify(s.value)}[${s.state}]`).join(", ")}`,
+              `  - ⚠ 待裁决: ${pendingJ
+                .map((s) => `${JSON.stringify(s.value)}[${s.state}]${s.saidBy === "assistant" ? "(assistant，待确认)" : ""}`)
+                .join(", ")}`,
             );
           }
           if (retired.length > 0) {
@@ -380,21 +388,17 @@ async function main(): Promise<void> {
 
       case "mcp": {
         // Channel A infra: stdio MCP server (Claude Code / Codex / any MCP host).
-        loadDotEnv(".env.local");
-        const chatDriver = process.env.EDGELORE_MODEL
-          ? OpenAiCompatDriver.fromEnv(process.env)
-          : undefined; // memory_remember reports the missing config when called
         await startMcpServer(g, {
           createdBy: flags.get("created-by") ?? "human:local",
-          chatDriver,
-          retrieval: retrievalFromEnv(g, flags),
+          chatDriver: cfg.llm ? chatDriver(cfg) : undefined, // memory_remember reports the missing config when called
+          retrieval: retrievalFromConfig(g, cfg, flags),
         });
         break;
       }
 
       default:
         throw new Error(
-          `unknown command: ${entity} (node|edge|constraint|evaluate|get|capture|remember|search|ask|conflicts|resolve|autoresolve|digest|mcp)`,
+          `unknown command: ${entity} (node|edge|constraint|evaluate|get|capture|remember|search|ask|conflicts|resolve|autoresolve|confirm|digest|mcp)`,
         );
     }
   } finally {

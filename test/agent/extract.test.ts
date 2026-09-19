@@ -10,8 +10,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { AgentError } from "../../src/agent/errors.js";
 import { MockDriver } from "../../src/agent/llm-driver.js";
-import { buildExtractPrompt, type KnownDimension } from "../../src/agent/prompt.js";
-import { runExtract } from "../../src/agent/extract.js";
+import { buildBatchExtractionPrompt, buildExtractPrompt, type KnownDimension } from "../../src/agent/prompt.js";
+import { normalizeBatchContents, runExtract } from "../../src/agent/extract.js";
 
 const KNOWN: KnownDimension[] = [
   { key: "budget", description: "项目预算", cardinality: "single", unit: "CNY" },
@@ -252,4 +252,76 @@ test("extract: similarDimensions are injected into the prompt with reuse pressur
   assert.match(p, /SAME slot, REUSE its key/);
   assert.match(p, /"owner"/);
   assert.match(p, /项目负责人/);
+});
+
+// --- W3: saidBy attribution + batch normalization -----------------------------
+
+test("extract: saidBy passes through to CaptureContent", async () => {
+  const driver = contentsDriver([
+    { dimensionKey: "NEW:databaseChoice", value: "PostgreSQL", saidBy: "assistant" },
+    { dimensionKey: "budget", value: 5000, saidBy: "user" },
+  ]);
+  const r = await runExtract({
+    text: "助手推荐了 PostgreSQL；预算 5000",
+    candidates: ["助手推荐了 PostgreSQL", "预算 5000"],
+    knownDimensions: KNOWN,
+    contextMemories: [],
+    driver,
+  });
+  assert.equal(r.action, "STORE");
+  assert.equal(r.contents?.[0]?.saidBy, "assistant");
+  assert.equal(r.contents?.[1]?.saidBy, "user");
+});
+
+test("extract: invalid saidBy fails loud", async () => {
+  const driver = contentsDriver([{ dimensionKey: "budget", value: 1, saidBy: "system" }]);
+  await assert.rejects(
+    () =>
+      runExtract({
+        text: "x",
+        candidates: ["x"],
+        knownDimensions: KNOWN,
+        contextMemories: [],
+        driver,
+      }),
+    AgentError,
+  );
+});
+
+test("batch: normalizeBatchContents accepts bare camelCase keys without NEW: (lenient)", () => {
+  const contents = normalizeBatchContents([
+    { dimensionKey: "weddingAttended", value: "Sarah 的婚礼", saidBy: "user" },
+    { dimensionKey: "NEW:smokerPurchase", value: 1, cardinality: "single" },
+    { dimensionKey: "budget", value: "5000" }, // numeric string -> number
+  ]);
+  assert.equal(contents.length, 3);
+  assert.equal(contents[0]?.dimensionKey, "weddingAttended");
+  assert.equal(contents[0]?.saidBy, "user");
+  assert.equal(contents[1]?.dimensionKey, "smokerPurchase"); // NEW: stripped
+  assert.equal(contents[1]?.cardinality, "single");
+  assert.equal(contents[2]?.value, 5000);
+});
+
+test("batch: normalizeBatchContents rejects malformed entries", () => {
+  assert.throws(() => normalizeBatchContents([{ dimensionKey: "", value: 1 }]), /dimensionKey/);
+  assert.throws(() => normalizeBatchContents([{ dimensionKey: "ok key!" , value: 1 }]), /malformed/);
+  assert.throws(() => normalizeBatchContents([{ dimensionKey: "ok" }]), /missing a value/);
+  assert.throws(
+    () => normalizeBatchContents([{ dimensionKey: "ok", value: 1, saidBy: "ai" }]),
+    /saidBy/,
+  );
+});
+
+test("batch: buildBatchExtractionPrompt carries both-speaker attribution and no bias", () => {
+  const p = buildBatchExtractionPrompt({
+    transcript: "[user] hi",
+    knownDimensions: KNOWN,
+    maxFacts: 12,
+  });
+  assert.match(p, /BOTH sides of the conversation/);
+  assert.match(p, /saidBy/);
+  assert.match(p, /"assistant"/);
+  assert.ok(!/the assistant only helps/.test(p), "the old bias must be gone");
+  assert.match(p, /at most 12 facts/);
+  assert.match(p, /"budget"/); // known dimensions injected
 });

@@ -65,7 +65,12 @@
             "phase_id": { "type": "string" },
             "dimension_id": { "type": "string", "description": "required for core:statement" },
             "value": {},
-            "unit": { "type": "string" }
+            "unit": { "type": "string" },
+            "saidBy": {
+              "type": "string",
+              "enum": ["user", "assistant"],
+              "description": "Content-axis attribution: who said this in the conversation (vs created_by, the system-axis writer). Optional; capture defaults its trust policy off it."
+            }
           },
           "additionalProperties": true
         }

@@ -21,8 +21,9 @@
 // values, no schema change — pure M0 primitives (narrow state, wide metadata).
 
 import { AgentError } from "./errors.js";
+import { valuesEqual } from "./capture.js";
 import { MemoryGraph } from "../model/store.js";
-import type { Constraint, DimensionNode, FactNodeState, StatementNode } from "../model/types.js";
+import type { Constraint, DimensionNode, FactNodeState, SaidBy, StatementNode } from "../model/types.js";
 import type { EvaluationResult } from "../engine/evaluate.js";
 
 /** One statement row in a conflict docket. */
@@ -32,6 +33,9 @@ export interface ConflictStatement {
   state: FactNodeState;
   createdBy: string;
   createdAt: string;
+  /** Content-axis speaker when recorded (assistant claims read differently
+   * in a docket — an unconfirmed suggestion vs a user assertion). */
+  saidBy?: SaidBy;
 }
 
 /** A pending conflict: one dimension with incompatible live statements. */
@@ -61,6 +65,7 @@ export function listConflicts(graph: MemoryGraph): ConflictCase[] {
       state: s.state,
       createdBy: s.created_by,
       createdAt: s.created_at,
+      ...(s.saidBy !== undefined ? { saidBy: s.saidBy } : {}),
     });
     const mine = stmts.filter((s) => s.dimension_id === dim.id);
     cases.push({
@@ -174,6 +179,91 @@ export interface AutoResolutionOutcome {
   reason: string;
   /** Present only when status === "resolved". */
   result?: ResolveResult;
+}
+
+/** Options for {@link confirmStatement}. */
+export interface ConfirmOptions {
+  /** WHO confirmed — MUST be `human:<id>` (Q01-style governance). */
+  confirmedBy: string;
+  /** Optional rationale, stored on the statement attributes. */
+  note?: string;
+}
+
+/** Result of {@link confirmStatement}. */
+export interface ConfirmResult {
+  statementId: string;
+  dimensionId: string;
+  state: "accepted";
+}
+
+/**
+ * Confirm a tentative statement — typically an assistant-authored fact that
+ * entered `tentative` pending user confirmation (W2 trust policy).
+ *
+ * Deliberately NOT resolveConflict: there is no facing incumbent and no
+ * dimension conflict here, so there is nothing to supersede — the statement
+ * simply becomes accepted, and the decision is recorded in attributes
+ * (narrow state, wide metadata). The human requirement matches resolve.
+ *
+ * Refuses when the dimension is single-cardinality and already holds a
+ * DIFFERENT accepted value: that IS a real conflict, and confirming past it
+ * would create two live accepted values behind resolve's back — route it
+ * through resolveConflict instead.
+ *
+ * @param graph a concrete MemoryGraph (or SqliteGraph)
+ * @param statementId the tentative statement to promote
+ * @param opts who confirmed (human) and why
+ * @returns the confirmation summary
+ * @throws AgentError if confirmedBy is not human:<id>, the statement is
+ *   missing / not tentative, or a single-cardinality rival exists
+ */
+export function confirmStatement(
+  graph: MemoryGraph,
+  statementId: string,
+  opts: ConfirmOptions,
+): ConfirmResult {
+  if (!opts.confirmedBy.startsWith("human:")) {
+    throw new AgentError("confirmation requires a human: confirmedBy must be human:<id>");
+  }
+  const node = graph.getNode(statementId);
+  if (!node || node.type !== "core:statement") {
+    throw new AgentError(`statement not found: ${statementId}`);
+  }
+  const stmt = node as StatementNode;
+  if (stmt.state !== "tentative") {
+    throw new AgentError(`statement is not tentative (state: ${stmt.state}) — nothing to confirm`);
+  }
+  const dim = graph.getNode(stmt.dimension_id);
+  if (!dim || dim.type !== "core:dimension") {
+    throw new AgentError(`dimension not found: ${stmt.dimension_id}`);
+  }
+  if ((dim as DimensionNode).cardinality === "single") {
+    const rival = (graph.queryNodes({ type: "core:statement" }) as StatementNode[]).find(
+      (s) =>
+        s.dimension_id === dim.id &&
+        s.id !== stmt.id &&
+        s.state === "accepted" &&
+        !valuesEqual(s.value, stmt.value),
+    );
+    if (rival) {
+      throw new AgentError(
+        `single-cardinality dimension "${(dim as DimensionNode).key}" already holds a different ` +
+          `accepted value (${JSON.stringify(rival.value)}) — confirming here would mint a second ` +
+          `accepted value. Have the user restate the value in conversation (that flags the ` +
+          `conflict), then use resolve.`,
+      );
+    }
+  }
+  // The decision record rides in open metadata; mutating attributes BEFORE
+  // the transition means the SqliteGraph write-through persists both.
+  stmt.attributes = {
+    ...stmt.attributes,
+    confirmed_by: opts.confirmedBy,
+    confirmed_at: new Date().toISOString(),
+    ...(opts.note ? { confirm_note: opts.note } : {}),
+  };
+  graph.transitionNodeState(stmt.id, "accepted");
+  return { statementId: stmt.id, dimensionId: dim.id, state: "accepted" };
 }
 
 /**

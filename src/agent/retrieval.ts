@@ -104,13 +104,23 @@ export interface RetrievalInput {
   embedder?: EmbeddingDriver;
   /** Required for the vector route. */
   vectors?: VectorStore;
+  /** RRF smoothing constant (default 60) — lower weights top ranks higher. */
+  smoothing?: number;
+  /** Restrict candidates to these statement states (default: ALL states —
+   * counting questions need superseded/tentative to stay visible). */
+  states?: readonly FactNodeState[];
+  /** Inclusive lower bound on the statement's created_at DAY ("YYYY-MM-DD"). */
+  dateFrom?: string;
+  /** Inclusive upper bound on the statement's created_at DAY ("YYYY-MM-DD"). */
+  dateTo?: string;
 }
 
 /**
  * Retrieve the statements most relevant to a query, fused across routes.
  *
  * @param graph any graph backend (lexical route works everywhere)
- * @param input query, k, mode, and optional embedding plumbing
+ * @param input query, k, mode, optional embedding plumbing, and optional
+ *   state/date candidate filters (applied once, before both routes score)
  * @returns up to k hits, best fused score first
  * @throws AgentError when mode is "vector" but no embedder/store is given
  */
@@ -121,7 +131,16 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
   if (mode === "vector" && (!input.embedder || !input.vectors)) {
     throw new AgentError('retrieval mode "vector" requires an embedder and a vector store');
   }
-  const stmts = graph.queryNodes({ type: "core:statement" }) as StatementNode[];
+  const all = graph.queryNodes({ type: "core:statement" }) as StatementNode[];
+  if (all.length === 0) return [];
+  // One candidate pre-filter (state / date window) shared by both routes.
+  const stmts = all.filter((s) => {
+    if (input.states && !input.states.includes(s.state)) return false;
+    const day = s.created_at.slice(0, 10);
+    if (input.dateFrom && day < input.dateFrom) return false;
+    if (input.dateTo && day > input.dateTo) return false;
+    return true;
+  });
   if (stmts.length === 0) return [];
   const dims = new Map<string, GraphNode>(
     graph.queryNodes({ type: "core:dimension" }).map((d) => [d.id, d]),
@@ -161,7 +180,7 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
   const usable = routes.filter((r) =>
     mode === "vector" ? r.name === "vector" : mode === "lexical" ? r.name === "lexical" : true,
   );
-  const fused = fuseRRF(usable);
+  const fused = fuseRRF(usable, input.smoothing ?? 60);
   return [...fused.entries()]
     .sort((a, b) => b[1].score - a[1].score)
     .slice(0, k)
@@ -213,10 +232,15 @@ export function expandHit(graph: MemoryGraph, hit: RetrievalHit, maxSiblings = 5
   return { siblings, constraints };
 }
 
-/** Canonical text a statement is embedded / lexically matched against. */
+/** Canonical text a statement is embedded / lexically matched against.
+ * Assistant-authored statements get an explicit speaker prefix: queries like
+ * "助手推荐了什么数据库" must lexically hit the attribution, not just the
+ * value. Legacy rows (no saidBy) are untouched, so existing vectors stay
+ * valid — the prefix only ever applies to new assistant statements. */
 export function statementText(graph: GraphStore, stmt: StatementNode): string {
   const dim = graph.getNode(stmt.dimension_id) as DimensionNode | undefined;
-  return `${dim?.key ?? ""} ${JSON.stringify(stmt.value)}${stmt.unit ? ` ${stmt.unit}` : ""}`;
+  const speaker = stmt.saidBy === "assistant" ? "assistant: " : "";
+  return `${speaker}${dim?.key ?? ""} ${JSON.stringify(stmt.value)}${stmt.unit ? ` ${stmt.unit}` : ""}`;
 }
 
 // --- routes ------------------------------------------------------------------

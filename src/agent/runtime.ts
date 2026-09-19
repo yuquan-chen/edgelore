@@ -16,7 +16,7 @@
 //                 posture and constraint verdicts attached
 
 import type { GraphStore, MemoryGraph } from "../model/store.js";
-import type { DimensionNode, StatementNode } from "../model/types.js";
+import type { DimensionNode, FactNodeState, StatementNode } from "../model/types.js";
 import { capture, type CaptureContext, type CaptureResult } from "./capture.js";
 import { runGate } from "./gate.js";
 import { runExtract } from "./extract.js";
@@ -24,7 +24,6 @@ import type { KnownDimension } from "./prompt.js";
 import type { LlmDriver } from "./llm-driver.js";
 import type { EmbeddingDriver } from "./embedding-driver.js";
 import {
-  expandHit,
   retrieveRelevant,
   statementText,
   type RetrievalMode,
@@ -62,8 +61,21 @@ export interface RetrievalConfig {
   vectors: VectorStore;
   /** Route selection (default "hybrid"). */
   mode?: RetrievalMode;
-  /** Max context hits (default 8). */
+  /** Max context hits, i.e. how many dimensions get a group (default 8). */
   k?: number;
+  /** RRF smoothing constant (default 60) — lower weights top ranks higher. */
+  rrfSmoothing?: number;
+  /** Per-dimension entry cap in grouped ask context (default 8). */
+  maxEntriesPerDimension?: number;
+  /** Hard line budget for the assembled context (default 48). */
+  maxContextLines?: number;
+  /** Candidate state filter (default: ALL states — counting questions need
+   * superseded/tentative visible; narrow deliberately, never by default). */
+  states?: FactNodeState[];
+  /** Inclusive created_at day bounds ("YYYY-MM-DD") for candidates. */
+  dateFrom?: string;
+  /** Inclusive upper bound (see {@link dateFrom}). */
+  dateTo?: string;
 }
 
 /**
@@ -208,10 +220,10 @@ export function contextMemoriesOf(graph: GraphStore, limit = 50): string[] {
   for (const d of graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]) {
     keys.set(d.id, d.key);
   }
-  const lines = (graph.queryNodes({ type: "core:statement" }) as StatementNode[]).map(
-    (s) =>
-      `${keys.get(s.dimension_id) ?? "?"} = ${JSON.stringify(s.value)}${s.unit ? ` ${s.unit}` : ""} [${s.state} @${s.created_at.slice(0, 10)}]`,
-  );
+  const lines = (graph.queryNodes({ type: "core:statement" }) as StatementNode[]).map((s) => {
+    const speaker = s.saidBy === "assistant" ? " (assistant)" : "";
+    return `${keys.get(s.dimension_id) ?? "?"} = ${JSON.stringify(s.value)}${s.unit ? ` ${s.unit}` : ""} [${s.state} @${s.created_at.slice(0, 10)}]${speaker}`;
+  });
   return lines.length > limit ? lines.slice(lines.length - limit) : lines;
 }
 
@@ -222,15 +234,22 @@ export interface RetrievalContext {
 }
 
 /**
- * Retrieval-grade context: hybrid retrieval (vector + lexical, RRF fused)
- * picks the relevant statements, each hit is expanded one hop — competing
- * statements (conflict counterparts) and active constraints with the M1
- * engine's current verdict — and the hits' owning dimensions are returned
- * as same-slot hints for the extractor (anti-drift layer 2).
+ * Retrieval-grade context, rendered as GROUPED dimension blocks.
+ *
+ * Retrieval picks the relevant DIMENSIONS; the renderer then prints each one
+ * as a complete block — a header carrying the graph's own entry count
+ * (`key — 3 entries:`) followed by the dimension's statements (capped) and
+ * active constraint verdicts. Counting questions read the header (the graph
+ * counts; the model doesn't), and entries can no longer scatter out of
+ * top-k. Over-budget dimensions degrade to a one-line summary that STILL
+ * carries the count.
+ *
+ * The hits' owning dimensions are also returned as same-slot hints for the
+ * extractor (anti-drift layer 2).
  *
  * @param graph a concrete MemoryGraph (constraint access needs the full store)
  * @param query the conversation turn
- * @param config embedding + vector-store plumbing
+ * @param config embedding + vector-store plumbing and rendering budgets
  * @returns context lines and similar-dimension hints
  */
 export async function retrievalContext(
@@ -244,30 +263,59 @@ export async function retrievalContext(
     mode: config.mode,
     embedder: config.embedder,
     vectors: config.vectors,
+    smoothing: config.rrfSmoothing,
+    states: config.states,
+    dateFrom: config.dateFrom,
+    dateTo: config.dateTo,
   });
-  const lines = hits.map((hit) => {
-    // Short date rides along: temporal reasoning needs to know WHEN a fact was said.
-    const stmt = graph.getNode(hit.statementId) as StatementNode | undefined;
-    const day = stmt ? stmt.created_at.slice(0, 10) : "?";
-    const parts = [`${hit.dimensionKey} = ${JSON.stringify(hit.value)} [${hit.state} @${day}]`];
-    const expansion = expandHit(graph, hit);
-    if (expansion.siblings.length > 0) {
-      parts.push(
-        `competing: ${expansion.siblings
-          .map((s) => `${JSON.stringify(s.value)}[${s.state} @${s.createdAt.slice(0, 10)}]`)
-          .join(" vs ")}`,
-      );
-    }
-    for (const c of expansion.constraints) {
-      parts.push(`constraint "${c.name ?? c.id}" -> ${c.evaluation}`);
-    }
-    return parts.join(" | ");
-  });
-  // Anti-drift layer 2: the dimensions owning retrieved context are the
-  // likely slots for this turn's candidates.
   const dimById = new Map(
     (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).map((d) => [d.id, d]),
   );
+
+  // Group ALL statements by dimension once (per-dimension completeness is
+  // the point of grouped rendering); chronological inside each group.
+  const membersByDim = new Map<string, StatementNode[]>();
+  for (const s of graph.queryNodes({ type: "core:statement" }) as StatementNode[]) {
+    const list = membersByDim.get(s.dimension_id);
+    if (list) list.push(s);
+    else membersByDim.set(s.dimension_id, [s]);
+  }
+  for (const list of membersByDim.values()) {
+    list.sort((a, b) => a.created_at.localeCompare(b.created_at));
+  }
+
+  const maxEntries = config.maxEntriesPerDimension ?? 8;
+  const maxLines = config.maxContextLines ?? 48;
+  const activeConstraints = graph
+    .getAllConstraints()
+    .filter((c) => c.activation_state === "active");
+  const lines: string[] = [];
+  const hitDims = [...new Set(hits.map((h) => h.dimensionId))];
+  for (const dimId of hitDims) {
+    const members = membersByDim.get(dimId) ?? [];
+    const key = dimById.get(dimId)?.key ?? hits.find((h) => h.dimensionId === dimId)?.dimensionKey ?? "?";
+    if (lines.length + Math.min(members.length, maxEntries) + 1 > maxLines) {
+      // Over budget: degrade to a one-line summary — the COUNT survives even
+      // when the entries do not (counting questions read the header).
+      lines.push(`${key}: ${members.length} entries (omitted — context budget)`);
+      continue;
+    }
+    lines.push(`${key} — ${members.length} ${members.length === 1 ? "entry" : "entries"}:`);
+    for (const m of members.slice(0, maxEntries)) {
+      const speaker = m.saidBy === "assistant" ? " (assistant)" : "";
+      lines.push(
+        `  = ${JSON.stringify(m.value)}${m.unit ? ` ${m.unit}` : ""} [${m.state} @${m.created_at.slice(0, 10)}]${speaker}`,
+      );
+    }
+    for (const c of activeConstraints) {
+      if (Object.values(c.bindings).includes(dimId) || c.participants.includes(dimId)) {
+        lines.push(`  rule "${c.name ?? c.id}" -> ${graph.evaluateConstraint(c.id)}`);
+      }
+    }
+  }
+
+  // Anti-drift layer 2: the dimensions owning retrieved context are the
+  // likely slots for this turn's candidates.
   const units = borrowUnits(graph);
   const seen = new Set<string>();
   const similarDimensions: KnownDimension[] = [];

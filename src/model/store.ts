@@ -36,6 +36,7 @@ import {
   type GraphEdge,
   type GraphNode,
   type NamespacedType,
+  type SaidBy,
   type Scope,
   type StatementNode,
 } from "./types.js";
@@ -68,6 +69,8 @@ export interface AddNodeInput {
   dimension_id?: string;
   value?: unknown;
   unit?: string;
+  /** Content-axis speaker (statements only) — validated at the boundary. */
+  saidBy?: SaidBy;
   cardinality?: "single" | "multi";
 }
 
@@ -183,12 +186,18 @@ export class MemoryGraph implements GraphStore {
       case "core:statement":
         if (!input.dimension_id) throw new ModelError("core:statement requires `dimension_id`");
         if (input.value === undefined) throw new ModelError("core:statement requires `value`");
+        if (input.saidBy !== undefined && input.saidBy !== "user" && input.saidBy !== "assistant") {
+          throw new ModelError(
+            `core:statement.saidBy must be "user" | "assistant", got: ${JSON.stringify(input.saidBy)}`,
+          );
+        }
         node = {
           ...base,
           type: "core:statement",
           dimension_id: input.dimension_id,
           value: input.value,
           unit: input.unit,
+          ...(input.saidBy !== undefined ? { saidBy: input.saidBy } : {}),
         };
         break;
       default:

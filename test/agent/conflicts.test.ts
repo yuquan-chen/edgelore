@@ -17,6 +17,7 @@ import { SqliteGraph } from "../../src/store/sqlite.js";
 import { capture } from "../../src/agent/capture.js";
 import {
   autoResolveConstraintGuided,
+  confirmStatement,
   listConflicts,
   resolveConflict,
 } from "../../src/agent/conflicts.js";
@@ -172,4 +173,80 @@ test("conflicts: resolution parity across both backends", () => {
     g.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// --- W2: confirmStatement — promoting tentative (assistant) facts -------------
+
+test("confirm: human confirmation promotes tentative to accepted with an audit trail", () => {
+  const graph = new MemoryGraph();
+  const a = capture(graph, { dimensionKey: "db_choice", value: "PostgreSQL", saidBy: "assistant" }, ctx);
+  const r = confirmStatement(graph, a.statementId as string, {
+    confirmedBy: "human:charles",
+    note: "就这么定",
+  });
+  assert.equal(r.state, "accepted");
+  assert.equal(r.dimensionId, a.dimensionId);
+  const stmt = graph.getNode(a.statementId as string) as {
+    state: string;
+    attributes: Record<string, unknown>;
+  };
+  assert.equal(stmt.state, "accepted");
+  assert.equal(stmt.attributes.confirmed_by, "human:charles");
+  assert.ok(typeof stmt.attributes.confirmed_at === "string");
+  assert.equal(stmt.attributes.confirm_note, "就这么定");
+});
+
+test("confirm: confirmation parity across both backends (attributes survive reopen)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "edgelore-confirm-"));
+  const path = join(dir, "t.db");
+  try {
+    let stmtId = "";
+    {
+      const g = new SqliteGraph(path);
+      const a = capture(g, { dimensionKey: "db", value: "PG", saidBy: "assistant" }, ctx);
+      stmtId = a.statementId as string;
+      confirmStatement(g, stmtId, { confirmedBy: "human:charles" });
+      g.close();
+    }
+    {
+      const g = new SqliteGraph(path);
+      const stmt = g.getNode(stmtId) as { state: string; attributes: Record<string, unknown> };
+      assert.equal(stmt.state, "accepted");
+      assert.equal(stmt.attributes.confirmed_by, "human:charles");
+      g.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("confirm: agent confirmer is rejected (Q01 governance)", () => {
+  const graph = new MemoryGraph();
+  const a = capture(graph, { dimensionKey: "db", value: "PG", saidBy: "assistant" }, ctx);
+  assert.throws(
+    () => confirmStatement(graph, a.statementId as string, { confirmedBy: "agent:edgelore:1" }),
+    /human:<id>/,
+  );
+});
+
+test("confirm: a non-tentative statement has nothing to confirm", () => {
+  const graph = new MemoryGraph();
+  const r = capture(graph, { dimensionKey: "owner", value: "alice" }, ctx); // accepted
+  assert.throws(
+    () => confirmStatement(graph, r.statementId as string, { confirmedBy: "human:x" }),
+    /not tentative/,
+  );
+});
+
+test("confirm: a single-cardinality rival accepted value is refused (no double accept)", () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "db", value: "MySQL", cardinality: "single" }, ctx);
+  const a = capture(graph, { dimensionKey: "db", value: "PostgreSQL", saidBy: "assistant" }, ctx);
+  assert.throws(
+    () => confirmStatement(graph, a.statementId as string, { confirmedBy: "human:x" }),
+    /second\s+accepted/,
+  );
+  // the refused statement stays tentative
+  const stmt = graph.getNode(a.statementId as string) as { state: string };
+  assert.equal(stmt.state, "tentative");
 });

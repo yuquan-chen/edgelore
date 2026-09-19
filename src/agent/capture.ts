@@ -13,9 +13,11 @@ import type {
   DimensionNode,
   FactNodeState,
   GraphNode,
+  SaidBy,
   StatementNode,
 } from "../model/types.js";
 import type { GraphStore } from "../model/store.js";
+import { AgentError } from "./errors.js";
 
 /** ② Agent-operated content — the ONLY fields the Agent authors. This is the
  * JSON/API contract between the Agent Memory layer and storage. */
@@ -32,6 +34,15 @@ export interface CaptureContent {
    * dimension, stored as `attributes.description`. This is what later sessions'
    * extractors read to map phrases onto the same key (anti-drift). */
   description?: string;
+  /**
+   * Content-axis speaker (who said this IN the conversation) — see SaidBy.
+   * This does NOT break the "Agent never writes provenance" rule: provenance
+   * (`created_by`) is the SYSTEM axis (which principal wrote the object),
+   * runtime-injected; `saidBy` is the CONTENT axis (part of what the fact
+   * is), agent-authored. Trust policy keys off it: assistant statements
+   * enter `tentative` pending user confirmation.
+   */
+  saidBy?: SaidBy;
 }
 
 /** ① Provenance — populated by the runtime (reads context), NOT by the Agent. */
@@ -50,11 +61,14 @@ export interface CaptureResult {
   statementId: string | null; // null when deduplicated (no new statement)
   created: boolean; // a new dimension was created
   deduplicated: boolean; // value already existed -> no new statement
-  conflict: boolean; // single-cardinality clash -> tentative + flagged
+  conflict: boolean; // a user-side clash got (or is) flagged on the dimension
+  /** Final statement state (so callers can distinguish "pending user
+   * confirmation" from "conflict flagged" without re-reading the graph). */
+  state: FactNodeState;
 }
 
 /** Deep-equality for arbitrary JSON-serializable values. */
-function valuesEqual(a: unknown, b: unknown): boolean {
+export function valuesEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
@@ -66,6 +80,15 @@ function valuesEqual(a: unknown, b: unknown): boolean {
  * @param ctx provenance (runtime-authored)
  */
 export function capture(graph: GraphStore, content: CaptureContent, ctx: CaptureContext): CaptureResult {
+  // 0. Validate the agent-authored attribution at the boundary — capture is
+  // the last wall before the graph; malformed attribution fails loud here.
+  if (content.saidBy !== undefined && content.saidBy !== "user" && content.saidBy !== "assistant") {
+    throw new AgentError(
+      `CaptureContent.saidBy must be "user" | "assistant", got: ${JSON.stringify(content.saidBy)}`,
+    );
+  }
+  const saidByAssistant = content.saidBy === "assistant";
+
   // 1. Resolve dimension (global scope in M3; scope is a future extension).
   const dimensions = graph.queryNodes({ type: "core:dimension" }) as DimensionNode[];
   const existing = dimensions.find((d) => d.key === content.dimensionKey);
@@ -94,12 +117,32 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
   const sameDim = statements.filter((s) => s.dimension_id === dimension.id);
   const dup = sameDim.find((s) => valuesEqual(s.value, content.value));
   if (dup) {
+    // A user restating a tentative value carries intent — three cases:
+    //   a. plain confirmation (no rival, no live adjudication): promote it;
+    //   b. restating AGAINST an incumbent accepted value (single-cardinality):
+    //      the restatement makes the clash user-backed — flag the dimension so
+    //      resolve can adjudicate (never silently mint a second accepted);
+    //   c. an adjudication is already running (dimension conflict): hands off —
+    //      flipping values behind resolve's back would bypass the human.
+    const rivalAccepted =
+      cardinality === "single" &&
+      sameDim.some((s) => s.state === "accepted" && !valuesEqual(s.value, content.value));
+    let conflictFlagged = false;
+    if (dup.state === "tentative" && !saidByAssistant) {
+      if (rivalAccepted) {
+        if (dimension.state !== "conflict") graph.transitionNodeState(dimension.id, "conflict");
+        conflictFlagged = true;
+      } else if (dimension.state !== "conflict") {
+        graph.transitionNodeState(dup.id, "accepted");
+      }
+    }
     return {
       dimensionId: dimension.id,
       statementId: dup.id,
       created,
       deduplicated: true,
-      conflict: false,
+      conflict: conflictFlagged,
+      state: graph.getNode(dup.id)!.state,
     };
   }
 
@@ -114,6 +157,13 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
       newState = "tentative";
     }
   }
+  // Assistant-authored facts always await user confirmation (W2), regardless
+  // of cardinality. The dimension is deliberately NOT flagged: an assistant
+  // claim is not a user-vs-user clash, so it must not pollute the human
+  // adjudication queue (listConflicts reads dimension.state).
+  if (saidByAssistant && newState === "accepted") {
+    newState = "tentative";
+  }
 
   const stmt = graph.addNode({
     type: "core:statement",
@@ -121,12 +171,14 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
     value: content.value,
     unit: content.unit,
     state: newState,
+    ...(content.saidBy !== undefined ? { saidBy: content.saidBy } : {}),
     created_by: ctx.created_by,
     created_at: ctx.createdAt,
     source_refs: ctx.source_refs,
   }) as StatementNode;
 
-  if (newState === "tentative") {
+  // Only USER-side tentative states flag the dimension (see above).
+  if (newState === "tentative" && !saidByAssistant) {
     graph.transitionNodeState(dimension.id, "conflict");
   }
 
@@ -135,6 +187,7 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
     statementId: stmt.id,
     created,
     deduplicated: false,
-    conflict: newState === "tentative",
+    conflict: newState === "tentative" && !saidByAssistant,
+    state: newState,
   };
 }

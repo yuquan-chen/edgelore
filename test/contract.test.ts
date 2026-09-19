@@ -99,6 +99,25 @@ test("contract: objects produced by the real store validate against schema", () 
   );
 });
 
+test("contract: a statement with content-axis saidBy still validates (W2)", () => {
+  const g = new MemoryGraph();
+  const dim = g.addNode({ type: "core:dimension", created_by: HUMAN, key: "db_choice" });
+  const stmt = g.addNode({
+    type: "core:statement",
+    created_by: AGENT, // system axis: which principal wrote it
+    dimension_id: dim.id,
+    value: "PostgreSQL",
+    saidBy: "assistant", // content axis: who said it in the conversation
+  });
+  assert.ok(
+    validateNode(stmt),
+    `saidBy statement should validate: ${ajv.errorsText(validateNode.errors)}`,
+  );
+  // an out-of-vocabulary speaker is rejected by the schema enum
+  const bad = { ...stmt, saidBy: "system" } as unknown as Record<string, unknown>;
+  assert.ok(!validateNode(bad), "saidBy enum must reject unknown speakers");
+});
+
 test("contract: a constraint activated by a human still validates", () => {
   const g = new MemoryGraph();
   const c = g.addConstraint({

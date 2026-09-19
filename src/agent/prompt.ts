@@ -50,13 +50,14 @@ const GATE_STORE_WHITELIST = [
   "measured quantity — a value with a unit",
   "relation — ownership, dependency, belonging",
   "lesson/feedback — a pitfall hit, or a correction/praise about how work is done (include the why)",
+  "one-off event with lasting significance — purchases, milestones, ceremonies, incidents; dated happenings that must still be answerable months later",
 ]
   .map((line) => `- ${line}`)
   .join("\n");
 
 const GATE_REJECT_LIST = [
   'small talk, greetings, politeness ("thanks!", "ok")',
-  'transient state that goes stale by the next session ("I\'m tired today")',
+  'transient state that goes stale by the next session ("I\'m tired today") — one-off events with lasting consequences are NOT transient',
   "information equivalent to something already stored (capture deduplicates)",
   'pure process talk ("help me look at this", "done")',
   "public knowledge or general common sense",
@@ -116,20 +117,22 @@ const EXTRACT_RULES = [
   "5. If similarDimensions are provided and a candidate is the SAME slot as one of them, you MUST reuse that dimension's key — never mint a NEW key for an existing concept (key drift fragments the memory graph).",
   "6. If contextMemories already contain an equivalent value, still output the entry (capture deduplicates). If one contradicts, still output it (capture flags the conflict) — resolving conflicts is not your job.",
   "7. One entry per candidate, in order; each entry is independent.",
+  '8. Attribute each entry with saidBy — who STATED it in the text: "user" for facts the user stated; "assistant" for conclusions/recommendations the assistant contributed. Assistant conclusions are first-class memories: never drop one for being the assistant\'s.',
 ].join("\n");
 
 const EXTRACT_ENTRY_SHAPE = `For each candidate, output exactly one entry object:
 {
   "dimensionKey": "<a key from knownDimensions, or NEW:camelCaseKey if no existing key fits>",
   "value": <a bare NUMBER for quantities — e.g. 5000, NEVER a quoted "5000" — otherwise a short string in the speaker's language verbatim>,
+  "saidBy": "user" or "assistant" — who STATED this fact; conclusions/recommendations the ASSISTANT contributed get \\"assistant\\" (default \\"user\\" only when genuinely ambiguous)",
   "dimensionDescription": "optional but STRONGLY RECOMMENDED for NEW: keys — one short line in the speaker's language saying what this slot means (e.g. \\"项目负责人\\" for owner), so later sessions map the same concept onto this key; omit when reusing an existing dimension",
   "cardinality": "optional — ONLY for NEW: keys: "single" if the slot holds one value at a time, "multi" otherwise; omit when reusing an existing dimension (it already has one)",
   "unit": "optional, e.g. CNY, days, ms; reuse the existing dimension's unit when present"
 }
 
 Examples (note: quantities are unquoted numbers, the unit is a separate field):
-quantity fact: {"dimensionKey": "budget", "value": 5000, "unit": "CNY"}
-text fact:     {"dimensionKey": "theme", "value": "深色"}`;
+quantity fact: {"dimensionKey": "budget", "value": 5000, "unit": "CNY", "saidBy": "user"}
+assistant recommendation: {"dimensionKey": "database_choice", "value": "PostgreSQL", "saidBy": "assistant"}`;
 
 /** Input for building the extract prompt. */
 export interface ExtractPromptInput {
@@ -181,4 +184,72 @@ export function buildExtractPrompt(input: ExtractPromptInput): string {
     'Respond with ONLY one JSON object, no markdown fences, no commentary:\n{ "contents": [ { ...entry... } ] }',
   ];
   return blocks.join("\n\n");
+}
+
+// --- batch extraction (session-level bulk import) -----------------------------
+
+/** Input for building the batch (session-level) extraction prompt. */
+export interface BatchExtractionPromptInput {
+  /** The full session transcript, turns prefixed with their role. */
+  transcript: string;
+  /** Dimension slots read from the graph by the importing harness. */
+  knownDimensions: readonly KnownDimension[];
+  /** Max facts per session — the harness's budget knob. */
+  maxFacts: number;
+}
+
+/**
+ * Assemble the BATCH extraction prompt: one call per session for bulk
+ * imports (the LongMemEval harness ingests 940 sessions this way — one
+ * cheap call each, instead of the per-turn gate+extract pipeline).
+ *
+ * History: this prompt used to live in benchmark/longmemeval/ingest.mjs,
+ * with a second stale copy in fill-gaps.mjs — where it silently diverged
+ * from src and grew the "the assistant only helps" bias that dropped every
+ * assistant conclusion on the floor (LongMemEval single-session-assistant
+ * 7.1%). It now lives in src so product and benchmark share ONE wording;
+ * the entry contract is deliberately identical to the per-turn extractor
+ * (plus required saidBy), so `normalizeBatchContents` can share the same
+ * narrowing code.
+ */
+export function buildBatchExtractionPrompt(input: BatchExtractionPromptInput): string {
+  const known =
+    input.knownDimensions.length > 0
+      ? input.knownDimensions.map((d) => JSON.stringify(d)).join("\n")
+      : "(none yet)";
+  return [
+    "You are extracting durable long-term memories from ONE session of a conversation",
+    "between a user and an assistant. Evaluate BOTH sides of the conversation:",
+    "extract every fact worth remembering months later — facts the user stated about",
+    "their life/project AND conclusions, recommendations, or plans the ASSISTANT",
+    "contributed that will still matter to the user later. Skip greetings, small talk,",
+    "transient chatter, and pure process talk.",
+    "",
+    "Known dimensions (REUSE one of these keys if a fact is the same slot — never mint",
+    "a new key for an existing concept):",
+    known,
+    "",
+    "For each fact output one object:",
+    '{ "dimensionKey": "<known key, or NEW:lowerCamelCase>",',
+    '  "value": <bare NUMBER for quantities (e.g. 5000, never "5000"), else a short',
+    '           string in the original language verbatim>,',
+    '  "saidBy": "user" | "assistant" — who STATED this fact (see below),',
+    '  "dimensionDescription": "<one short line in the original language, NEW: only>",',
+    '  "cardinality": "<single|multi, NEW: only>",',
+    '  "unit": "<optional, e.g. CNY, days, km>" }',
+    "",
+    'Attribution: facts the USER stated about themselves or their project -> "user".',
+    "Conclusions, recommendations, explanations or plans the ASSISTANT contributed",
+    '-> "assistant". Assistant conclusions are first-class memories: never drop one',
+    "for being the assistant's.",
+    "If the user CORRECTS an earlier statement in this session, extract the final",
+    "corrected value only.",
+    "",
+    "Session transcript:",
+    input.transcript,
+    "",
+    'Respond with ONLY one JSON object, no fences: { "contents": [ ... ] }',
+    `Extract at most ${input.maxFacts} facts per session - prefer the most durable and important.`,
+    'If nothing is worth remembering, respond { "contents": [] }.',
+  ].join("\n");
 }

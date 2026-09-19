@@ -175,9 +175,12 @@ test("runtime: retrieval-based context carries conflict posture and constraint v
   graph.transitionConstraintState(constraint.id, "active", { approved_by: "human:charles" });
 
   const lines = await contextMemoriesViaRetrieval(graph, "预算", retrieval);
-  assert.equal(lines.length, 1);
-  assert.match(lines[0] ?? "", /budget = 5000 /);
-  assert.match(lines[0] ?? "", /constraint ".+" -> (satisfied|violated|indeterminate|error)/);
+  // Grouped rendering (W4): header with the graph's own count, then the
+  // entry line, then the constraint verdict — 3 lines.
+  assert.equal(lines.length, 3);
+  assert.match(lines[0] ?? "", /budget — 1 entry:/);
+  assert.match(lines[1] ?? "", /= 5000 .*\[accepted @\d{4}-\d{2}-\d{2}\]/);
+  assert.match(lines[2] ?? "", /rule ".+" -> (satisfied|violated|indeterminate|error)/);
 });
 
 test("runtime: deduplicated capture embeds nothing new", async () => {
@@ -202,4 +205,51 @@ test("runtime: knownDimensionsOf surfaces stored descriptions (anti-drift signal
   const known = knownDimensionsOf(graph);
   assert.equal(known.find((k) => k.key === "owner")?.description, "项目负责人");
   assert.equal(known.find((k) => k.key === "tags")?.description, "tags"); // fallback = key
+});
+
+// --- W4: grouped rendering -----------------------------------------------------
+
+test("runtime: grouped context caps entries per dimension but keeps the header count", async () => {
+  const graph = new MemoryGraph();
+  for (let i = 0; i < 5; i++) capture(graph, { dimensionKey: "trip", value: `trip-${i}` }, ctx);
+  const lines = await contextMemoriesViaRetrieval(graph, "trip", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    maxEntriesPerDimension: 3,
+  });
+  assert.match(lines[0] ?? "", /trip — 5 entries:/); // graph's own count
+  const entryLines = lines.filter((l) => l.startsWith("  = "));
+  assert.equal(entryLines.length, 3); // capped
+});
+
+test("runtime: over-budget dimension degrades to a count-bearing one-liner", async () => {
+  const graph = new MemoryGraph();
+  for (let i = 0; i < 3; i++) capture(graph, { dimensionKey: "alpha", value: `alpha-${i}` }, ctx);
+  for (let i = 0; i < 2; i++) capture(graph, { dimensionKey: "beta", value: `beta-${i}` }, ctx);
+  const lines = await contextMemoriesViaRetrieval(graph, "alpha beta", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    maxContextLines: 4,
+  });
+  const headers = lines.filter((l) => / — \d+ entries?:$/.test(l));
+  const degraded = lines.filter((l) => /\(omitted — context budget\)/.test(l));
+  // both dimensions present: one as a full group, one as the summary line
+  assert.equal(headers.length + degraded.length, 2);
+  assert.equal(degraded.length, 1);
+  assert.match(degraded[0] ?? "", /: \d+ entries? \(omitted/); // the count survives
+});
+
+test("runtime: assistant-authored statements are labelled in grouped context", async () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "db", value: "PG", saidBy: "assistant" }, ctx);
+  capture(graph, { dimensionKey: "db", value: "MySQL" }, ctx);
+  const lines = await contextMemoriesViaRetrieval(graph, "PG MySQL", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+  });
+  assert.match(lines[0] ?? "", /db — 2 entries:/);
+  const assistantLine = lines.find((l) => l.includes("PG"));
+  assert.match(assistantLine ?? "", /\(assistant\)/);
+  const userLine = lines.find((l) => l.includes("MySQL"));
+  assert.ok(!/\(assistant\)/.test(userLine ?? ""));
 });

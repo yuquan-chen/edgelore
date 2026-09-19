@@ -207,3 +207,18 @@ test("retrieval: dateFrom/dateTo window filters candidates inclusively", async (
   });
   assert.equal(edge.length, 1);
 });
+
+// --- F1-balanced lexical scoring (anti-attractor) -------------------------------
+
+test("lexical route: long attractor documents no longer outrank short precise ones", async () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "gymSchedule", value: "gym at 6:00 pm" }, ctx);
+  capture(graph, {
+    dimensionKey: "movieList",
+    value:
+      "avengers endgame titanic avatar inception godfather pulp matrix fight club gladiator heat rio frozen up cars toy coco soul wall soul power gym 6:00 pm run",
+  }, ctx);
+  const hits = await retrieveRelevant(graph, { query: "几点去健身房 gym 6:00 pm", mode: "lexical" });
+  assert.ok(hits.length >= 1);
+  assert.equal(hits[0]?.dimensionKey, "gymSchedule", "short precise doc must beat the long movie list");
+});

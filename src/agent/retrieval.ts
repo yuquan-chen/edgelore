@@ -257,14 +257,27 @@ function bigrams(text: string): Set<string> {
   return out;
 }
 
-/** Containment of the query's bigrams in the document's — 0..1, rankable. */
+/**
+ * Lexical match score — 0..1, F1-balanced.
+ *
+ * Pure query-containment favored long "attractor" documents: a 736-char
+ * movie list contains almost any query's bigrams and used to occupy every
+ * retrieval slot regardless of the query (stage-2 forensics: gold evidence
+ * ranked #594+ behind 8 global attractors). Balancing query coverage with
+ * document precision rewards documents whose bigrams are mostly the
+ * query's — short and on-topic beats long and overflowing.
+ */
 function lexicalScore(queryBigrams: Set<string>, docText: string): number {
   const doc = bigrams(docText);
+  if (doc.size === 0) return 0;
   let hits = 0;
   for (const b of queryBigrams) {
     if (doc.has(b)) hits++;
   }
-  return hits / queryBigrams.size;
+  if (hits === 0) return 0;
+  const queryCoverage = hits / queryBigrams.size;
+  const docPrecision = hits / doc.size;
+  return (2 * queryCoverage * docPrecision) / (queryCoverage + docPrecision);
 }
 
 /** Cosine similarity; zero-norm vectors score 0. */

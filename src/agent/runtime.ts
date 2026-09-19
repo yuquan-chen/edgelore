@@ -24,6 +24,7 @@ import type { KnownDimension } from "./prompt.js";
 import type { LlmDriver } from "./llm-driver.js";
 import type { EmbeddingDriver } from "./embedding-driver.js";
 import {
+  bigrams,
   retrieveRelevant,
   statementText,
   type RetrievalMode,
@@ -181,6 +182,48 @@ export function knownDimensionsOf(graph: GraphStore): KnownDimension[] {
   return (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).map((d) =>
     toKnownDimension(d, units),
   );
+}
+
+/**
+ * Build the extractor's dimension list bounded by RELEVANCE, not graph size.
+ *
+ * Feeding the FULL dimension list scales O(dims): at 5,657 dimensions the
+ * batch-extraction prompt carried ~624KB (~180k tokens) of key JSON — past
+ * the model's context window, silently truncated, which killed the
+ * anti-drift hint exactly when the library grew (drift audit: zero key
+ * reuse). This variant scores dimensions by lexical overlap between the
+ * turn/transcript and the dimension's key+description, and keeps only the
+ * top `limit` — the prompt stays bounded forever and the hints it keeps are
+ * ones the model can actually use.
+ *
+ * @param graph the graph to read
+ * @param text the turn (or session transcript) the extraction is for
+ * @param limit max dimensions returned (default 30)
+ * @returns the most lexically-relevant dimension slots; falls back to the
+ *   first `limit` dims (insertion order) when nothing overlaps
+ */
+export function relevantDimensionsOf(graph: GraphStore, text: string, limit = 30): KnownDimension[] {
+  const units = borrowUnits(graph);
+  const queryBigrams = bigrams(text);
+  const scored = (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).map((d) => {
+    const kd = toKnownDimension(d, units);
+    const doc = bigrams(`${kd.key} ${kd.description}`);
+    let hits = 0;
+    for (const b of queryBigrams) {
+      if (doc.has(b)) hits++;
+    }
+    // Plain containment: hints are short, so precision weighting matters
+    // less than "does the transcript touch this slot at all".
+    const score = hits === 0 || queryBigrams.size === 0 ? 0 : hits / queryBigrams.size;
+    return { kd, score };
+  });
+  const relevant = scored
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((s) => s.kd);
+  if (relevant.length > 0) return relevant;
+  return scored.slice(0, limit).map((s) => s.kd);
 }
 
 /** Unit borrowing: a dimension's unit lives on its first unit-bearing statement. */

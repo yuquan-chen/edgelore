@@ -27,6 +27,7 @@ const driver = requireChat(cfg, { maxTokens: 16000, extraBody: { thinking: { typ
 const nArg = process.argv.indexOf("--n");
 const N = nArg !== -1 ? Number(process.argv[nArg + 1]) : 20;
 const dbPath = join(dataDir, "smoke-reingest.db");
+void N; // 选样量由取证类别配比决定（12+2+4+2）；--n 预留给未来的配比参数化
 if (existsSync(dbPath)) rmSync(dbPath);
 
 const dataset = JSON.parse(readFileSync(join(dataDir, "longmemeval_oracle.json"), "utf8"));

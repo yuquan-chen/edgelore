@@ -19,6 +19,7 @@ import {
   capture,
   buildBatchExtractionPrompt,
   normalizeBatchContents,
+  relevantDimensionsOf,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
 
@@ -83,12 +84,14 @@ const embedder = cfg.embedding ? embeddingDriver(cfg) : undefined;
 const ctx = { created_by: "human:longmemeval_user", source_refs: [] };
 
 function knownDimensions() {
+  // full list — kept only for progress/debug output; prompts use relevantDimensionsOf
   return (graph.queryNodes({ type: "core:dimension" }) ?? []).map((d) => ({
     key: d.key,
     description: typeof d.attributes?.description === "string" ? d.attributes.description : d.key,
     cardinality: d.cardinality ?? "multi",
   }));
 }
+void knownDimensions;
 
 function captureContents(contents, sessionId, date) {
   let stored = 0;
@@ -164,7 +167,9 @@ for (const [sid, session] of sessions) {
   try {
     const promptOpts = {
       transcript,
-      knownDimensions: knownDimensions(),
+      // 相关 top-30 而非全量：全量清单 O(维度数) 增长，库后期每次 prompt 带
+      // 60 万字符的 key 清单，超出模型上下文被静默截断，反漂移失效
+      knownDimensions: relevantDimensionsOf(graph, transcript, 30),
       maxFacts: cfg.extraction.maxFactsPerSession,
     };
     let parsed = parseJsonReply(await driver.complete(buildBatchExtractionPrompt(promptOpts)));

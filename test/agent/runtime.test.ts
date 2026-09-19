@@ -13,7 +13,7 @@ import { capture } from "../../src/agent/capture.js";
 import { AgentError } from "../../src/agent/errors.js";
 import { MockEmbedder, type EmbeddingDriver } from "../../src/agent/embedding-driver.js";
 import { InMemoryVectorStore } from "../../src/agent/retrieval.js";
-import { contextMemoriesOf, contextMemoriesViaRetrieval, knownDimensionsOf, processTurn } from "../../src/agent/runtime.js";
+import { contextMemoriesOf, contextMemoriesViaRetrieval, knownDimensionsOf, processTurn, relevantDimensionsOf } from "../../src/agent/runtime.js";
 
 const ctx = { created_by: "human:charles", source_refs: ["t:1"] };
 
@@ -252,4 +252,20 @@ test("runtime: assistant-authored statements are labelled in grouped context", a
   assert.match(assistantLine ?? "", /\(assistant\)/);
   const userLine = lines.find((l) => l.includes("MySQL"));
   assert.ok(!/\(assistant\)/.test(userLine ?? ""));
+});
+
+// --- 相关维度选择（批量抽取的 O(维度数) prompt 爆炸修复） -----------------------
+
+test("runtime: relevantDimensionsOf ranks matching dims first and bounds the list", () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "gymSchedule", value: "6:00 pm", description: "健身安排" }, ctx);
+  capture(graph, { dimensionKey: "weddingsAttended", value: "Sarah" }, ctx);
+  capture(graph, { dimensionKey: "apexLevel", value: 100 }, ctx);
+  // 再造 40 个不相关维度，验证 limit 截断
+  for (let i = 0; i < 40; i++) capture(graph, { dimensionKey: `noise${i}Pad`, value: `noise-${i}` }, ctx);
+  const relevant = relevantDimensionsOf(graph, "今天下午六点去健身房锻炼", 30);
+  assert.ok(relevant.length <= 30);
+  assert.equal(relevant[0]?.key, "gymSchedule"); // 词面命中者登顶
+  const relevant2 = relevantDimensionsOf(graph, " completely unrelated text about quantum sailing ", 5);
+  assert.ok(relevant2.length <= 5); // 零命中 → 插入序兜底，仍受 limit 约束
 });

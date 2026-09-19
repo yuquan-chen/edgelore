@@ -246,7 +246,7 @@ export function statementText(graph: GraphStore, stmt: StatementNode): string {
 // --- routes ------------------------------------------------------------------
 
 /** Character bigrams (whitespace collapsed) — CJK-safe lexical features. */
-function bigrams(text: string): Set<string> {
+export function bigrams(text: string): Set<string> {
   const s = text.toLowerCase().replace(/\s+/g, "");
   const out = new Set<string>();
   if (s.length === 1) {

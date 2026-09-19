@@ -81,7 +81,7 @@ const deleteVector = target.prepare("DELETE FROM embeddings WHERE node_id = ?");
 let unifiedKeys = 0;
 let droppedDims = 0;
 let remappedStmts = 0;
-for (const [key, group] of byKey) {
+for (const group of byKey.values()) {
   if (group.length === 1) continue;
   unifiedKeys += 1;
   // canonical = deterministic first-seen; description = longest non-empty

@@ -13,6 +13,7 @@ import {
   capture,
   buildBatchExtractionPrompt,
   normalizeBatchContents,
+  relevantDimensionsOf,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
 
@@ -50,14 +51,6 @@ console.log(`需要补录: ${targets.length} 个会话\n`);
 
 const ctx = { created_by: "human:longmemeval_user", source_refs: [] };
 
-function knownDims() {
-  return (graph.queryNodes({ type: "core:dimension" }) ?? []).map((d) => ({
-    key: d.key,
-    description: typeof d.attributes?.description === "string" ? d.attributes.description : d.key,
-    cardinality: d.cardinality ?? "multi",
-  }));
-}
-
 let stored = 0, errors = 0;
 const t0 = Date.now();
 
@@ -74,7 +67,7 @@ for (let i = 0; i < targets.length; i++) {
     const reply = await driver.complete(
       buildBatchExtractionPrompt({
         transcript,
-        knownDimensions: knownDims(),
+        knownDimensions: relevantDimensionsOf(graph, transcript, 30),
         maxFacts: cfg.extraction.maxFactsPerSession,
       }),
     );

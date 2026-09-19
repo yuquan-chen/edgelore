@@ -289,7 +289,7 @@ test("extract: invalid saidBy fails loud", async () => {
 });
 
 test("batch: normalizeBatchContents accepts bare camelCase keys without NEW: (lenient)", () => {
-  const contents = normalizeBatchContents([
+  const { contents } = normalizeBatchContents([
     { dimensionKey: "weddingAttended", value: "Sarah 的婚礼", saidBy: "user" },
     { dimensionKey: "NEW:smokerPurchase", value: 1, cardinality: "single" },
     { dimensionKey: "budget", value: "5000" }, // numeric string -> number
@@ -302,14 +302,43 @@ test("batch: normalizeBatchContents accepts bare camelCase keys without NEW: (le
   assert.equal(contents[2]?.value, 5000);
 });
 
-test("batch: normalizeBatchContents rejects malformed entries", () => {
-  assert.throws(() => normalizeBatchContents([{ dimensionKey: "", value: 1 }]), /dimensionKey/);
-  assert.throws(() => normalizeBatchContents([{ dimensionKey: "ok key!" , value: 1 }]), /malformed/);
-  assert.throws(() => normalizeBatchContents([{ dimensionKey: "ok" }]), /missing a value/);
-  assert.throws(
-    () => normalizeBatchContents([{ dimensionKey: "ok", value: 1, saidBy: "ai" }]),
-    /saidBy/,
-  );
+test("batch: malformed entries are SKIPPED, never fatal (one bad field != lost session)", () => {
+  const { contents, skipped } = normalizeBatchContents([
+    { dimensionKey: "good", value: 1, unit: "" }, // empty unit -> omitted, entry kept
+    { dimensionKey: "", value: 1 }, // no key -> skipped
+    { dimensionKey: "ok key!", value: 1 }, // malformed key -> skipped
+    { dimensionKey: "good2", value: "x", saidBy: "ai" }, // bad saidBy -> kept, unattributed
+    { dimensionKey: "good3" }, // no value -> skipped
+    "not an object", // skipped
+  ]);
+  assert.equal(contents.length, 2);
+  assert.equal(skipped, 4);
+  assert.equal(contents[0]?.unit, undefined); // empty string vanished
+  assert.equal(contents[0]?.dimensionKey, "good");
+  assert.equal(contents[1]?.saidBy, undefined); // bad attribution dropped, fact kept
+  assert.equal(contents[1]?.dimensionKey, "good2");
+});
+
+test("batch: buildBatchExtractionPrompt carries both-speaker attribution and no bias", () => {
+  const p = buildBatchExtractionPrompt({
+    transcript: "[user] hi",
+    knownDimensions: KNOWN,
+    maxFacts: 12,
+  });
+  assert.match(p, /BOTH sides of the conversation/);
+  assert.match(p, /saidBy/);
+  assert.match(p, /"assistant"/);
+  assert.ok(!/the assistant only helps/.test(p), "the old bias must be gone");
+  assert.match(p, /at most 12 facts/);
+  assert.match(p, /LAST RESORT/); // anti-empty-list clause
+  assert.match(p, /"budget"/); // known dimensions injected
+  const retry = buildBatchExtractionPrompt({
+    transcript: "[user] hi",
+    knownDimensions: KNOWN,
+    maxFacts: 12,
+    extraFragments: ["NOTE: your previous reply was EMPTY."],
+  });
+  assert.match(retry, /previous reply was EMPTY/);
 });
 
 test("batch: buildBatchExtractionPrompt carries both-speaker attribution and no bias", () => {
@@ -324,4 +353,14 @@ test("batch: buildBatchExtractionPrompt carries both-speaker attribution and no 
   assert.ok(!/the assistant only helps/.test(p), "the old bias must be gone");
   assert.match(p, /at most 12 facts/);
   assert.match(p, /"budget"/); // known dimensions injected
+});
+
+test("batch: lowercase new: prefix is stripped too (model drift)", () => {
+  const { contents, skipped } = normalizeBatchContents([
+    { dimensionKey: "new:carFirstServiceDate", value: "2023-05-01" },
+    { dimensionKey: "NEW:smokerPurchase", value: 1 },
+  ]);
+  assert.equal(skipped, 0);
+  assert.equal(contents[0]?.dimensionKey, "carFirstServiceDate");
+  assert.equal(contents[1]?.dimensionKey, "smokerPurchase");
 });

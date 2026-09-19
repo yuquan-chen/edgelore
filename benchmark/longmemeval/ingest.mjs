@@ -162,15 +162,35 @@ for (const [sid, session] of sessions) {
   }
 
   try {
-    const reply = await driver.complete(
-      buildBatchExtractionPrompt({
-        transcript,
-        knownDimensions: knownDimensions(),
-        maxFacts: cfg.extraction.maxFactsPerSession,
-      }),
-    );
-    const parsed = parseJsonReply(reply);
-    const contents = normalizeBatchContents(parsed.contents ?? []);
+    const promptOpts = {
+      transcript,
+      knownDimensions: knownDimensions(),
+      maxFacts: cfg.extraction.maxFactsPerSession,
+    };
+    let parsed = parseJsonReply(await driver.complete(buildBatchExtractionPrompt(promptOpts)));
+    let batch = normalizeBatchContents(parsed.contents ?? []);
+    if (batch.contents.length === 0) {
+      // Empty-reply retry: flash overuses the [] exit on recommendation-heavy
+      // sessions (smoke test: 7/20). One nudged re-ask costs a call only
+      // when it fires.
+      parsed = parseJsonReply(
+        await driver.complete(
+          buildBatchExtractionPrompt({
+            ...promptOpts,
+            extraFragments: [
+              "NOTE: your previous reply was EMPTY, but this session is not empty.",
+              "Extract the assistant's recommendations/explanations and every durable",
+              "fact from either speaker explicitly.",
+            ],
+          }),
+        ),
+      );
+      batch = normalizeBatchContents(parsed.contents ?? []);
+    }
+    if (batch.skipped > 0) {
+      console.log(`\n[warn] session ${sid}: skipped ${batch.skipped} malformed entries`);
+    }
+    const contents = batch.contents;
     ctx.source_refs = [sid];
     const stored = captureContents(contents, sid, session.date);
     workerFacts += stored;

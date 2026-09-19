@@ -174,52 +174,84 @@ function applyOptionalContentFields(content: CaptureContent, entry: Record<strin
   }
 }
 
+/** Result of {@link normalizeBatchContents}. */
+export interface BatchNormalizeResult {
+  /** Valid entries, order preserved (malformed entries are skipped, not fatal). */
+  contents: CaptureContent[];
+  /** How many entries were dropped for being malformed (missing key/value,
+   * malformed key). One bad entry must not cost a whole session's harvest. */
+  skipped: number;
+}
+
 /**
  * Narrow a BATCH extraction reply's contents (the session-level bulk-import
  * path used by the benchmark harnesses). Deliberately more lenient than
- * {@link toCaptureContent}: a bare lowerCamelCase key without the NEW:
- * prefix is ACCEPTED as a new key (batch sessions mint many keys; the alias
- * guard's ambiguity checks matter less than not losing a whole session to
- * one strict failure). Everything else — value normalization, optional
- * fields, saidBy — follows the exact same contract.
+ * {@link toCaptureContent} — the smoke test showed a single strict failure
+ * used to cost a WHOLE session's harvest (~12 facts), so here:
+ *   - a bare lowerCamelCase key without NEW: is accepted as new;
+ *   - empty-string unit / dimensionDescription are omitted (the model emits
+ *     `""` freely; the old harness ignored it silently);
+ *   - an invalid saidBy is omitted (the fact is kept — it just loses its
+ *     content-axis attribution);
+ *   - malformed entries are SKIPPED and counted, never fatal.
+ * The per-turn product path stays fail-loud by design; only bulk import is
+ * forgiving.
  *
  * @param raw the parsed reply's `contents` array (each entry an object)
  * @param knownKeys keys of dimensions already in the graph (informational;
  *   unknown keys are accepted as new when well-formed)
- * @returns one CaptureContent per entry, order preserved
- * @throws AgentError on malformed entries (missing key/value, bad enum)
+ * @returns valid entries plus the skip count
  */
 export function normalizeBatchContents(
   raw: readonly unknown[],
   knownKeys?: ReadonlySet<string>,
-): CaptureContent[] {
-  return raw.map((entry) => {
+): BatchNormalizeResult {
+  const contents: CaptureContent[] = [];
+  let skipped = 0;
+  for (const entry of raw) {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
-      throw new AgentError("batch extract: each content must be a JSON object");
+      skipped += 1;
+      continue;
     }
     const rec = entry as Record<string, unknown>;
     if (typeof rec.dimensionKey !== "string" || rec.dimensionKey.length === 0) {
-      throw new AgentError("batch extract: content.dimensionKey must be a non-empty string");
+      skipped += 1;
+      continue;
     }
     if (rec.value === undefined || rec.value === null) {
-      throw new AgentError(`batch extract: content "${rec.dimensionKey}" is missing a value`);
+      skipped += 1;
+      continue;
     }
     let dimensionKey = rec.dimensionKey;
-    if (dimensionKey.startsWith(NEW_PREFIX)) {
-      const key = dimensionKey.slice(NEW_PREFIX.length);
+    // Models sometimes lowercase the protocol prefix ("new:key") — accept
+    // any case, strip it, then enforce camelCase on the key itself.
+    if (/^new:/i.test(dimensionKey)) {
+      const key = dimensionKey.slice(dimensionKey.indexOf(":") + 1);
       if (!LOWER_CAMEL_CASE.test(key)) {
-        throw new AgentError(`batch extract: "${rec.dimensionKey}" is not NEW:lowerCamelCase`);
+        skipped += 1;
+        continue;
       }
       dimensionKey = key;
     } else if (!knownKeys?.has(dimensionKey) && !LOWER_CAMEL_CASE.test(dimensionKey)) {
       // Lenient path: an unknown key is fine when well-formed (the model
-      // meant a new key and forgot NEW:); anything malformed fails loud.
-      throw new AgentError(`batch extract: malformed dimensionKey "${dimensionKey}"`);
+      // meant a new key and forgot NEW:); anything malformed drops the entry.
+      skipped += 1;
+      continue;
     }
     const content: CaptureContent = { dimensionKey, value: normalizeNumericValue(rec.value) };
-    applyOptionalContentFields(content, rec);
-    return content;
-  });
+    // Lenient optional fields: empty strings vanish, invalid saidBy vanishes,
+    // everything else follows the shared contract.
+    if (typeof rec.dimensionDescription === "string" && rec.dimensionDescription.trim().length > 0) {
+      content.description = rec.dimensionDescription.trim();
+    }
+    if (rec.cardinality === "single" || rec.cardinality === "multi") {
+      content.cardinality = rec.cardinality;
+    }
+    if (typeof rec.unit === "string" && rec.unit.length > 0) content.unit = rec.unit;
+    if (rec.saidBy === "user" || rec.saidBy === "assistant") content.saidBy = rec.saidBy;
+    contents.push(content);
+  }
+  return { contents, skipped };
 }
 
 /**

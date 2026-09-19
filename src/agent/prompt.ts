@@ -196,6 +196,8 @@ export interface BatchExtractionPromptInput {
   knownDimensions: readonly KnownDimension[];
   /** Max facts per session — the harness's budget knob. */
   maxFacts: number;
+  /** Extra fragments appended before the output contract (retry nudges). */
+  extraFragments?: readonly string[];
 }
 
 /**
@@ -250,6 +252,10 @@ export function buildBatchExtractionPrompt(input: BatchExtractionPromptInput): s
     "",
     'Respond with ONLY one JSON object, no fences: { "contents": [ ... ] }',
     `Extract at most ${input.maxFacts} facts per session - prefer the most durable and important.`,
-    'If nothing is worth remembering, respond { "contents": [] }.',
+    "An EMPTY list is a LAST RESORT. Before returning [], re-check the transcript:",
+    "did the assistant recommend, suggest, explain, or draft anything? did any event,",
+    "plan, preference, or fact appear on either side? Return [] only for pure",
+    "greetings/small talk with no content at all.",
+    ...(input.extraFragments ?? []),
   ].join("\n");
 }

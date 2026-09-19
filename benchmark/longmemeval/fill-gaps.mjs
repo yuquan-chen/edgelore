@@ -28,7 +28,7 @@ const dataset = JSON.parse(readFileSync(join(here, "data", "longmemeval_oracle.j
 const missingIds = new Set(JSON.parse(readFileSync(join(here, "data", "missing-sessions.json"), "utf8")));
 
 const graph = new SqliteGraph(join(here, "data", "memory.db"));
-const driver = requireChat(cfg, { maxTokens: 16000, extraBody: { thinking: { type: "disabled" } } });
+const driver = requireChat(cfg, { maxTokens: 16000, timeoutMs: 180_000, extraBody: { thinking: { type: "disabled" } } }); // 缺失会话常是超长转写：60s 不够，放宽到 3 分钟
 const vectors = new SqliteVectorStore(graph);
 const embedder = cfg.embedding ? embeddingDriver(cfg) : undefined;
 
@@ -79,7 +79,8 @@ for (let i = 0; i < targets.length; i++) {
       }),
     );
     const parsed = parseJsonReply(reply);
-    const contents = normalizeBatchContents(parsed.contents ?? []);
+    const { contents, skipped } = normalizeBatchContents(parsed.contents ?? []);
+    if (skipped > 0) console.log(`[warn] ${t.sid}: skipped ${skipped} malformed entries`);
 
     for (const c of contents) {
       capture(graph, c, { ...ctx, createdAt: t.date || undefined });

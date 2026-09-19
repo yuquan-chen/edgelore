@@ -86,7 +86,7 @@ test("mcp: memory_remember runs the pipeline and indexes vectors", async () => {
     const payload = r.structuredContent as { captures: Array<{ created: boolean }>; indexed: number };
     assert.equal(payload.captures.length, 1);
     assert.equal(payload.indexed, 1); // embedded through the injected plumbing
-    assert.equal(h.vectors.all().length, 1);
+    assert.equal(h.vectors.all().length, 2); // statement + dimension
   } finally {
     h.cleanup();
   }

@@ -187,7 +187,6 @@ let processed = 0;
 let factsStored = 0;
 let ordinal = -1;
 const t0 = Date.now();
-const shardTotal = [...sessions.keys()].filter((_, i) => !shardFilter || shardFilter(i)).length;
 
 function drawBar(done, total, facts, start) {
   const width = 28;

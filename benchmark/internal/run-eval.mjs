@@ -11,7 +11,6 @@ import { fileURLToPath } from "node:url";
 import {
   MemoryGraph,
   OpenAiCompatDriver,
-  parseJsonReply,
   runGate,
   runExtract,
   capture,

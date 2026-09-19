@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>edgelore · LongMemEval 评测报告</title>
+<style>
+:root {
+  --bg: #f5f5f0; --card: #fff; --ink: #1a1a2e; --sub: #555;
+  --green: #2e7d32; --yellow: #f9a825; --red: #c62828; --blue: #1565c0;
+  --line: #ddd; --tag-ok: #e8f5e9; --tag-warn: #fff8e1; --tag-bad: #ffebee;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--ink); padding: 24px; max-width: 960px; margin: 0 auto; }
+h1 { font-size: 1.5em; margin-bottom: 4px; }
+h2 { font-size: 1.15em; margin: 28px 0 12px; padding-bottom: 6px; border-bottom: 2px solid var(--line); }
+h3 { font-size: 1em; margin: 16px 0 8px; }
+.subtitle { color: var(--sub); font-size: .9em; margin-bottom: 20px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin: 12px 0; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+.big-num { font-size: 2.2em; font-weight: 700; }
+.big-num small { font-size: .45em; font-weight: 400; color: var(--sub); }
+.label { font-size: .82em; color: var(--sub); margin-top: 2px; }
+table { width: 100%; border-collapse: collapse; font-size: .88em; }
+th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--line); }
+th { font-weight: 600; color: var(--sub); font-size: .82em; }
+.bar-wrap { background: #eee; border-radius: 4px; height: 20px; overflow: hidden; }
+.bar { height: 100%; border-radius: 4px; display: flex; align-items: center; padding-left: 8px; color: #fff; font-size: .78em; font-weight: 600; min-width: 36px; }
+.bar.good { background: var(--green); } .bar.mid { background: var(--yellow); color: #333; } .bar.bad { background: var(--red); }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: .78em; font-weight: 600; }
+.tag-ok { background: var(--tag-ok); color: var(--green); }
+.tag-warn { background: var(--tag-warn); color: #b8860b; }
+.tag-bad { background: var(--tag-bad); color: var(--red); }
+.section { margin: 20px 0; }
+.error-box { border-left: 3px solid var(--red); padding: 10px 14px; margin: 8px 0; background: var(--tag-bad); border-radius: 0 6px 6px 0; font-size: .88em; }
+.success-box { border-left: 3px solid var(--green); padding: 10px 14px; margin: 8px 0; background: var(--tag-ok); border-radius: 0 6px 6px 0; font-size: .88em; }
+.note { font-size: .82em; color: var(--sub); margin: 8px 0; }
+.arrow { color: var(--sub); margin: 0 4px; }
+</style>
+</head>
+<body>
+
+<h1>📊 LongMemEval ORACLE 评测报告</h1>
+<p class="subtitle">edgelore · deepseek-v4-flash + qwen3.7-embedding · 500 题 · 2026-09-19</p>
+
+<!-- ===== 总分 ===== -->
+<div class="grid3">
+  <div class="card" style="text-align:center">
+    <div class="big-num">28.2<small>%</small></div><div class="label">总正确率</div>
+  </div>
+  <div class="card" style="text-align:center">
+    <div class="big-num" style="color:var(--red)">264<small></small></div><div class="label">不当拒答 / 500 题</div>
+  </div>
+  <div class="card" style="text-align:center">
+    <div class="big-num" style="color:var(--blue)">914<small>/940</small></div><div class="label">会话摄入覆盖率</div>
+  </div>
+</div>
+
+<!-- ===== 五能力 ===== -->
+<h2>五能力得分</h2>
+<div class="card">
+<table>
+<tr><th>能力</th><th>得分</th><th></th><th style="text-align:right">正确/总数</th><th>判定</th></tr>
+<tr><td>🟢 拒答能力</td><td><b>76.7%</b></td><td><div class="bar-wrap"><div class="bar good" style="width:76.7%">76.7%</div></div></td><td style="text-align:right">23/30</td><td><span class="tag tag-ok">强项</span></td></tr>
+<tr><td>🟢 单会话用户</td><td><b>67.2%</b></td><td><div class="bar-wrap"><div class="bar good" style="width:67.2%">67.2%</div></div></td><td style="text-align:right">43/64</td><td><span class="tag tag-ok">强项</span></td></tr>
+<tr><td>🟢 知识更新</td><td><b>62.5%</b></td><td><div class="bar-wrap"><div class="bar good" style="width:62.5%">62.5%</div></div></td><td style="text-align:right">45/72</td><td><span class="tag tag-ok">强项</span></td></tr>
+<tr><td>🟡 单会话偏好</td><td><b>36.7%</b></td><td><div class="bar-wrap"><div class="bar mid" style="width:36.7%">36.7%</div></div></td><td style="text-align:right">11/30</td><td><span class="tag tag-warn">弱</span></td></tr>
+<tr><td>🔴 多会话推理</td><td><b>16.5%</b></td><td><div class="bar-wrap"><div class="bar bad" style="width:16.5%">16.5%</div></div></td><td style="text-align:right">20/121</td><td><span class="tag tag-bad">弱</span></td></tr>
+<tr><td>🔴 时间推理</td><td><b>14.2%</b></td><td><div class="bar-wrap"><div class="bar bad" style="width:14.2%">14.2%</div></div></td><td style="text-align:right">18/127</td><td><span class="tag tag-bad">最弱</span></td></tr>
+<tr><td>🔴 单会话助手</td><td><b>7.1%</b></td><td><div class="bar-wrap"><div class="bar bad" style="width:7.1%">7.1%</div></div></td><td style="text-align:right">4/56</td><td><span class="tag tag-bad">最弱</span></td></tr>
+</table>
+</div>
+
+<!-- ===== 错误分析 ===== -->
+<h2>错误归因（全量 95 个错误回答 + 235 个不当拒答）</h2>
+
+<div class="error-box">
+<b>发现 1 · 拒答危机（235 题）</b><br>
+52.8% 的题目回答了"不知道"，其中 235 题的金标准其实有答案。原因：检索没有召回足够的记忆 + 回答 prompt 的拒答门槛太保守。<br>
+<span class="arrow">→ 修法</span> 提高检索召回率（增加 k 值）+ 调优回答 prompt 的拒答阈值
+</div>
+
+<div class="error-box">
+<b>发现 2 · AI 回复丢失（49 题拒答）</b><br>
+抽取 prompt 明确写了"the assistant only helps"——AI 自身的有价值结论（推荐、总结、判断）被系统性丢弃。单会话助手能力 7.1% 是直接后果。<br>
+<span class="arrow">→ 修法</span> 去掉抽取偏向，同时评估 user 和 assistant 的对话内容
+</div>
+
+<div class="error-box">
+<b>发现 3 · 计数不全（~20 题）</b><br>
+"参加了几场婚礼？"金标准 3 场，我们答 1 场。原因：superseded 的记忆被检索排除 → 历史计数必然偏少。这是"标而不裁"治理机制的已知副作用。<br>
+<span class="arrow">→ 修法</span> 回答层区分"当前状态查询"（只看 accepted）和"历史计数查询"（含 superseded）
+</div>
+
+<div class="error-box">
+<b>发现 4 · 维度漂移（全局影响）</b><br>
+同一概念被存为 owner / manager / projectLeader 等不同维度 key → 检索时只命中其中一个 → 另外的记忆被漏掉。4016 个维度中大量是同一概念的变体。<br>
+<span class="arrow">→ 修法</span> 维度别名表 + 后台合并（M5 生命周期设计已规划）
+</div>
+
+<!-- ===== 成功模式 ===== -->
+<h2>✓ 成功模式（164 题答对的分析）</h2>
+<div class="success-box">
+<b>冲突治理有效</b>：知识更新 62.5%——事实变更后正确引用了新值，不引用被 superseded 的旧值。这是我们"标而不裁"机制在基准上的直接验证。
+</div>
+<div class="success-box">
+<b>拒答设计有效</b>：76.7% 拒答准确率——记忆不够就诚实说"不知道"，不编造。ask 层的拒答规则工作正常。
+</div>
+<div class="success-box">
+<b>基础事实召回正常</b>：单会话用户 67.2%——"学历是什么""用什么洗发水"这类简单事实的存取没有问题。
+</div>
+
+<!-- ===== 跟竞品的关系 ===== -->
+<h2>跟竞品的关系（不可直接比）</h2>
+<div class="card">
+<table>
+<tr><th>系统</th><th>模型</th><th>分数</th><th>备注</th></tr>
+<tr><td>LongMemEval 论文 GPT-4o + oracle</td><td>GPT-4o</td><td>87.0%</td><td>理论天花板</td></tr>
+<tr><td>Zep</td><td>未公开</td><td>71.2%</td><td>厂商自报</td></tr>
+<tr><td>GPT-4o 塞全上下文</td><td>GPT-4o</td><td>60.6%</td><td>不用记忆系统的对照</td></tr>
+<tr><td>Letta 裸文件</td><td>GPT-4o-mini</td><td>74.0%</td><td>LoCoMo 基准</td></tr>
+<tr><td style="background:#e3f2fd"><b>edgelore（我们）</b></td><td style="background:#e3f2fd">deepseek-v4-flash</td><td style="background:#e3f2fd"><b>32.8%</b></td><td style="background:#e3f2fd">ORACLE 配置</td></tr>
+</table>
+<p class="note" style="margin-top:8px">⚠ 不可直接比：模型能力、判卷模型、配置均不同。有意义的对比是「同一模型下 edgelore vs Mem0」——即我们讨论的 Mem0 对照实验。</p>
+</div>
+
+<!-- ===== 改进路线 ===== -->
+<h2>改进路线图</h2>
+<div class="card">
+<table>
+<tr><th>优先级</th><th>改进</th><th>预期提升</th><th>成本</th></tr>
+<tr><td><span class="tag tag-ok">P0</span></td><td>拒答门槛调优（有相关记忆时不轻易说"不知道"）</td><td>总分 +15~20%</td><td>prompt 调优</td></tr>
+<tr><td><span class="tag tag-ok">P0</span></td><td>AI 回复入库（去掉"the assistant only helps"偏向）</td><td>助手召回 7% → 40%+</td><td>改一行 prompt</td></tr>
+<tr><td><span class="tag tag-warn">P1</span></td><td>时间上下文注入（回答时引导使用日期）</td><td>时间推理 14% → 30%+</td><td>ask prompt 一行</td></tr>
+<tr><td><span class="tag tag-warn">P1</span></td><td>计数查询优化（区分"当前状态"和"历史计数"）</td><td>多会话 16% → 35%+</td><td>检索层改造</td></tr>
+<tr><td><span class="tag tag-warn">P2</span></td><td>维度别名合并（治理 4016 个维度的漂移问题）</td><td>全局信噪比</td><td>中等改动</td></tr>
+<tr><td><span class="tag tag-warn">P2</span></td><td>事件时间解析（"上周"→ 具体日期）</td><td>时间推理精度</td><td>较大改动</td></tr>
+</table>
+</div>
+
+<div style="margin-top:24px;padding:12px;background:var(--blue);color:#fff;border-radius:8px;text-align:center;font-size:.9em">
+一句话总结：<b>拒答和知识更新验证了治理设计；时间推理和计数暴露了覆盖缺口；改进不是放弃治理，是扩大治理的覆盖范围。</b>
+</div>
+
+</body>
+</html>

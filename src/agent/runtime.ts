@@ -91,19 +91,22 @@ export async function processTurn(
     return { gate: { store: false, reason: gate.reason }, captures: [], indexed: 0 };
   }
   let contextMemories: string[];
-  let similarDimensions: KnownDimension[] | undefined;
+  let knownDims: KnownDimension[];
   if (opts?.retrieval) {
     const rc = await retrievalContext(graph, text, opts.retrieval);
     contextMemories = rc.lines;
-    similarDimensions = rc.similarDimensions;
+    // 反漂移分层：检索命中的相关维度为主选，兜底前 50 个已知维度
+    knownDims = rc.similarDimensions.length > 0
+      ? rc.similarDimensions
+      : knownDimensionsOf(graph).slice(0, 50);
   } else {
     contextMemories = contextMemoriesOf(graph);
+    knownDims = knownDimensionsOf(graph).slice(0, 50);
   }
   const extract = await runExtract({
     text,
     candidates: gate.candidates,
-    knownDimensions: knownDimensionsOf(graph),
-    similarDimensions,
+    knownDimensions: knownDims,
     contextMemories,
     driver,
     extraFragments: opts?.extraFragments,
@@ -117,7 +120,8 @@ export async function processTurn(
   }
   const captures = extract.contents.map((content) => capture(graph, content, ctx));
 
-  // Embedding write path: after capture, index each new statement. Failures
+  // Embedding write path: after capture, index each new statement AND each
+  // new dimension (so similarDimensions can find it next time). Failures
   // here must NOT fail the turn — the memory is stored; the index is stale
   // and can be rebuilt (vectors are derived data).
   let indexed = 0;
@@ -129,8 +133,20 @@ export async function processTurn(
         const texts = stored.map((c) => statementText(graph, graph.getNode(c.statementId as string) as StatementNode));
         const vectors = await opts.retrieval.embedder.embed(texts);
         stored.forEach((c, i) => opts.retrieval?.vectors.put(c.statementId as string, vectors[i] as number[]));
-        indexed = stored.length;
       }
+      // also embed new dimensions (key + description) for similarDimensions retrieval
+      const newDims = captures.filter((c) => c.created).map((c) => c.dimensionId);
+      if (newDims.length > 0) {
+        const dimTexts = newDims.map((id) => {
+          const d = graph.getNode(id) as DimensionNode | undefined;
+          return d ? `${d.key} ${d.attributes?.description ?? ""}` : "";
+        }).filter(Boolean);
+        if (dimTexts.length > 0) {
+          const dimVectors = await opts.retrieval.embedder.embed(dimTexts);
+          newDims.forEach((id, i) => opts.retrieval?.vectors.put(id, dimVectors[i] as number[]));
+        }
+      }
+      indexed = captures.filter((c) => c.statementId !== null && !c.deduplicated).length;
     } catch (err) {
       indexError = (err as Error).message;
     }

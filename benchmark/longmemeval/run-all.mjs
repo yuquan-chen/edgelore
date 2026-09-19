@@ -40,10 +40,10 @@ function render(t0) {
   let facts = 0;
   const perShard = [];
   for (let i = 0; i < 4; i++) {
-    const s = readShard(i);
-    done += s.done;
-    facts += s.facts;
-    perShard.push(`${s.done}`);
+    const shard = readShard(i);
+    done += shard.done;
+    facts += shard.facts;
+    perShard.push(`${shard.done}`);
   }
   const width = 30;
   const filled = Math.max(0, Math.min(width, Math.round((width * done) / TOTAL)));
@@ -72,7 +72,6 @@ render(t0);
 await Promise.all(workers.map((w) => new Promise((res) => w.on("exit", res))));
 clearInterval(timer);
 render(t0);
-const s = readShard(0);
 console.log(
   `\n\n全部摄入完成 ✓  分片计数 [${[0, 1, 2, 3].map((i) => readShard(i).done).join(", ")}]  ` +
     `总记忆 ${[0, 1, 2, 3].reduce((a, i) => a + readShard(i).facts, 0)} 条\n` +

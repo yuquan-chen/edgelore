@@ -72,3 +72,13 @@ test("ask: now is forwarded into the assembled prompt through answerQuestion", a
   await answerQuestion(graph, "负责人是谁？", driver, { now: "2023-04-10" });
   assert.match(prompt(), /Today is 2023-04-10\./);
 });
+
+// --- A2: rule 3 原则化措辞 -----------------------------------------------------
+
+test("ask: rule 3 states the recency principle without referencing any benchmark case", () => {
+  const p = buildAskPrompt("q", ["x — 1 entry:"]);
+  assert.match(p, /LATEST USER-stated/);
+  assert.match(p, /even if it is still tentative/);
+  assert.match(p, /never overrides an accepted user value/);
+  assert.ok(!/yoga|therapy|apex|harvard/i.test(p), "prompt must stay case-agnostic");
+});

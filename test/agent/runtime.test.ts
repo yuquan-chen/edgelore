@@ -269,3 +269,39 @@ test("runtime: relevantDimensionsOf ranks matching dims first and bounds the lis
   const relevant2 = relevantDimensionsOf(graph, " completely unrelated text about quantum sailing ", 5);
   assert.ok(relevant2.length <= 5); // 零命中 → 插入序兜底，仍受 limit 约束
 });
+
+// --- A1/A5: 双端保留渲染 + scope 分组成员过滤 -----------------------------------
+
+test("runtime: over-cap dimensions render oldest+newest with a gap marker", async () => {
+  const graph = new MemoryGraph();
+  for (let i = 0; i < 10; i++) {
+    capture(graph, { dimensionKey: "trip", value: `trip-${String(i).padStart(2, "0")}` }, ctx);
+  }
+  const lines = await contextMemoriesViaRetrieval(graph, "trip", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    maxEntriesPerDimension: 8,
+  });
+  assert.match(lines[0] ?? "", /trip — 10 entries:/); // 图给计数不因截断失真
+  const entries = lines.filter((l) => l.startsWith("  = "));
+  assert.equal(entries.length, 8); // 4 最旧 + 4 最新
+  assert.match(entries[0] ?? "", /trip-00/); // 最旧
+  assert.match(entries[entries.length - 1] ?? "", /trip-09/); // 最新（旧版恰好裁掉的就是它）
+  const gap = lines.find((l) => l.includes("⋯"));
+  assert.match(gap ?? "", /2 more entries/);
+});
+
+test("runtime: scopeSessionIds filters group members (identity, not content)", async () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "hobby", value: "Alice 的爱好" }, { ...ctx, source_refs: ["s:alice"] });
+  capture(graph, { dimensionKey: "hobby", value: "Bob 的爱好" }, { ...ctx, source_refs: ["s:bob"] });
+  const lines = await contextMemoriesViaRetrieval(graph, "hobby", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    scopeSessionIds: ["s:alice"],
+  });
+  assert.match(lines[0] ?? "", /hobby — 1 entry:/); // 只剩 Alice 的
+  const joined = lines.join("\n");
+  assert.match(joined, /Alice 的爱好/);
+  assert.ok(!joined.includes("Bob 的爱好"), "scoped-out member must not render");
+});

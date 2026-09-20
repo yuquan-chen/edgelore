@@ -139,5 +139,37 @@ for (const d of clashDims) flagClash.run(nowIso, d.id);
 
 console.log(`\n维度按 key 统一: ${unifiedKeys} 个 key 调和, ${droppedDims} 个重复节点删除, ${remappedStmts} 条语句重挂`);
 console.log(`跨分片值冲突已标记 conflict（进入裁决台，resolve/autoresolve 可接管）: ${clashDims.length}`);
+
+// --- 跨分片同值语句去重（孪生会话/分片边界产生的精确重复） ----------------------
+// capture() 的去重只在同一分片内生效；两个分片为同一维度存了完全相同的值时，
+// 统一维度后它们会并排出现——虚增头部计数、浪费渲染预算。保留最早一条。
+
+const allStmts = target.prepare("SELECT id, data FROM nodes WHERE type = 'core:statement'").all();
+const byDimVal = new Map();
+const dupIds = [];
+for (const row of allStmts) {
+  const d = JSON.parse(row.data);
+  const sig = d.dimension_id + "|" + JSON.stringify(d.value);
+  const prev = byDimVal.get(sig);
+  if (!prev) {
+    byDimVal.set(sig, row);
+  } else {
+    const prevCreated = JSON.parse(prev.data).created_at ?? "";
+    const thisCreated = d.created_at ?? "";
+    if (thisCreated < prevCreated) {
+      dupIds.push(prev.id);
+      byDimVal.set(sig, row);
+    } else {
+      dupIds.push(row.id);
+    }
+  }
+}
+const delStmt = target.prepare("DELETE FROM nodes WHERE id = ?");
+const delVec = target.prepare("DELETE FROM embeddings WHERE node_id = ?");
+for (const id of dupIds) {
+  delStmt.run(id);
+  delVec.run(id);
+}
+console.log(`跨分片同值去重: ${dupIds.length} 条重复语句删除（保留最早）`);
 console.log(`merged store: ${finalCounts}, edges=${totals.edges}, constraints=${totals.constraints}, vectors=${totals.embeddings}`);
 target.close();

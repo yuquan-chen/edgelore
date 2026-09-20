@@ -113,6 +113,11 @@ export interface RetrievalInput {
   dateFrom?: string;
   /** Inclusive upper bound on the statement's created_at DAY ("YYYY-MM-DD"). */
   dateTo?: string;
+  /** Scope filter: when set, only statements carrying at least one of these
+   * source_refs are candidates. This is IDENTITY, not content — the caller
+   * says WHOSE memory to search (e.g. one user's session set), never WHICH
+   * facts are right. Unset = search everything (single-tenant default). */
+  sourceRefsAllow?: readonly string[];
 }
 
 /**
@@ -133,10 +138,14 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
   }
   const all = graph.queryNodes({ type: "core:statement" }) as StatementNode[];
   if (all.length === 0) return [];
-  // One candidate pre-filter (state / date window) shared by both routes.
+  // One candidate pre-filter (state / date window / scope) shared by both routes.
+  // Day normalization: legacy rows stored slash dates ("2023/05/28"); ASCII
+  // compares silently misorder "/" (0x2F) vs "-" (0x2D) — normalize both sides.
+  const allowSet = input.sourceRefsAllow ? new Set(input.sourceRefsAllow) : undefined;
   const stmts = all.filter((s) => {
     if (input.states && !input.states.includes(s.state)) return false;
-    const day = s.created_at.slice(0, 10);
+    if (allowSet && !(s.source_refs ?? []).some((r) => allowSet.has(r))) return false;
+    const day = s.created_at.slice(0, 10).replace(/\//g, "-");
     if (input.dateFrom && day < input.dateFrom) return false;
     if (input.dateTo && day > input.dateTo) return false;
     return true;
@@ -235,12 +244,20 @@ export function expandHit(graph: MemoryGraph, hit: RetrievalHit, maxSiblings = 5
 /** Canonical text a statement is embedded / lexically matched against.
  * Assistant-authored statements get an explicit speaker prefix: queries like
  * "助手推荐了什么数据库" must lexically hit the attribution, not just the
- * value. Legacy rows (no saidBy) are untouched, so existing vectors stay
- * valid — the prefix only ever applies to new assistant statements. */
+ * value. The dimension's human-language description is appended (when it
+ * differs from the key) — numeric values ("views": 1456) share zero bigrams
+ * with natural-language queries; the description is the bridge. Legacy rows
+ * without saidBy/description are untouched. */
 export function statementText(graph: GraphStore, stmt: StatementNode): string {
   const dim = graph.getNode(stmt.dimension_id) as DimensionNode | undefined;
   const speaker = stmt.saidBy === "assistant" ? "assistant: " : "";
-  return `${speaker}${dim?.key ?? ""} ${JSON.stringify(stmt.value)}${stmt.unit ? ` ${stmt.unit}` : ""}`;
+  const desc =
+    typeof dim?.attributes?.description === "string" &&
+    dim.attributes.description.length > 0 &&
+    dim.attributes.description !== dim.key
+      ? ` ${dim.attributes.description}`
+      : "";
+  return `${speaker}${dim?.key ?? ""}${desc} ${JSON.stringify(stmt.value)}${stmt.unit ? ` ${stmt.unit}` : ""}`;
 }
 
 // --- routes ------------------------------------------------------------------

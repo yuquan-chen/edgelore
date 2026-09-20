@@ -77,6 +77,10 @@ export interface RetrievalConfig {
   dateFrom?: string;
   /** Inclusive upper bound (see {@link dateFrom}). */
   dateTo?: string;
+  /** Scope filter — WHOSE memory to search (session/source ids). Identity,
+   * not content: group members are filtered by the same set so a retrieved
+   * dimension never renders another tenant's statements. Unset = all. */
+  scopeSessionIds?: readonly string[];
 }
 
 /**
@@ -108,13 +112,13 @@ export async function processTurn(
   if (opts?.retrieval) {
     const rc = await retrievalContext(graph, text, opts.retrieval);
     contextMemories = rc.lines;
-    // 反漂移分层：检索命中的相关维度为主选，兜底前 50 个已知维度
+    // 反漂移分层：检索命中的相关维度为主选，兜底为按本回合相关性选择的 top-50
     knownDims = rc.similarDimensions.length > 0
       ? rc.similarDimensions
-      : knownDimensionsOf(graph).slice(0, 50);
+      : relevantDimensionsOf(graph, text, 50);
   } else {
     contextMemories = contextMemoriesOf(graph);
-    knownDims = knownDimensionsOf(graph).slice(0, 50);
+    knownDims = relevantDimensionsOf(graph, text, 50);
   }
   const extract = await runExtract({
     text,
@@ -310,15 +314,20 @@ export async function retrievalContext(
     states: config.states,
     dateFrom: config.dateFrom,
     dateTo: config.dateTo,
+    sourceRefsAllow: config.scopeSessionIds,
   });
   const dimById = new Map(
     (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).map((d) => [d.id, d]),
   );
 
-  // Group ALL statements by dimension once (per-dimension completeness is
-  // the point of grouped rendering); chronological inside each group.
+  // Group statements by dimension once (per-dimension completeness is the
+  // point of grouped rendering); chronological inside each group. Scope
+  // filter applies to GROUP MEMBERS too — a retrieved dimension must never
+  // render another tenant's statements.
+  const scopeSet = config.scopeSessionIds ? new Set(config.scopeSessionIds) : undefined;
   const membersByDim = new Map<string, StatementNode[]>();
   for (const s of graph.queryNodes({ type: "core:statement" }) as StatementNode[]) {
+    if (scopeSet && !(s.source_refs ?? []).some((r) => scopeSet.has(r))) continue;
     const list = membersByDim.get(s.dimension_id);
     if (list) list.push(s);
     else membersByDim.set(s.dimension_id, [s]);
@@ -337,19 +346,32 @@ export async function retrievalContext(
   for (const dimId of hitDims) {
     const members = membersByDim.get(dimId) ?? [];
     const key = dimById.get(dimId)?.key ?? hits.find((h) => h.dimensionId === dimId)?.dimensionKey ?? "?";
-    if (lines.length + Math.min(members.length, maxEntries) + 1 > maxLines) {
+    // Double-ended selection: oldest half + newest half. Oldest-only rendering
+    // systematically hid the LATEST value of fast-growing dimensions (the
+    // exact entries knowledge-update questions need).
+    const headN = Math.ceil(maxEntries / 2);
+    const tailN = maxEntries - headN;
+    const overCap = members.length > maxEntries;
+    const head = overCap ? members.slice(0, headN) : members;
+    const tail = overCap ? members.slice(members.length - tailN) : [];
+    const gapCount = overCap ? members.length - headN - tailN : 0;
+    const shownLines = head.length + tail.length + (gapCount > 0 ? 1 : 0);
+    if (lines.length + shownLines + 1 > maxLines) {
       // Over budget: degrade to a one-line summary — the COUNT survives even
       // when the entries do not (counting questions read the header).
       lines.push(`${key}: ${members.length} entries (omitted — context budget)`);
       continue;
     }
     lines.push(`${key} — ${members.length} ${members.length === 1 ? "entry" : "entries"}:`);
-    for (const m of members.slice(0, maxEntries)) {
+    const renderMember = (m: StatementNode) => {
       const speaker = m.saidBy === "assistant" ? " (assistant)" : "";
       lines.push(
         `  = ${JSON.stringify(m.value)}${m.unit ? ` ${m.unit}` : ""} [${m.state} @${m.created_at.slice(0, 10)}]${speaker}`,
       );
-    }
+    };
+    for (const m of head) renderMember(m);
+    if (gapCount > 0) lines.push(`  ⋯ ${gapCount} more entries in between`);
+    for (const m of tail) renderMember(m);
     for (const c of activeConstraints) {
       if (Object.values(c.bindings).includes(dimId) || c.participants.includes(dimId)) {
         lines.push(`  rule "${c.name ?? c.id}" -> ${graph.evaluateConstraint(c.id)}`);

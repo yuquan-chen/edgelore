@@ -41,8 +41,10 @@ export function buildAskPrompt(question: string, memories: readonly string[], no
     "1. Every claim must come from the memory entries. Never invent facts.",
     "2. Use dates actively: entries have [state @date] markers. For temporal questions,",
     "   compare dates against today, compute intervals, and order events chronologically.",
-    "3. When entries compete, the LATEST accepted entry is current truth. Report it as",
-    "   the answer; you may briefly note the outdated value.",
+    "3. When entries describe the same slot at different dates, the LATEST USER-stated",
+    "   entry is current truth — even if it is still tentative (pending review is not",
+    "   rejection); you may briefly note the outdated value. An assistant's tentative",
+    "   suggestion never overrides an accepted user value.",
     "4. The context is grouped by dimension: a header like `key — 3 entries:` is the",
     "   graph's OWN count — trust it for counting questions (a group marked omitted",
     "   still has its count in the header). superseded and tentative entries still",
@@ -77,6 +79,14 @@ export interface AskOptions {
   k?: number;
   /** "Today", as an ISO day ("2023-04-10"). Omitted -> no Today line. */
   now?: string;
+  /** Upper bound on candidate memory dates ("YYYY-MM-DD") — a question asked
+   * at time T cannot recall statements made after T. Product callers omit
+   * this (now = actual time); benchmark callers pass the question date. */
+  dateTo?: string;
+  /** Scope: WHOSE memory to search (session/source ids). Identity, not
+   * content — product callers scope by user namespace; benchmark callers
+   * pass the question's haystack session set. */
+  scopeSessionIds?: readonly string[];
 }
 
 /**
@@ -85,7 +95,8 @@ export interface AskOptions {
  * @param graph a concrete MemoryGraph (or SqliteGraph)
  * @param question the user's question
  * @param driver the LLM driver (MockDriver in tests)
- * @param opts optional retrieval plumbing, context size, and today's date
+ * @param opts optional retrieval plumbing, context size, today's date, and
+ *   scope/date bounds
  * @returns the grounded answer with its supporting memory lines
  * @throws AgentError on malformed driver replies (propagated)
  */
@@ -95,8 +106,16 @@ export async function answerQuestion(
   driver: LlmDriver,
   opts?: AskOptions,
 ): Promise<AskResult> {
-  const memories = opts?.retrieval
-    ? (await retrievalContext(graph, question, { ...opts.retrieval, k: opts.k ?? 10 })).lines
+  const retrievalConfig = opts?.retrieval
+    ? {
+        ...opts.retrieval,
+        ...(opts.dateTo ? { dateTo: opts.dateTo } : {}),
+        ...(opts.scopeSessionIds ? { scopeSessionIds: opts.scopeSessionIds } : {}),
+        k: opts.k ?? opts.retrieval.k ?? 10,
+      }
+    : undefined;
+  const memories = retrievalConfig
+    ? (await retrievalContext(graph, question, retrievalConfig)).lines
     : contextMemoriesOf(graph, opts?.k ?? 10);
   const answer = (await driver.complete(buildAskPrompt(question, memories, opts?.now))).trim();
   return { answer, usedMemories: memories, abstained: answer === ABSTAIN };

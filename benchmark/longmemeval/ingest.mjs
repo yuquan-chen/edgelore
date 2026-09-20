@@ -52,7 +52,7 @@ for (const q of dataset) {
   q.haystack_session_ids.forEach((sid, i) => {
     if (!sessions.has(sid)) {
       sessions.set(sid, {
-        date: (q.haystack_dates[i] ?? "").slice(0, 10),
+        date: (q.haystack_dates[i] ?? "").slice(0, 10).replace(/\//g, "-"),
         turns: q.haystack_sessions[i] ?? [],
       });
     }

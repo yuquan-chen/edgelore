@@ -222,3 +222,50 @@ test("lexical route: long attractor documents no longer outrank short precise on
   assert.ok(hits.length >= 1);
   assert.equal(hits[0]?.dimensionKey, "gymSchedule", "short precise doc must beat the long movie list");
 });
+
+// --- A3/A5/A6: 日期兼容 + scope 过滤 + 描述桥接 ---------------------------------
+
+test("retrieval: slash-format legacy dates compare correctly against ISO bounds", async () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "trip", value: "五月出行" }, { ...ctx, createdAt: "2023/05/28" });
+  // 斜杠日期若不归一，ASCII 比较 "2023/05/28" > "2023-05-31"（'/'>'-'）→ 会静默漏判
+  const inWindow = await retrieveRelevant(graph, {
+    query: "出行",
+    mode: "lexical",
+    dateFrom: "2023-05-01",
+    dateTo: "2023-05-31",
+  });
+  assert.equal(inWindow.length, 1);
+  const before = await retrieveRelevant(graph, {
+    query: "出行",
+    mode: "lexical",
+    dateTo: "2023-04-30",
+  });
+  assert.equal(before.length, 0);
+});
+
+test("retrieval: sourceRefsAllow scopes candidates by identity", async () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "city", value: "巴黎" }, { ...ctx, source_refs: ["s:alice"] });
+  capture(graph, { dimensionKey: "city", value: "罗马" }, { ...ctx, source_refs: ["s:bob"] });
+  const scoped = await retrieveRelevant(graph, {
+    query: "巴黎 罗马",
+    mode: "lexical",
+    sourceRefsAllow: ["s:alice"],
+  });
+  assert.equal(scoped.length, 1);
+  assert.equal(scoped[0]?.value, "巴黎");
+  const unscoped = await retrieveRelevant(graph, { query: "巴黎 罗马", mode: "lexical" });
+  assert.equal(unscoped.length, 2);
+});
+
+test("retrieval: statementText bridges numeric values via dimension description", () => {
+  const graph = new MemoryGraph();
+  const withDesc = capture(graph, { dimensionKey: "videoViews", value: 1456, description: "视频播放量" }, ctx);
+  const noDesc = capture(graph, { dimensionKey: "views", value: 42 }, ctx);
+  const t1 = statementText(graph, graph.getNode(withDesc.statementId!) as StatementNode);
+  const t2 = statementText(graph, graph.getNode(noDesc.statementId!) as StatementNode);
+  assert.match(t1, /视频播放量/); // 自然语言桥接进打分文本
+  assert.ok(!t2.includes("views views"), "description === key must not be duplicated");
+  assert.match(t2, /^views /);
+});

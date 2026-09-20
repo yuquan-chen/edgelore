@@ -45,7 +45,7 @@ function argVal(name) {
   const i = args.indexOf(name);
   return i !== -1 ? args[i + 1] : undefined;
 }
-const k = Number(argVal("--k") ?? 10);
+const k = argVal("--k") ? Number(argVal("--k")) : Number(process.env.EDGELORE_RETRIEVAL_K) || 10;
 const seed = Number(argVal("--seed") ?? 20260919);
 const idsArg = argVal("--ids");
 const tag = argVal("--tag");
@@ -160,8 +160,15 @@ if (dryRun) {
 requireChat(cfg, { maxTokens: 16000 }); // fail fast with a readable message
 const driver = requireChat(cfg, { maxTokens: 16000 });
 const graph = new SqliteGraph(join(dataDir, "memory.db"));
+// A9: env 旋钮（mode/k/rrfSmoothing/maxEntriesPerDimension/maxContextLines）接线——
+// k 显式由 --k / EDGELORE_RETRIEVAL_K 决定（上方），其余旋钮从 config 透传
 const retrieval = cfg.embedding
-  ? { embedder: embeddingDriver(cfg), vectors: new SqliteVectorStore(graph) }
+  ? {
+      ...cfg.retrieval,
+      k: undefined, // k 由 AskOptions 单独传（--k / env / 默认 10），避免 config 默认 8 混淆
+      embedder: embeddingDriver(cfg),
+      vectors: new SqliteVectorStore(graph),
+    }
   : undefined;
 
 // resume support
@@ -207,6 +214,8 @@ for (const q of todo) {
       retrieval,
       k,
       now: isoDay(q.question_date), // honored by the answering layer (W4); ignored before
+      dateTo: isoDay(q.question_date), // A4: 题目时刻之后的话不能被"回忆"起来
+      scopeSessionIds: q.haystack_session_ids, // A5: 只在该题的会话集（= 该虚拟用户的账本）内检索
     });
     appendFileSync(hypPath, JSON.stringify({ question_id: q.question_id, hypothesis: r.answer }) + "\n");
     done += 1;

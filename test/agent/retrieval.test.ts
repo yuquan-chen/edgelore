@@ -244,7 +244,7 @@ test("retrieval: slash-format legacy dates compare correctly against ISO bounds"
   assert.equal(before.length, 0);
 });
 
-test("retrieval: sourceRefsAllow scopes candidates by identity", async () => {
+test("retrieval: sourceRefsAllow soft-scopes — in-scope ranked first, out-of-scope reachable", async () => {
   const graph = new MemoryGraph();
   capture(graph, { dimensionKey: "city", value: "巴黎" }, { ...ctx, source_refs: ["s:alice"] });
   capture(graph, { dimensionKey: "city", value: "罗马" }, { ...ctx, source_refs: ["s:bob"] });
@@ -253,8 +253,10 @@ test("retrieval: sourceRefsAllow scopes candidates by identity", async () => {
     mode: "lexical",
     sourceRefsAllow: ["s:alice"],
   });
-  assert.equal(scoped.length, 1);
+  // 软 scope：范围内的排第一（加权），范围外的仍可达（孪生会话不致失明）
+  assert.equal(scoped.length, 2);
   assert.equal(scoped[0]?.value, "巴黎");
+  assert.ok(scoped[0]!.score > scoped[1]!.score * 2, "in-scope hit must be clearly boosted");
   const unscoped = await retrieveRelevant(graph, { query: "巴黎 罗马", mode: "lexical" });
   assert.equal(unscoped.length, 2);
 });

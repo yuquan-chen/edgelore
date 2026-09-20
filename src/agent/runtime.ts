@@ -322,12 +322,14 @@ export async function retrievalContext(
 
   // Group statements by dimension once (per-dimension completeness is the
   // point of grouped rendering); chronological inside each group. Scope
-  // filter applies to GROUP MEMBERS too — a retrieved dimension must never
-  // render another tenant's statements.
+  // prefers THIS tenant's members (header count = tenant count) but falls
+  // back to all members when the dimension holds none — twin-session
+  // provenance must stay visible (the stage2b -2 lesson).
   const scopeSet = config.scopeSessionIds ? new Set(config.scopeSessionIds) : undefined;
+  const inScopeOf = (s: StatementNode) =>
+    !scopeSet || (s.source_refs ?? []).some((r) => scopeSet.has(r));
   const membersByDim = new Map<string, StatementNode[]>();
   for (const s of graph.queryNodes({ type: "core:statement" }) as StatementNode[]) {
-    if (scopeSet && !(s.source_refs ?? []).some((r) => scopeSet.has(r))) continue;
     const list = membersByDim.get(s.dimension_id);
     if (list) list.push(s);
     else membersByDim.set(s.dimension_id, [s]);
@@ -344,7 +346,9 @@ export async function retrievalContext(
   const lines: string[] = [];
   const hitDims = [...new Set(hits.map((h) => h.dimensionId))];
   for (const dimId of hitDims) {
-    const members = membersByDim.get(dimId) ?? [];
+    const allMembers = membersByDim.get(dimId) ?? [];
+    const scoped = scopeSet ? allMembers.filter(inScopeOf) : [];
+    const members = scoped.length > 0 ? scoped : allMembers;
     const key = dimById.get(dimId)?.key ?? hits.find((h) => h.dimensionId === dimId)?.dimensionKey ?? "?";
     // Double-ended selection: oldest half + newest half. Oldest-only rendering
     // systematically hid the LATEST value of fast-growing dimensions (the

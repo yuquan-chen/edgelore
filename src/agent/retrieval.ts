@@ -148,13 +148,14 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
   }
   const all = graph.queryNodes({ type: "core:statement" }) as StatementNode[];
   if (all.length === 0) return [];
-  // One candidate pre-filter (state / date window / scope) shared by both routes.
+  // One candidate pre-filter (state / date window) shared by both routes.
   // Day normalization: legacy rows stored slash dates ("2023/05/28"); ASCII
   // compares silently misorder "/" (0x2F) vs "-" (0x2D) — normalize both sides.
-  const allowSet = input.sourceRefsAllow ? new Set(input.sourceRefsAllow) : undefined;
+  // NOTE: scope (sourceRefsAllow) is applied as a SCORE BOOST after fusion,
+  // not as a hard filter here — twin-session provenance (the same logical
+  // conversation stored under different session ids) must stay reachable.
   const stmts = all.filter((s) => {
     if (input.states && !input.states.includes(s.state)) return false;
-    if (allowSet && !(s.source_refs ?? []).some((r) => allowSet.has(r))) return false;
     const day = s.created_at.slice(0, 10).replace(/\//g, "-");
     if (input.dateFrom && day < input.dateFrom) return false;
     if (input.dateTo && day > input.dateTo) return false;
@@ -200,7 +201,27 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
     mode === "vector" ? r.name === "vector" : mode === "lexical" ? r.name === "lexical" : true,
   );
   const fused = fuseRRF(usable, input.smoothing ?? 60);
-  return [...fused.entries()]
+
+  // Soft scope: in-scope statements get their fused score multiplied —
+  // preferred, never mandatory. Hard filtering blinded us to twin-session
+  // provenance (the same fact stored under a sibling session id): the -2
+  // regression in stage2b. Identity should bias ranking, not blind it.
+  // Boost BEFORE truncation, or a low-ranking but in-scope hit gets cut
+  // before it can be promoted.
+  const scopeSet = input.sourceRefsAllow ? new Set(input.sourceRefsAllow) : undefined;
+  const SCOPE_BOOST = 3;
+  const ranked = [...fused.entries()];
+  const withScope = scopeSet
+    ? (() => {
+        const byId = new Map(stmts.map((s) => [s.id, s]));
+        return ranked.map(([statementId, meta]) => {
+          const stmt = byId.get(statementId) as StatementNode;
+          const inScope = (stmt.source_refs ?? []).some((r) => scopeSet.has(r));
+          return [statementId, { score: inScope ? meta.score * SCOPE_BOOST : meta.score, via: meta.via }] as const;
+        });
+      })()
+    : ranked;
+  return withScope
     .sort((a, b) => b[1].score - a[1].score)
     .slice(0, k)
     .map(([statementId, meta]) => {

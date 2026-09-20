@@ -49,10 +49,11 @@
 ## 反过拟合纪律（2026-09-20 起，所有评测优化必须遵守）
 
 1. 每项修改必须对应**失败模式**（来自错题取证），不对应**具体题目**；取证里的题目 ID 只用作验收清单（改完回归看失败模式是否消失），绝不进 prompt/runtime/配置
-2. 有专门测试锁线：ask prompt 不得出现任何案例关键词（test/agent/ask.test.ts 的 case-agnostic 断言）
+2. **分层红线（test/boundary.test.ts 机器强制）**：`src/` 是产品——禁止出现任何 benchmark/数据集词汇（haystack/longmemeval/question_date/oracle/gold/judge/stage1/stage2）和案例关键词；这些只允许存在于 `benchmark/` 工装层。发现于 benchmark 的问题可以决定**优先级**，但实现必须是通用药方，不是给单个病人演的戏
 3. 每个 prompt/规则改动都要能回答："一个从没见过这个 benchmark 的用户，这条规则对他的真实记忆也有益吗？"——答否就不做
 4. 修复优先修**通用机制**（检索/渲染/治理），修不动才动措辞；措辞也要是普适原则（如"最新用户陈述优先"），不是案例规则
 5. 有数据支撑的克制同样重要：明确不做 ANN（<10 万语句）、不做 memoryType 标签、不做全量回扫（见 optimization-roadmap.md 不做清单）
+6. **灵魂锚**：benchmark 是罗盘不是领土。产品的灵魂 = 约束引擎进主链路（W6b）+ 真实使用闭环（edgelore-memory MCP 技能 dogfood）+ 触发层——这三样 benchmark 测不了，但不做它们，项目就没有差异化
 
 ## 关键架构决策（已冻结，不要重开讨论）
 

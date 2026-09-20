@@ -373,8 +373,9 @@ test("batch: session date anchors relative-time resolution in examples and pream
     sessionDate: "2023-05-01",
   });
   assert.match(p, /Session date: 2023-05-01/); // 真实锚点
-  assert.match(p, /Two months ago I started learning French/); // few-shot 教日期换算
-  assert.match(p, /\(from 2023-03-01\)/); // 换算结果在示例里示范
+  assert.match(p, /By the way, I got a \$50 parking ticket last Monday/); // few-shot 教旁插+日期换算
+  assert.match(p, /我两个月前开始学法语/); // 中文示例：语言镜像 + 日期换算
+  assert.match(p, /（从 2023-03-01 起）/); // 换算结果在示例里示范
   assert.match(p, /never\s+invent one|never invent/); // 防幻觉条款
   const p2 = buildBatchExtractionPrompt({ transcript: "x", knownDimensions: [], maxFacts: 5 });
   assert.match(p2, /Session date: \(unknown\)/);

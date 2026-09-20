@@ -6,7 +6,7 @@ edgelore 把 Agent 的记忆存成一张**知识图谱**（节点 / 边 / 约束
 
 - 本地优先，零云依赖：用 Node 内置的 `node:sqlite` 落库，一个 `.db` 文件就是全部记忆。
 - 结构化存储原语 `capture`：喂一段结构化 JSON（维度 + 值），系统自动建维度、去重、落库、标冲突。
-- 阶段化演进：M0 形状 → M1 自检 → M2 存得住 → M3 自己长（capture）。后续规划见 [docs/HANDOFF.md](docs/HANDOFF.md)。
+- 阶段化演进：M0–M4 全线贯通 + Agent 记忆管线（gate→extract→capture）+ 混合检索 + 冲突裁决 + MCP server。**LongMemEval-ORACLE（固定 100 题对照）：71.0%**（deepseek-v4-flash 同时担任抽取与判卷；三轮取证验证 38.0% → 53.0% → 71.0%）。当前状态见 [HANDOFF-v2.md](HANDOFF-v2.md)，优化路线图见 [docs/notes/optimization-roadmap.md](docs/notes/optimization-roadmap.md)。
 
 ---
 
@@ -25,7 +25,7 @@ npm install
 # 3. 编译 TypeScript
 npm run build
 
-# 4. 跑测试（46 个用例，全绿即通过）
+# 4. 跑测试（178 个用例，全绿即通过）
 npm test
 ```
 

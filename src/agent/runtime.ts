@@ -367,10 +367,17 @@ export async function retrievalContext(
       continue;
     }
     lines.push(`${key} — ${members.length} ${members.length === 1 ? "entry" : "entries"}:`);
+    // Scope tagging: when scoping is active and this dimension has NO in-scope
+    // members (the twin-session fallback channel), every rendered line is
+    // tagged so the answering layer can keep them out of aggregates. Mixed
+    // dimensions never reach here — when scoped members exist, only they are
+    // rendered (untagged: they ARE the account).
+    const fallbackOut = scopeSet !== undefined && scoped.length === 0 && scopeSet.size > 0;
     const renderMember = (m: StatementNode) => {
       const speaker = m.saidBy === "assistant" ? " (assistant)" : "";
+      const tag = fallbackOut ? " (non-user-account)" : "";
       lines.push(
-        `  = ${JSON.stringify(m.value)}${m.unit ? ` ${m.unit}` : ""} [${m.state} @${m.created_at.slice(0, 10)}]${speaker}`,
+        `  = ${JSON.stringify(m.value)}${m.unit ? ` ${m.unit}` : ""} [${m.state} @${m.created_at.slice(0, 10)}]${speaker}${tag}`,
       );
     };
     for (const m of head) renderMember(m);

@@ -305,3 +305,31 @@ test("runtime: scopeSessionIds filters group members (identity, not content)", a
   assert.match(joined, /Alice 的爱好/);
   assert.ok(!joined.includes("Bob 的爱好"), "scoped-out member must not render");
 });
+
+// --- 账本标注渲染（软 scope 的聚合防护） ----------------------------------------
+
+test("runtime: fallback (no in-scope members) tags lines as non-user-account", async () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "standMixerGift", value: "mixer from sister" }, { ...ctx, source_refs: ["s:twin"] });
+  const lines = await contextMemoriesViaRetrieval(graph, "stand mixer", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    scopeSessionIds: ["s:alice"], // 该维度在 alice 账本内无成员 → 走孪生兜底并打标
+  });
+  assert.match(lines[0] ?? "", /standMixerGift — 1 entry:/);
+  assert.match(lines[1] ?? "", /\(non-user-account\)/);
+});
+
+test("runtime: in-scope members render without the non-user-account tag", async () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "hobby", value: "Alice 的爱好" }, { ...ctx, source_refs: ["s:alice"] });
+  capture(graph, { dimensionKey: "hobby", value: "Bob 的爱好" }, { ...ctx, source_refs: ["s:bob"] });
+  const lines = await contextMemoriesViaRetrieval(graph, "hobby", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    scopeSessionIds: ["s:alice"],
+  });
+  const joined = lines.join("\n");
+  assert.ok(!joined.includes("non-user-account"), "scoped render is the account itself — no tag");
+  assert.ok(!joined.includes("Bob 的爱好"));
+});

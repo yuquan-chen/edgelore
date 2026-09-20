@@ -82,3 +82,10 @@ test("ask: rule 3 states the recency principle without referencing any benchmark
   assert.match(p, /never overrides an accepted user value/);
   assert.ok(!/yoga|therapy|apex|harvard/i.test(p), "prompt must stay case-agnostic");
 });
+
+test("ask: rule 6 keeps non-user-account entries out of aggregates", () => {
+  const p = buildAskPrompt("q", ["x — 1 entry:"]);
+  assert.match(p, /non-user-account/);
+  assert.match(p, /never count,/);
+  assert.match(p, /single-fact lookup/);
+});

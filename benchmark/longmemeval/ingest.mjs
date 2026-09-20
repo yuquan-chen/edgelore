@@ -171,6 +171,7 @@ for (const [sid, session] of sessions) {
       // 60 万字符的 key 清单，超出模型上下文被静默截断，反漂移失效
       knownDimensions: relevantDimensionsOf(graph, transcript, 30),
       maxFacts: cfg.extraction.maxFactsPerSession,
+      sessionDate: session.date || undefined,
     };
     let parsed = parseJsonReply(await driver.complete(buildBatchExtractionPrompt(promptOpts)));
     let batch = normalizeBatchContents(parsed.contents ?? []);

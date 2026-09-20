@@ -118,6 +118,7 @@ const EXTRACT_RULES = [
   "6. If contextMemories already contain an equivalent value, still output the entry (capture deduplicates). If one contradicts, still output it (capture flags the conflict) — resolving conflicts is not your job.",
   "7. One entry per candidate, in order; each entry is independent.",
   '8. Attribute each entry with saidBy — who STATED it in the text: "user" for facts the user stated; "assistant" for conclusions/recommendations the assistant contributed. Assistant conclusions are first-class memories: never drop one for being the assistant\'s.',
+  '9. Resolve relative time expressions ("two months ago", "last Friday") into absolute dates and keep them inside the value; today\'s date arrives with the turn context. If unresolvable, omit it — never invent one.',
 ].join("\n");
 
 const EXTRACT_ENTRY_SHAPE = `For each candidate, output exactly one entry object:
@@ -196,7 +197,9 @@ export interface BatchExtractionPromptInput {
   knownDimensions: readonly KnownDimension[];
   /** Max facts per session — the harness's budget knob. */
   maxFacts: number;
-  /** Extra fragments appended before the output contract (retry nudges). */
+  /** ISO date anchoring relative-time resolution ("two months ago"). */
+  sessionDate?: string;
+  /** Extra fragments appended to the rules zone (retry nudges). */
   extraFragments?: readonly string[];
 }
 
@@ -205,14 +208,12 @@ export interface BatchExtractionPromptInput {
  * imports (the LongMemEval harness ingests 940 sessions this way — one
  * cheap call each, instead of the per-turn gate+extract pipeline).
  *
- * History: this prompt used to live in benchmark/longmemeval/ingest.mjs,
- * with a second stale copy in fill-gaps.mjs — where it silently diverged
- * from src and grew the "the assistant only helps" bias that dropped every
- * assistant conclusion on the floor (LongMemEval single-session-assistant
- * 7.1%). It now lives in src so product and benchmark share ONE wording;
- * the entry contract is deliberately identical to the per-turn extractor
- * (plus required saidBy), so `normalizeBatchContents` can share the same
- * narrowing code.
+ * Style follows the frameworks we studied (Mem0/Graphiti): a positive role,
+ * FEW-SHOT EXAMPLES that teach by demonstration (date resolution, side
+ * remarks, assistant attribution, abstention), and a short rules list —
+ * instead of prohibitive rule walls. The session date anchors every
+ * relative-time resolution; unresolvable times are omitted, never invented
+ * (Graphiti's DATETIME RULES).
  */
 export function buildBatchExtractionPrompt(input: BatchExtractionPromptInput): string {
   const known =
@@ -220,42 +221,74 @@ export function buildBatchExtractionPrompt(input: BatchExtractionPromptInput): s
       ? input.knownDimensions.map((d) => JSON.stringify(d)).join("\n")
       : "(none yet)";
   return [
-    "You are extracting durable long-term memories from ONE session of a conversation",
-    "between a user and an assistant. Evaluate BOTH sides of the conversation:",
-    "extract every fact worth remembering months later — facts the user stated about",
-    "their life/project AND conclusions, recommendations, or plans the ASSISTANT",
-    "contributed that will still matter to the user later. Skip greetings, small talk,",
-    "transient chatter, and pure process talk.",
+    "You are a Personal Memory Organizer. You read ONE session of a conversation",
+    "between a user and an assistant, and extract the facts worth remembering",
+    "months later — from BOTH sides of the conversation:",
+    "- User facts: preferences, plans, events, personal details, quantities.",
+    "- Assistant contributions: recommendations, conclusions, or plans that will",
+    "  still matter to the user later.",
     "",
-    "Known dimensions (REUSE one of these keys if a fact is the same slot — never mint",
-    "a new key for an existing concept):",
+    "### Examples",
+    "",
+    "Session date: 2023-05-01",
+    "[user] Hi!",
+    "[assistant] Hello! How can I help?",
+    '→ {"contents": []}',
+    "",
+    "Session date: 2023-05-01",
+    "[user] Two months ago I started learning French. It's going well!",
+    '→ {"contents": [{"dimensionKey": "NEW:frenchLearning", "value": "Started learning French (from 2023-03-01)", "saidBy": "user", "dimensionDescription": "French learning", "cardinality": "single"}]}',
+    "",
+    "Session date: 2023-05-14",
+    "[user] This week is busy. By the way, I got a $50 parking ticket last Monday.",
+    '→ {"contents": [{"dimensionKey": "NEW:parkingTicket", "value": "Parking ticket, $50 (2023-05-08)", "saidBy": "user"}]}',
+    "",
+    "Session date: 2023-05-20",
+    "[user] 我两个月前开始学法语，现在每周上三次课。",
+    '→ {"contents": [{"dimensionKey": "NEW:frenchLearning", "value": "开始学法语（从 2023-03-01 起），每周三次课", "saidBy": "user"}]}',
+    "",
+    "Session date: 2023-05-20",
+    "[user] Which database should I use for this project?",
+    "[assistant] For this use case I recommend PostgreSQL — it fits your structured workload better than MongoDB here.",
+    '→ {"contents": [{"dimensionKey": "NEW:databaseChoice", "value": "PostgreSQL recommended for the project\'s structured workload", "saidBy": "assistant"}]}',
+    "",
+    "### Rules",
+    "",
+    "- The session date is stated above the transcript. Resolve every relative time",
+    '  ("two months ago", "last Friday", "today") into an absolute date and keep it',
+    "  inside the value. If a time cannot be resolved, omit it — never invent one.",
+    '- Keep numbers exactly as stated ("10-12 hours", "$50", "500 Mbps") — never',
+    "  flatten a range to a single number.",
+    '- Facts mentioned in passing ("by the way...") count as memories too.',
+    "- If the user CORRECTS an earlier statement in this session, record only the",
+    "  final corrected value.",
+    "- Do not invent facts; every value must come from the transcript.",
+    "- Record facts in the speaker's original language; dimension keys stay English.",
+    "",
+    "### Known dimensions",
+    "(REUSE one of these keys if a fact is the same slot — never mint a new key for",
+    "an existing concept)",
     known,
     "",
     "For each fact output one object:",
     '{ "dimensionKey": "<known key, or NEW:lowerCamelCase>",',
-    '  "value": <bare NUMBER for quantities (e.g. 5000, never "5000"), else a short',
-    '           string in the original language verbatim>,',
-    '  "saidBy": "user" | "assistant" — who STATED this fact (see below),',
+    '  "value": <bare NUMBER for quantities, else a short string in the original',
+    '           language — keep resolved dates inside>,',
+    '  "saidBy": "user" | "assistant" — who STATED this fact',
+    '            (assistant recommendations count too),',
     '  "dimensionDescription": "<one short line in the original language, NEW: only>",',
     '  "cardinality": "<single|multi, NEW: only>",',
     '  "unit": "<optional, e.g. CNY, days, km>" }',
     "",
-    'Attribution: facts the USER stated about themselves or their project -> "user".',
-    "Conclusions, recommendations, explanations or plans the ASSISTANT contributed",
-    '-> "assistant". Assistant conclusions are first-class memories: never drop one',
-    "for being the assistant's.",
-    "If the user CORRECTS an earlier statement in this session, extract the final",
-    "corrected value only.",
+    `Extract at most ${input.maxFacts} facts per session — prefer the durable and important.`,
+    "An EMPTY list is a LAST RESORT: re-read the transcript (assistant",
+    "recommendations count too) before returning [].",
+    ...(input.extraFragments ?? []),
     "",
+    "Session date: " + (input.sessionDate ?? "(unknown)"),
     "Session transcript:",
     input.transcript,
     "",
     'Respond with ONLY one JSON object, no fences: { "contents": [ ... ] }',
-    `Extract at most ${input.maxFacts} facts per session - prefer the most durable and important.`,
-    "An EMPTY list is a LAST RESORT. Before returning [], re-check the transcript:",
-    "did the assistant recommend, suggest, explain, or draft anything? did any event,",
-    "plan, preference, or fact appear on either side? Return [] only for pure",
-    "greetings/small talk with no content at all.",
-    ...(input.extraFragments ?? []),
   ].join("\n");
 }

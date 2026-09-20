@@ -364,3 +364,18 @@ test("batch: lowercase new: prefix is stripped too (model drift)", () => {
   assert.equal(contents[0]?.dimensionKey, "carFirstServiceDate");
   assert.equal(contents[1]?.dimensionKey, "smokerPurchase");
 });
+
+test("batch: session date anchors relative-time resolution in examples and preamble", () => {
+  const p = buildBatchExtractionPrompt({
+    transcript: "[user] hi",
+    knownDimensions: KNOWN,
+    maxFacts: 12,
+    sessionDate: "2023-05-01",
+  });
+  assert.match(p, /Session date: 2023-05-01/); // 真实锚点
+  assert.match(p, /Two months ago I started learning French/); // few-shot 教日期换算
+  assert.match(p, /\(from 2023-03-01\)/); // 换算结果在示例里示范
+  assert.match(p, /never\s+invent one|never invent/); // 防幻觉条款
+  const p2 = buildBatchExtractionPrompt({ transcript: "x", knownDimensions: [], maxFacts: 5 });
+  assert.match(p2, /Session date: \(unknown\)/);
+});

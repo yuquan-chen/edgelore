@@ -126,7 +126,11 @@ export async function processTurn(
     knownDimensions: knownDims,
     contextMemories,
     driver,
-    extraFragments: opts?.extraFragments,
+    // 日期锚：相对时间（"两个月前"）需要今天作参照才能换算进 value
+    extraFragments: [
+      ...(opts?.extraFragments ?? []),
+      `Today's date: ${new Date().toISOString().slice(0, 10)}. Resolve relative time expressions ("two months ago") into absolute dates and keep them inside the value.`,
+    ],
   });
   if (extract.action !== "STORE" || !extract.contents?.length) {
     return {

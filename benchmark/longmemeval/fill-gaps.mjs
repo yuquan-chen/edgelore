@@ -69,6 +69,7 @@ for (let i = 0; i < targets.length; i++) {
         transcript,
         knownDimensions: relevantDimensionsOf(graph, transcript, 30),
         maxFacts: cfg.extraction.maxFactsPerSession,
+        sessionDate: t.date || undefined,
       }),
     );
     const parsed = parseJsonReply(reply);

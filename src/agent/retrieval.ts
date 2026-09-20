@@ -54,9 +54,15 @@ export class InMemoryVectorStore implements VectorStore {
   }
 }
 
-/** Vector store backed by the SQLite `embeddings` table (Float32 BLOBs). */
+/** Vector store backed by the SQLite `embeddings` table (Float32 BLOBs).
+ * Measured on the 8.4k-statement benchmark library: re-materializing all
+ * vectors from SQLite cost ~1.6s PER QUERY (32.7MB of BLOB reads + parse) —
+ * 94% of the whole retrieval overhead. The store therefore materializes ONCE
+ * per process and serves subsequent reads from memory; a put() invalidates
+ * the cache (writes are rare, reads are every query). */
 export class SqliteVectorStore implements VectorStore {
   private readonly graph: SqliteGraph;
+  private cache: Array<{ id: string; vector: number[] }> | null = null;
 
   /** @param graph an open SqliteGraph (the table is created on open) */
   constructor(graph: SqliteGraph) {
@@ -65,10 +71,14 @@ export class SqliteVectorStore implements VectorStore {
 
   put(id: string, vector: number[]): void {
     this.graph.putVector(id, vector);
+    this.cache = null; // writes are rare — full invalidation is plenty
   }
 
   all(): Array<{ id: string; vector: number[] }> {
-    return this.graph.allVectors().map((e) => ({ id: e.nodeId, vector: e.vector }));
+    if (!this.cache) {
+      this.cache = this.graph.allVectors().map((e) => ({ id: e.nodeId, vector: e.vector }));
+    }
+    return this.cache;
   }
 }
 
@@ -161,7 +171,7 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
   const queryBigrams = bigrams(input.query);
   if (queryBigrams.size > 0) {
     const scored = stmts
-      .map((s) => ({ id: s.id, score: lexicalScore(queryBigrams, statementText(graph, s)) }))
+      .map((s) => ({ id: s.id, score: lexicalScore(queryBigrams, docBigrams(graph, s)) }))
       .filter((d) => d.score > 0)
       .sort((a, b) => b.score - a.score);
     routes.push({ name: "lexical", ranked: scored.map((d) => d.id) });
@@ -284,8 +294,27 @@ export function bigrams(text: string): Set<string> {
  * document precision rewards documents whose bigrams are mostly the
  * query's — short and on-topic beats long and overflowing.
  */
-function lexicalScore(queryBigrams: Set<string>, docText: string): number {
-  const doc = bigrams(docText);
+/**
+ * Per-statement lexical index cache: building statementText + bigrams for
+ * the whole library on every query measured ~95ms at 8.4k statements
+ * (rebuild) vs ~14ms warm. Keyed by statement id; entries are immutable in
+ * practice (value/description only change via offline merge, which runs in
+ * its own process), and the cache is bounded for safety.
+ */
+const docBigramCache = new Map<string, Set<string>>();
+const DOC_BIGRAM_CACHE_MAX = 50_000;
+
+function docBigrams(graph: GraphStore, s: StatementNode): Set<string> {
+  let doc = docBigramCache.get(s.id);
+  if (!doc) {
+    if (docBigramCache.size >= DOC_BIGRAM_CACHE_MAX) docBigramCache.clear();
+    doc = bigrams(statementText(graph, s));
+    docBigramCache.set(s.id, doc);
+  }
+  return doc;
+}
+
+function lexicalScore(queryBigrams: Set<string>, doc: Set<string>): number {
   if (doc.size === 0) return 0;
   let hits = 0;
   for (const b of queryBigrams) {

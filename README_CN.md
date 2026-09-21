@@ -6,7 +6,7 @@ edgelore 把 Agent 的记忆存成一张**知识图谱**（节点 / 边 / 约束
 
 - 本地优先，零云依赖：用 Node 内置的 `node:sqlite` 落库，一个 `.db` 文件就是全部记忆。
 - 结构化存储原语 `capture`：喂一段结构化 JSON（维度 + 值），系统自动建维度、去重、落库、标冲突。
-- 阶段化演进：M0–M4 全线贯通 + Agent 记忆管线（gate→extract→capture）+ 混合检索 + 冲突裁决 + MCP server。**LongMemEval-ORACLE（固定 100 题对照）：71.0%**（deepseek-v4-flash 同时担任抽取与判卷；三轮取证验证 38.0% → 53.0% → 71.0%）。当前状态见 [HANDOFF-v2.md](HANDOFF-v2.md)，优化路线图见 [docs/notes/optimization-roadmap.md](docs/notes/optimization-roadmap.md)。
+- 阶段化演进：M0–M4 全线贯通 + Agent 记忆管线（gate→extract→capture）+ 混合检索 + 冲突裁决 + MCP server。**LongMemEval-ORACLE（全量 500 题）：74.2%**（基线 28.2%，deepseek-v4-flash 同时担任抽取与判卷；四轮取证验证）。优化路线图见 [docs/notes/optimization-roadmap.md](docs/notes/optimization-roadmap.md)。
 
 ---
 
@@ -109,7 +109,7 @@ npm run format     # Prettier 格式化
 
 ## 文档导航
 
-- [HANDOFF-v2.md](HANDOFF-v2.md) —— 新接手的人 / AI 先看这个（目标、边界、文件地图、git 状态）
+- [docs/notes/](docs/notes/) —— 调研与取证文档（研究/解剖/路线图）
 - [docs/agent-memory-design.md](docs/agent-memory-design.md) —— Agent Memory 层（把一句话变结构化 JSON）设计
 - [docs/competitor-analysis.md](docs/competitor-analysis.md) —— 竞品调研（Mem0 / Zep / Letta / OMEGA）
 - [docs/notes/agent-memory-write-policy.md](docs/notes/agent-memory-write-policy.md) —— "哪些值得记"怎么定

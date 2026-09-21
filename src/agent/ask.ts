@@ -9,6 +9,7 @@
 
 import type { MemoryGraph } from "../model/store.js";
 import type { LlmDriver } from "./llm-driver.js";
+import type { DecisionDriver } from "./decision.js";
 import { contextMemoriesOf, retrievalContext, type RetrievalConfig } from "./runtime.js";
 
 export const ABSTAIN = "不知道";
@@ -96,6 +97,10 @@ export interface AskOptions {
    * content — product callers scope by user namespace; benchmark callers
    * pass the question's haystack session set. */
   scopeSessionIds?: readonly string[];
+  /** System One decision layer (e.g. TypeSafe Jev). When present, one
+   * decision call classifies the question's intent and a "set" intent
+   * widens the retrieval window. Optional — answering proceeds without it. */
+  decision?: DecisionDriver;
 }
 
 /**
@@ -115,17 +120,35 @@ export async function answerQuestion(
   driver: LlmDriver,
   opts?: AskOptions,
 ): Promise<AskResult> {
-  const retrievalConfig = opts?.retrieval
+  let retrievalConfig = opts?.retrieval
     ? {
         ...opts.retrieval,
         ...(opts.dateTo ? { dateTo: opts.dateTo } : {}),
         ...(opts.scopeSessionIds ? { scopeSessionIds: opts.scopeSessionIds } : {}),
-        k: opts.k ?? opts.retrieval.k ?? 10,
       }
     : undefined;
+  let effectiveK = opts?.k ?? opts?.retrieval?.k ?? 10;
+  // 决策层（可选）：聚合类问题自动放大检索窗口。失败不阻塞主链路——
+  // 决策层是增强，不是依赖。
+  if (opts?.decision && retrievalConfig) {
+    try {
+      const intent = await opts.decision.choice(
+        question,
+        "Is this question asking for a COMPLETE list or total count of everything matching (a set question), or about ONE specific fact?",
+        {
+          set: "asks for all instances, a count, or a total",
+          lookup: "asks about one specific fact",
+        },
+      );
+      if (intent === "set") effectiveK = Math.max(effectiveK, 30);
+    } catch {
+      // decision-layer failures must never break answering
+    }
+  }
+  if (retrievalConfig) retrievalConfig = { ...retrievalConfig, k: effectiveK };
   const memories = retrievalConfig
     ? (await retrievalContext(graph, question, retrievalConfig)).lines
-    : contextMemoriesOf(graph, opts?.k ?? 10);
+    : contextMemoriesOf(graph, effectiveK);
   const answer = (await driver.complete(buildAskPrompt(question, memories, opts?.now))).trim();
   return { answer, usedMemories: memories, abstained: answer === ABSTAIN };
 }

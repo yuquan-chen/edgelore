@@ -31,6 +31,7 @@ import {
   SqliteGraph,
   SqliteVectorStore,
   embeddingDriver,
+  decisionDriver,
   answerQuestion,
 } from "../../dist/src/index.js";
 
@@ -170,6 +171,8 @@ const retrieval = cfg.embedding
       vectors: new SqliteVectorStore(graph),
     }
   : undefined;
+// 决策层（可选）：Jev 意图路由——聚合题自动放大窗口
+const decision = cfg.decision ? decisionDriver(cfg) : undefined;
 
 // resume support
 const answered = new Set();
@@ -216,6 +219,7 @@ for (const q of todo) {
       now: isoDay(q.question_date), // honored by the answering layer (W4); ignored before
       dateTo: isoDay(q.question_date), // A4: 题目时刻之后的话不能被"回忆"起来
       scopeSessionIds: q.haystack_session_ids, // A5: 只在该题的会话集（= 该虚拟用户的账本）内检索
+      decision, // Jev 决策层：聚合题自动放大窗口
     });
     appendFileSync(hypPath, JSON.stringify({ question_id: q.question_id, hypothesis: r.answer }) + "\n");
     done += 1;

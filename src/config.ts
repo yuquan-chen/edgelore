@@ -18,6 +18,7 @@ import { readFileSync } from "node:fs";
 import { AgentError } from "./agent/errors.js";
 import { OpenAiCompatDriver, type OpenAiCompatOptions } from "./agent/openai-compat-driver.js";
 import { OpenAiCompatEmbeddingDriver } from "./agent/embedding-driver.js";
+import { TypeSafeDecisionDriver } from "./agent/decision.js";
 import type { RetrievalMode } from "./agent/retrieval.js";
 
 /** Chat endpoint identity (what to call), not per-call params (maxTokens etc. live at call sites). */
@@ -55,12 +56,21 @@ export interface ExtractionSettings {
   maxFactsPerSession: number;
 }
 
+/** Decision-layer endpoint identity (System One model, e.g. TypeSafe Jev). */
+export interface DecisionConfig {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+
 /** Fully-resolved configuration; `llm`/`embedding` are absent when unconfigured. */
 export interface EdgeloreConfig {
   /** Missing -> chat features unavailable (drivers constructed on demand throw). */
   llm?: LlmConfig;
   /** Missing -> retrieval degrades to lexical-only / digest. */
   embedding?: EmbeddingConfig;
+  /** Missing -> decision layer optional; pipeline runs without it. */
+  decision?: DecisionConfig;
   retrieval: RetrievalSettings;
   extraction: ExtractionSettings;
   /** Judge model for benchmark scoring; falls back to llm.model when unset. */
@@ -135,7 +145,14 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
   const extraction: ExtractionSettings = {
     maxFactsPerSession: num(env.EDGELORE_EXTRACTION_MAX_FACTS) ?? 12,
   };
-  return { llm, embedding, retrieval, extraction, judgeModel: env.EDGELORE_JUDGE_MODEL };
+  const decision = env.TYPESAFE_API_KEY
+    ? {
+        baseUrl: env.TYPESAFE_BASE_URL ?? "https://api.typesafe.ai",
+        apiKey: env.TYPESAFE_API_KEY,
+        model: env.TYPESAFE_MODEL ?? "jev-latest",
+      }
+    : undefined;
+  return { llm, embedding, decision, retrieval, extraction, judgeModel: env.EDGELORE_JUDGE_MODEL };
 }
 
 /** Per-call construction overrides for {@link chatDriver} (CLI flags, benchmark knobs). */
@@ -177,4 +194,18 @@ export function embeddingDriver(cfg: EdgeloreConfig): OpenAiCompatEmbeddingDrive
     );
   }
   return new OpenAiCompatEmbeddingDriver(cfg.embedding);
+}
+
+/**
+ * Build the System One decision driver (TypeSafe Jev) from resolved config.
+ *
+ * @throws AgentError when the config carries no decision section.
+ */
+export function decisionDriver(cfg: EdgeloreConfig): TypeSafeDecisionDriver {
+  if (!cfg.decision) {
+    throw new AgentError(
+      "missing TYPESAFE_API_KEY (set it in the environment or .env.local to enable the decision layer)",
+    );
+  }
+  return new TypeSafeDecisionDriver(cfg.decision);
 }

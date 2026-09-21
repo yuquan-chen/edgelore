@@ -202,27 +202,28 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
   );
   const fused = fuseRRF(usable, input.smoothing ?? 60);
 
-  // Soft scope: in-scope statements get their fused score multiplied —
-  // preferred, never mandatory. Hard filtering blinded us to twin-session
-  // provenance (the same fact stored under a sibling session id): the -2
-  // regression in stage2b. Identity should bias ranking, not blind it.
-  // Boost BEFORE truncation, or a low-ranking but in-scope hit gets cut
-  // before it can be promoted.
+  // Scope priority: in-scope statements ALWAYS rank above out-of-scope ones
+  // (each tier internally sorted by score); out-of-scope entries still fill
+  // remaining slots so twin-session provenance stays reachable. Replaces the
+  // ×3 multiplicative boost — slot-starvation forensics showed ×3 lost when
+  // the user's own card had weak word overlap. Identity biases ORDER, it
+  // does not blind.
   const scopeSet = input.sourceRefsAllow ? new Set(input.sourceRefsAllow) : undefined;
-  const SCOPE_BOOST = 3;
-  const ranked = [...fused.entries()];
-  const withScope = scopeSet
-    ? (() => {
-        const byId = new Map(stmts.map((s) => [s.id, s]));
-        return ranked.map(([statementId, meta]) => {
-          const stmt = byId.get(statementId) as StatementNode;
-          const inScope = (stmt.source_refs ?? []).some((r) => scopeSet.has(r));
-          return [statementId, { score: inScope ? meta.score * SCOPE_BOOST : meta.score, via: meta.via }] as const;
-        });
-      })()
-    : ranked;
-  return withScope
-    .sort((a, b) => b[1].score - a[1].score)
+  const rankedAll = [...fused.entries()];
+  let ranked = rankedAll;
+  if (scopeSet) {
+    const byId = new Map(stmts.map((s) => [s.id, s]));
+    const inS: typeof rankedAll = [];
+    const outS: typeof rankedAll = [];
+    for (const entry of rankedAll) {
+      const stmt = byId.get(entry[0]) as StatementNode;
+      ((stmt.source_refs ?? []).some((r) => scopeSet.has(r)) ? inS : outS).push(entry);
+    }
+    inS.sort((a, b) => b[1].score - a[1].score);
+    outS.sort((a, b) => b[1].score - a[1].score);
+    ranked = [...inS, ...outS];
+  }
+  return ranked
     .slice(0, k)
     .map(([statementId, meta]) => {
       const stmt = stmts.find((s) => s.id === statementId) as StatementNode;

@@ -89,3 +89,13 @@ test("ask: rule 6 keeps non-user-account entries out of aggregates", () => {
   assert.match(p, /never count,/);
   assert.match(p, /single-fact lookup/);
 });
+
+// --- 相对窗口宽容 + 计数类拒答纪律 ---------------------------------------------
+
+test("ask: relative windows are fuzzy, counting gaps must not be filled", () => {
+  const p = buildAskPrompt("q", ["x — 1 entry:"]);
+  assert.match(p, /Relative expressions \("last week", "recently"\) are fuzzy/);
+  assert.match(p, /a few days\s+outside your strict window still counts/);
+  assert.match(p, /how-many \/ how-much \/ how-long/);
+  assert.match(p, /never substitute a near-topic/);
+});

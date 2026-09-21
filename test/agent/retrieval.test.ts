@@ -253,10 +253,10 @@ test("retrieval: sourceRefsAllow soft-scopes — in-scope ranked first, out-of-s
     mode: "lexical",
     sourceRefsAllow: ["s:alice"],
   });
-  // 软 scope：范围内的排第一（加权），范围外的仍可达（孪生会话不致失明）
+  // 确定性优先：范围内永远排在范围外前面（分数不再跨层比较），范围外仍可达
   assert.equal(scoped.length, 2);
   assert.equal(scoped[0]?.value, "巴黎");
-  assert.ok(scoped[0]!.score > scoped[1]!.score * 2, "in-scope hit must be clearly boosted");
+  assert.equal(scoped[1]?.value, "罗马");
   const unscoped = await retrieveRelevant(graph, { query: "巴黎 罗马", mode: "lexical" });
   assert.equal(unscoped.length, 2);
 });

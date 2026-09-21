@@ -109,7 +109,7 @@ npm run format     # Prettier 格式化
 
 ## 文档导航
 
-- [docs/HANDOFF.md](docs/HANDOFF.md) —— 新接手的人 / AI 先看这个（目标、边界、文件地图、git 状态）
+- [HANDOFF-v2.md](HANDOFF-v2.md) —— 新接手的人 / AI 先看这个（目标、边界、文件地图、git 状态）
 - [docs/agent-memory-design.md](docs/agent-memory-design.md) —— Agent Memory 层（把一句话变结构化 JSON）设计
 - [docs/competitor-analysis.md](docs/competitor-analysis.md) —— 竞品调研（Mem0 / Zep / Letta / OMEGA）
 - [docs/notes/agent-memory-write-policy.md](docs/notes/agent-memory-write-policy.md) —— "哪些值得记"怎么定

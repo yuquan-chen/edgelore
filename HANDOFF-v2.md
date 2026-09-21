@@ -123,7 +123,8 @@ EDGELORE_EMBEDDING_DIMENSIONS=1024
 | benchmark/longmemeval/judge.mjs | 判分（--hypotheses/--tag，verdict 键含答案哈希） |
 | benchmark/longmemeval/merge.mjs | 分片合并 + **按 key 调和 + 冲突标记** |
 | benchmark/longmemeval/smoke-reingest.mjs | 重抽质检门（覆盖率 A/B） |
-| docs/notes/stage2-regression-forensics.md | 回归取证（12 题逐题） |
+| docs/notes/autopsy/ | 五轮错题解剖（首跑/stage2/2c/全量500） |
+| docs/notes/research/ | 六份外部调研（产品机制/聚合架构/分层检索/速度对标） |
 | docs/notes/memory-type-taxonomy.md | 类型分层调研与决策 |
 | docs/notes/lifecycle-design-draft.md | M5 遗忘机制设计（已冻结待实现） |
 

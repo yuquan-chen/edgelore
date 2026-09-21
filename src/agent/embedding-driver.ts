@@ -115,6 +115,7 @@ export class OpenAiCompatEmbeddingDriver implements EmbeddingDriver {
     const res = await postJsonWithRetry({
       url: `${this.baseUrl}/embeddings`,
       headers: { Authorization: `Bearer ${this.apiKey}` },
+      stage: "embedding",
       body: { model: this.model, input: texts },
       timeoutMs: this.timeoutMs,
       maxRetries: this.maxRetries,

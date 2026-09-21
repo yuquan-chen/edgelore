@@ -7,6 +7,7 @@
 // transport-level concerns, not provider configuration (industry practice).
 
 import { AgentError } from "./errors.js";
+import { recordUsage } from "./usage.js";
 
 /** Marks retryable transport failures (network errors, 429, 5xx). Internal. */
 export class TransientError extends Error {}
@@ -23,6 +24,8 @@ export interface PostJsonOptions {
   timeoutMs: number;
   /** Extra attempts after the first on transient failures. */
   maxRetries: number;
+  /** Pipeline stage label for usage tracking ("gate" | "extract" | "answer" | "embedding" | "decision"). */
+  stage?: string;
 }
 
 /**
@@ -35,13 +38,17 @@ export interface PostJsonOptions {
  */
 export async function postJsonWithRetry(options: PostJsonOptions): Promise<Response> {
   let lastError: Error = new AgentError("unreachable");
+  const t0 = performance.now();
   for (let attempt = 0; attempt <= options.maxRetries; attempt++) {
     if (attempt > 0) await sleep(500 * attempt);
     try {
-      return await postJsonOnce(options);
+      const res = await postJsonOnce(options);
+      recordUsage(options.stage ?? "http", res.status, await res.clone().json().catch(() => null), t0);
+      return res;
     } catch (err) {
       if (!(err instanceof TransientError)) throw err;
       lastError = err;
+      recordUsage(options.stage ?? "http", 0, null, t0);
     }
   }
   throw new AgentError(

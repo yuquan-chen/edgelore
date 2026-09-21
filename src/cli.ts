@@ -15,7 +15,7 @@ import { expandHit, retrieveRelevant, SqliteVectorStore, type RetrievalMode } fr
 import { autoResolveConstraintGuided, confirmStatement, listConflicts, resolveConflict } from "./agent/conflicts.js";
 import { startMcpServer } from "./mcp/server.js";
 import { answerQuestion } from "./agent/ask.js";
-import { chatDriver, configFromEnv, embeddingDriver, loadDotEnv, type EdgeloreConfig } from "./config.js";
+import { chatDriver, configFromEnv, decisionDriver, embeddingDriver, loadDotEnv, type EdgeloreConfig } from "./config.js";
 import type { AddConstraintInput, AddEdgeInput, AddNodeInput } from "./model/store.js";
 import type { DimensionNode, ExpressionNode, StatementNode } from "./model/types.js";
 
@@ -334,6 +334,7 @@ async function main(): Promise<void> {
             retrieval,
             k: flags.has("k") ? Number(flags.get("k")) : undefined,
             now: flags.get("today"),
+            decision: cfg.decision ? decisionDriver(cfg) : undefined,
           }),
         );
         break;

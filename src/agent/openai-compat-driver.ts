@@ -88,6 +88,7 @@ export class OpenAiCompatDriver implements LlmDriver {
     const res = await postJsonWithRetry({
       url: `${this.baseUrl}/chat/completions`,
       headers: { Authorization: `Bearer ${this.apiKey}` },
+      stage: "llm",
       body: {
         model: this.model,
         messages: [{ role: "user", content: prompt }],

@@ -87,6 +87,7 @@ export class TypeSafeDecisionDriver implements DecisionDriver {
       body: { state, model: this.model, questions },
       timeoutMs: this.timeoutMs,
       maxRetries: this.maxRetries,
+      stage: "decision",
     });
     if (!res.ok) {
       throw new AgentError(`TypeSafe API ${res.status}: ${(await res.text()).slice(0, 300)}`);

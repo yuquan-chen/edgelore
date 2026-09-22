@@ -79,7 +79,15 @@ console.log(`维度总数: ${dims.length}`);
 
 // --- pairwise similarity → union-find clustering ------------------------------
 
-const THRESHOLD = parseFloat(process.argv[process.argv.indexOf("--threshold") + 1] ?? "0.5");
+// 不传 --threshold 时默认 0.5。旧写法 indexOf(-1)+1 会取到 argv[0]（node 路径），
+// parseFloat 得 NaN → `jac >= NaN` 恒 false → 静默合并 0 组。现在：缺省取默认值，
+// 非法值 fail loud（与 --shard 同族的静默空转陷阱，一律加护栏）。
+const thresholdIdx = process.argv.indexOf("--threshold");
+const THRESHOLD = parseFloat(thresholdIdx !== -1 ? process.argv[thresholdIdx + 1] : "0.5");
+if (!Number.isFinite(THRESHOLD) || THRESHOLD <= 0 || THRESHOLD >= 1) {
+  console.error(`invalid --threshold: ${process.argv[thresholdIdx + 1]} (want a number in (0,1))`);
+  process.exit(1);
+}
 const parent = new Map(dims.map((d) => [d.id, d.id]));
 function find(x) {
   while (parent.get(x) !== x) parent.set(x, parent.get(parent.get(x)));

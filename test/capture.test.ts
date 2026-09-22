@@ -94,6 +94,13 @@ test("capture: single-cardinality conflicting value -> tentative + dimension fla
     const dim = g.getNode(r1.dimensionId) as { state: string };
     assert.equal(dim.state, "conflict");
     assert.equal(g.queryNodes({ type: "core:statement" }).length, 2);
+    const contradictions = g.queryEdges({
+      type: "core:contradicts",
+      from: r2.statementId!,
+      to: r1.statementId!,
+    });
+    assert.equal(contradictions.length, 1);
+    assert.equal(contradictions[0]?.attributes.reason, "single-cardinality incompatible values");
   });
 });
 
@@ -237,6 +244,14 @@ test("capture: user restatement clashing with an incumbent flags conflict", () =
     assert.equal(dim.state, "conflict");
     const pg = g.getNode(a.statementId!) as { state: string };
     assert.equal(pg.state, "tentative"); // untouched, awaiting resolve
+    assert.equal(
+      g.queryEdges({
+        type: "core:contradicts",
+        from: a.statementId!,
+        to: u1.statementId!,
+      }).length,
+      1,
+    );
   });
 });
 

@@ -381,7 +381,10 @@ export class MemoryGraph implements GraphStore {
         for (const n of this.nodes.values()) {
           if (n.type === "core:statement") {
             const stmt = n as StatementNode;
-            if (stmt.dimension_id === dimId) {
+            // Constraints evaluate the graph's CURRENT accepted belief, not
+            // tentative suggestions or terminal history. Candidate-by-candidate
+            // arbitration builds an accepted hypothetical snapshot separately.
+            if (stmt.dimension_id === dimId && stmt.state === "accepted") {
               const v = stmt.value;
               if (typeof v === "number") values.push(v);
             }

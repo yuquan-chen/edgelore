@@ -42,6 +42,8 @@ export interface ConflictStatement {
 export interface ConflictCase {
   dimensionId: string;
   dimensionKey: string;
+  /** Exact live statements participating in this connected contradiction. */
+  participantIds: string[];
   /** The incumbents (accepted) — what the graph currently believes. */
   incumbents: ConflictStatement[];
   /** The challengers (tentative) — awaiting adjudication. */
@@ -68,12 +70,60 @@ export function listConflicts(graph: MemoryGraph): ConflictCase[] {
       ...(s.saidBy !== undefined ? { saidBy: s.saidBy } : {}),
     });
     const mine = stmts.filter((s) => s.dimension_id === dim.id);
-    cases.push({
-      dimensionId: dim.id,
-      dimensionKey: dim.key,
-      incumbents: mine.filter((s) => s.state === "accepted").map(toRow),
-      challengers: mine.filter((s) => s.state === "tentative").map(toRow),
-    });
+    const live = mine.filter((s) => s.state !== "superseded" && s.state !== "rejected");
+    const mineIds = new Set(mine.map((s) => s.id));
+    const liveIds = new Set(live.map((s) => s.id));
+    const allContradictions = graph
+      .queryEdges({ type: "core:contradicts" })
+      .filter((edge) => mineIds.has(edge.from) && mineIds.has(edge.to));
+    const liveContradictions = allContradictions.filter(
+      (edge) => liveIds.has(edge.from) && liveIds.has(edge.to),
+    );
+
+    // Explicit contradiction edges are the canonical conflict membership.
+    // Legacy databases have no such edges, so retain their dimension-wide
+    // docket as a compatibility fallback.
+    const components: string[][] = [];
+    if (allContradictions.length > 0) {
+      const adjacency = new Map<string, Set<string>>();
+      for (const edge of liveContradictions) {
+        if (!adjacency.has(edge.from)) adjacency.set(edge.from, new Set());
+        if (!adjacency.has(edge.to)) adjacency.set(edge.to, new Set());
+        adjacency.get(edge.from)?.add(edge.to);
+        adjacency.get(edge.to)?.add(edge.from);
+      }
+      const seen = new Set<string>();
+      for (const start of adjacency.keys()) {
+        if (seen.has(start)) continue;
+        const stack = [start];
+        const component: string[] = [];
+        seen.add(start);
+        while (stack.length > 0) {
+          const current = stack.pop() as string;
+          component.push(current);
+          for (const next of adjacency.get(current) ?? []) {
+            if (seen.has(next)) continue;
+            seen.add(next);
+            stack.push(next);
+          }
+        }
+        if (component.length >= 2) components.push(component);
+      }
+    } else if (live.length >= 2) {
+      components.push(live.map((s) => s.id));
+    }
+
+    for (const participantIds of components) {
+      const participantSet = new Set(participantIds);
+      const participants = live.filter((s) => participantSet.has(s.id));
+      cases.push({
+        dimensionId: dim.id,
+        dimensionKey: dim.key,
+        participantIds,
+        incumbents: participants.filter((s) => s.state === "accepted").map(toRow),
+        challengers: participants.filter((s) => s.state === "tentative").map(toRow),
+      });
+    }
   }
   return cases;
 }
@@ -99,9 +149,10 @@ export interface ResolveResult {
 /**
  * Adjudicate a conflict: the chosen statement becomes THE value.
  *
- * The winner is accepted; every other live statement on the dimension is
- * superseded (terminal — history kept); a `core:supersedes` edge records the
- * decision per loser; the dimension returns to `accepted`.
+ * The winner is accepted; only statements in the SAME contradiction component
+ * are superseded. Independent memories sharing a multi-value dimension are
+ * untouched. The dimension returns to accepted only when no open component
+ * remains.
  *
  * @param graph a concrete MemoryGraph (or SqliteGraph)
  * @param dimensionId the conflicted dimension
@@ -139,9 +190,17 @@ export function resolveConflict(
     throw new AgentError(`winner is already terminal (${w.state}) and cannot be revived`);
   }
 
+  const conflict = listConflicts(graph).find(
+    (candidate) =>
+      candidate.dimensionId === dimensionId && candidate.participantIds.includes(winnerStatementId),
+  );
+  if (!conflict) {
+    throw new AgentError(`statement ${winnerStatementId} is not part of an open conflict`);
+  }
+  const participantIds = new Set(conflict.participantIds);
   const others = (graph.queryNodes({ type: "core:statement" }) as StatementNode[]).filter(
     (s) =>
-      s.dimension_id === dimensionId &&
+      participantIds.has(s.id) &&
       s.id !== winnerStatementId &&
       s.state !== "superseded" &&
       s.state !== "rejected",
@@ -161,7 +220,8 @@ export function resolveConflict(
     });
     supersededIds.push(loser.id);
   }
-  graph.transitionNodeState(dimensionId, "accepted");
+  const stillOpen = listConflicts(graph).some((candidate) => candidate.dimensionId === dimensionId);
+  if (!stillOpen) graph.transitionNodeState(dimensionId, "accepted");
 
   return {
     dimensionId,
@@ -354,6 +414,7 @@ function hypotheticalVerdict(
     type: "core:statement",
     dimension_id: dim.id,
     value,
+    state: "accepted",
     created_by: "agent:edgelore:auto",
   });
   const bindings: Record<string, string> = {};

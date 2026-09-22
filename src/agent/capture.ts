@@ -76,6 +76,28 @@ export function valuesEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+function linkContradiction(
+  graph: GraphStore,
+  challengerId: string,
+  incumbentId: string,
+  ctx: CaptureContext,
+): void {
+  const exists = graph
+    .queryEdges({ type: "core:contradicts", from: challengerId, to: incumbentId })
+    .some((edge) => scopesEqual(edge.scope, ctx.scope));
+  if (exists) return;
+  graph.addEdge({
+    type: "core:contradicts",
+    from: challengerId,
+    to: incumbentId,
+    scope: ctx.scope,
+    created_by: ctx.created_by,
+    created_at: ctx.createdAt,
+    source_refs: ctx.source_refs,
+    attributes: { reason: "single-cardinality incompatible values" },
+  });
+}
+
 /**
  * Persist a memory the Agent Memory layer already understood.
  *
@@ -135,10 +157,11 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
     //      flipping values behind resolve's back would bypass the human.
     const rivalAccepted =
       cardinality === "single" &&
-      sameDim.some((s) => s.state === "accepted" && !valuesEqual(s.value, content.value));
+      sameDim.find((s) => s.state === "accepted" && !valuesEqual(s.value, content.value));
     let conflictFlagged = false;
     if (dup.state === "tentative" && !saidByAssistant) {
       if (rivalAccepted) {
+        linkContradiction(graph, dup.id, rivalAccepted.id, ctx);
         if (dimension.state !== "conflict") graph.transitionNodeState(dimension.id, "conflict");
         conflictFlagged = true;
       } else if (dimension.state !== "conflict") {
@@ -189,6 +212,10 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
 
   // Only USER-side tentative states flag the dimension (see above).
   if (newState === "tentative" && !saidByAssistant) {
+    const incumbent = sameDim.find(
+      (s) => s.state === "accepted" && !valuesEqual(s.value, content.value),
+    );
+    if (incumbent) linkContradiction(graph, stmt.id, incumbent.id, ctx);
     graph.transitionNodeState(dimension.id, "conflict");
   }
 

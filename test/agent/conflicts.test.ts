@@ -44,6 +44,7 @@ test("conflicts: docket shows dimension with incumbents and challengers", () => 
   assert.equal(cases.length, 1);
   assert.equal(cases[0]?.dimensionId, c.dimensionId);
   assert.equal(cases[0]?.dimensionKey, "budget");
+  assert.deepEqual(new Set(cases[0]?.participantIds), new Set([c.acceptedId, c.tentativeId]));
   assert.equal(cases[0]?.incumbents[0]?.value, 5000);
   assert.equal(cases[0]?.incumbents[0]?.createdBy, "human:charles");
   assert.equal(cases[0]?.challengers[0]?.value, 8000);
@@ -78,6 +79,80 @@ test("conflicts: incumbent wins — challenger superseded, winner untouched", ()
   assert.deepEqual(r.supersededIds, [c.tentativeId]);
   assert.equal((graph.getNode(c.acceptedId) as { state: string }).state, "accepted");
   assert.equal((graph.getNode(c.tentativeId) as { state: string }).state, "superseded");
+});
+
+test("conflicts: resolving one explicit component preserves independent memories", () => {
+  const graph = new MemoryGraph();
+  const dim = graph.addNode({
+    type: "core:dimension",
+    key: "familyTrips",
+    cardinality: "multi",
+    state: "conflict",
+    created_by: "human:charles",
+  });
+  const may = graph.addNode({
+    type: "core:statement",
+    dimension_id: dim.id,
+    value: "Hawaii trip happened in May",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const june = graph.addNode({
+    type: "core:statement",
+    dimension_id: dim.id,
+    value: "Hawaii trip happened in June",
+    state: "tentative",
+    created_by: "human:charles",
+  });
+  const paris = graph.addNode({
+    type: "core:statement",
+    dimension_id: dim.id,
+    value: "Family trip to Paris",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  graph.addEdge({
+    type: "core:contradicts",
+    from: june.id,
+    to: may.id,
+    created_by: "agent:edgelore:conflict",
+  });
+
+  const result = resolveConflict(graph, dim.id, june.id, { resolvedBy: "human:charles" });
+  assert.deepEqual(result.supersededIds, [may.id]);
+  assert.equal(graph.getNode(june.id)?.state, "accepted");
+  assert.equal(graph.getNode(may.id)?.state, "superseded");
+  assert.equal(graph.getNode(paris.id)?.state, "accepted", "Paris must not be collateral damage");
+  assert.equal(graph.getNode(dim.id)?.state, "accepted");
+});
+
+test("conflicts: dimension stays conflicted while another contradiction component is open", () => {
+  const graph = new MemoryGraph();
+  const dim = graph.addNode({
+    type: "core:dimension",
+    key: "familyTrips",
+    cardinality: "multi",
+    state: "conflict",
+    created_by: "human:charles",
+  });
+  const statements = ["Hawaii May", "Hawaii June", "Paris April", "Paris May"].map((value, i) =>
+    graph.addNode({
+      type: "core:statement",
+      dimension_id: dim.id,
+      value,
+      state: i % 2 === 0 ? "accepted" : "tentative",
+      created_by: "human:charles",
+    }),
+  );
+  graph.addEdge({ type: "core:contradicts", from: statements[1]!.id, to: statements[0]!.id, created_by: "agent:x:1" });
+  graph.addEdge({ type: "core:contradicts", from: statements[3]!.id, to: statements[2]!.id, created_by: "agent:x:1" });
+
+  assert.equal(listConflicts(graph).length, 2);
+  resolveConflict(graph, dim.id, statements[1]!.id, { resolvedBy: "human:charles" });
+  assert.equal(graph.getNode(dim.id)?.state, "conflict");
+  assert.equal(listConflicts(graph).length, 1);
+  assert.equal(graph.getNode(statements[2]!.id)?.state, "accepted");
+  assert.equal(graph.getNode(statements[3]!.id)?.state, "tentative");
 });
 
 test("conflicts: agent resolver is rejected (Q01 governance)", () => {

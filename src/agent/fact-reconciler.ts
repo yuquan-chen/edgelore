@@ -364,8 +364,9 @@ function buildFactReconciliationPrompt(
   });
   return [
     "You are a Fact Reconciler. Compare one new Statement with existing live Statements.",
+    "Every relation is directional: New Statement -> Candidate. Never reverse that direction.",
     "Classify meaning, not topic. Return exactly one relation per candidate:",
-    "duplicate = materially the same claim; refines = compatible added detail; supersedes = explicitly updates or corrects the older claim; contradicts = cannot both be true in the same context; independent = related topic but separate facts.",
+    "duplicate = materially the same core claim, including when the Candidate contains details omitted by the New Statement; refines = the New Statement adds compatible detail to the Candidate; supersedes = the New Statement explicitly updates or corrects the Candidate; contradicts = they cannot both be true in the same context; independent = related topic but separate facts.",
     "preFlaggedContradiction only means storage saw different values in a single-cardinality Dimension. It may be a true contradiction or an explicit temporal update; decide from the claim text.",
     "Do not decide which contradictory fact wins. Do not output provenance, state changes, or graph ids other than the supplied statementId.",
     `New Statement:\n${JSON.stringify(row(subject, subjectDimension, []))}`,

@@ -69,6 +69,29 @@ organization is now forbidden from writing `core:contradicts`, `core:refines`,
 or `core:supersedes`. Those relations require a separate governed FactReconciler
 with deterministic checks first and Agent judgment only for ambiguous cases.
 
+## FactReconciler proposal-only dry run
+
+The first governed reconciler pass used ten relation-dense groups from the
+20-session graph database. It generated proposals without applying any of
+them, then compared every node state/update timestamp and every edge before
+and after the run. The graph fingerprint was unchanged.
+
+- 10 successful model calls, zero endpoint errors
+- 25 proposals: 15 independent, 4 duplicate, 2 refines, 1 supersedes, and
+  4 contradicts
+- a direction ambiguity (`new refines old` when only the old candidate carried
+  the extra date) was reproduced and fixed by explicitly defining every
+  relation as New Statement -> Candidate
+- shared generic entities were too broad as reconciliation evidence: a car
+  insurance Statement was compared with mileage, waxing, and interior-care
+  Statements merely because they all referred to the same car
+- repeatable events need stricter temporal identity: two trips to different
+  destinations were not stable between `independent` and `contradicts`
+
+The run therefore validated the proposal-only governance boundary while also
+showing that typed structural relations are needed before widening candidate
+generation beyond the same Dimension.
+
 ## Next capability work
 
 1. Add the FactReconciler (`duplicate | refines | supersedes | contradicts |

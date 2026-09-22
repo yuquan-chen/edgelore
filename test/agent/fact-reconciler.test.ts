@@ -129,6 +129,35 @@ test("fact reconciler: Agent classification is a proposal and cannot mutate the 
   assert.equal(graph.getNode(fresh.id)?.state, "accepted");
 });
 
+test("fact reconciler: prompt fixes relation direction as new Statement to candidate", async () => {
+  const graph = new MemoryGraph();
+  const dimension = addDimension(graph, "mortgagePreapproval");
+  const old = addStatement(graph, dimension, "Pre-approved for $350,000 on 2022-02-10");
+  const fresh = addStatement(graph, dimension, "Pre-approved for up to $350,000");
+  let prompt = "";
+  const driver = {
+    async complete(input: string): Promise<string> {
+      prompt = input;
+      return JSON.stringify({
+        decisions: [
+          {
+            statementId: old.id,
+            relation: "duplicate",
+            confidence: 0.9,
+            reason: "same core claim; the candidate contains the omitted date",
+          },
+        ],
+      });
+    },
+  };
+
+  await reconcileStatement(graph, fresh.id, { driver });
+
+  assert.match(prompt, /New Statement -> Candidate/);
+  assert.match(prompt, /New Statement adds compatible detail to the Candidate/);
+  assert.match(prompt, /Candidate contains details omitted by the New Statement/);
+});
+
 test("fact reconciler: omitted Agent decisions stay unresolved", async () => {
   const graph = new MemoryGraph();
   const dimension = addDimension(graph, "familyTrips");

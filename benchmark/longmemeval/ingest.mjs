@@ -6,7 +6,7 @@
 // knownDimensions growing as we go (anti-drift), vectors written after each
 // session. Resumable via a checkpoint file.
 //
-// Usage: node benchmark/longmemeval/ingest.mjs [--limit N]
+// Usage: node benchmark/longmemeval/ingest.mjs [--limit N] [--graph] [--db PATH]
 
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -23,6 +23,8 @@ import {
   scanEventCandidates,
   dominantLang,
   filterByLanguage,
+  runGraphEnrichment,
+  commitGraphWritePlan,
   usageTotals,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
@@ -41,11 +43,14 @@ if (!cfg.llm) {
 
 const dataDir = join(here, "data");
 const dataPath = join(dataDir, "longmemeval_oracle.json");
+const graphMode = process.argv.includes("--graph");
 const shardArg = process.argv.indexOf("--shard");
 const shardTag = shardArg !== -1 ? process.argv[shardArg + 1].replace("/", "-") : "main";
-const checkpointPath = join(dataDir, `ingest-checkpoint-${shardTag}.json`);
+const checkpointPath = join(dataDir, `ingest-checkpoint-${shardTag}${graphMode ? "-graph" : ""}.json`);
 const dbIdx = process.argv.indexOf("--db");
-const dbPath = dbIdx !== -1 ? process.argv[dbIdx + 1] : join(dataDir, "memory.db");
+const dbPath = dbIdx !== -1
+  ? process.argv[dbIdx + 1]
+  : join(dataDir, graphMode ? "memory-graph.db" : "memory.db");
 
 const dataset = JSON.parse(readFileSync(dataPath, "utf8"));
 const limit = Number(process.argv[process.argv.indexOf("--limit") + 1] ?? Infinity);
@@ -85,7 +90,6 @@ const driver = requireChat(cfg, { maxTokens: 16000, extraBody: { thinking: { typ
 const graph = new SqliteGraph(dbPath);
 const vectors = new SqliteVectorStore(graph);
 const embedder = cfg.embedding ? embeddingDriver(cfg) : undefined;
-const ctx = { created_by: "human:longmemeval_user", source_refs: [] };
 
 function knownDimensions() {
   // full list — kept only for progress/debug output; prompts use relevantDimensionsOf
@@ -97,14 +101,31 @@ function knownDimensions() {
 }
 void knownDimensions;
 
-function captureContents(contents, sessionId, date) {
+async function captureContents(contents, sessionId, date, transcript) {
+  const captureCtx = {
+    created_by: "human:longmemeval_user",
+    source_refs: [sessionId],
+    createdAt: date || undefined,
+    ...(graphMode ? { scope: { owner_id: "actor:longmemeval_user" } } : {}),
+  };
+  if (graphMode) {
+    try {
+      const plan = await runGraphEnrichment({
+        text: transcript,
+        contents,
+        knownDimensions: relevantDimensionsOf(graph, transcript, 30),
+        graph,
+        driver,
+        scope: captureCtx.scope,
+      });
+      return commitGraphWritePlan(graph, plan, captureCtx).captures.length;
+    } catch (err) {
+      console.log(`\n[warn] session ${sessionId}: graph enrichment failed; facts kept (${err.message})`);
+    }
+  }
   let stored = 0;
   for (const c of contents) {
-    capture(graph, c, {
-      created_by: "human:longmemeval_user",
-      source_refs: [sessionId],
-      createdAt: date || undefined,
-    });
+    capture(graph, c, captureCtx);
     stored += 1;
   }
   return stored;
@@ -236,8 +257,7 @@ for (const [sid, session] of sessions) {
       console.log(`\n[warn] session ${sid}: dropped ${langDropped} wrong-language entries (expected ${expectedLang})`);
     }
     const contents = batch.contents;
-    ctx.source_refs = [sid];
-    const stored = captureContents(contents, sid, session.date);
+    const stored = await captureContents(contents, sid, session.date, transcript);
     workerFacts += stored;
     checkpoint(sid); // facts are persisted — checkpoint immediately
     factsStored += stored;
@@ -267,5 +287,11 @@ const dims = graph.queryNodes({ type: "core:dimension" }).length;
 console.log(`\ndone: ${processed} sessions this run, ${factsStored} facts this run`);
 console.log(`language pinning: ${langDroppedTotal} wrong-language entries dropped`);
 console.log(`store: ${dims} dimensions, ${graph.queryNodes({ type: "core:statement" }).length} statements`);
+if (graphMode) {
+  const entities = graph.queryNodes({}).filter(
+    (node) => node.type !== "core:dimension" && node.type !== "core:statement",
+  ).length;
+  console.log(`graph: ${entities} entities/events, ${graph.queryEdges({}).length} edges`);
+}
 const usage = usageTotals();
 console.log(`API usage: ${usage.calls} calls, ${usage.inputTokens} input tokens, ${usage.outputTokens} output tokens, ${usage.errors} errors`);

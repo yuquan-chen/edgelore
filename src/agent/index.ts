@@ -7,6 +7,7 @@
 
 export * from "./capture.js";
 export * from "./graph-write.js";
+export * from "./graph-enrichment.js";
 export * from "./errors.js";
 export * from "./llm-driver.js";
 export * from "./prompt.js";

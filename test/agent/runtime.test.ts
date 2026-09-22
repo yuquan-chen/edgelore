@@ -46,6 +46,73 @@ test("runtime: full turn captures into the graph with runtime-injected provenanc
   assert.equal(stmts[0]?.created_by, "human:charles"); // from ctx, never the LLM
 });
 
+test("runtime: optional enrichment builds graph shape after fact extraction", async () => {
+  const graph = new MemoryGraph();
+  const driver = new MockDriver([
+    JSON.stringify({ store: true, candidates: ["Went to Hawaii with my family"] }),
+    JSON.stringify({
+      contents: [
+        {
+          dimensionKey: "NEW:familyTripHawaii",
+          value: "Went to Hawaii with my family",
+          saidBy: "user",
+        },
+      ],
+    }),
+    JSON.stringify({
+      factMappings: [
+        {
+          factRef: "fact:0",
+          dimensionKey: "familyTrips",
+          dimensionDescription: "Family travel experiences",
+          cardinality: "multi",
+        },
+      ],
+      entities: [
+        { ref: "trip", type: "travel:trip", key: "hawaii-family-trip", scope: "context" },
+        { ref: "hawaii", type: "geo:place", key: "hawaii", value: "Hawaii", scope: "global" },
+      ],
+      relations: [
+        { type: "core:about", from: "fact:0", to: "trip" },
+        { type: "travel:destination", from: "fact:0", to: "hawaii" },
+      ],
+    }),
+  ]);
+  const outcome = await processTurn(
+    graph,
+    "Went to Hawaii with my family",
+    driver,
+    { ...ctx, scope: { owner_id: "actor:alice" } },
+    { graphEnrichment: {} },
+  );
+  assert.equal(outcome.graph?.enriched, true);
+  assert.equal(outcome.graph?.createdEntities, 2);
+  assert.equal(outcome.graph?.createdEdges, 2);
+  assert.equal(graph.queryNodes({ type: "core:dimension" })[0]?.key, "familyTrips");
+  assert.equal(graph.queryNodes({ type: "travel:trip" }).length, 1);
+  assert.equal(graph.queryNodes({ type: "travel:trip" })[0]?.state, "accepted");
+});
+
+test("runtime: failed enrichment falls back without losing extracted facts", async () => {
+  const graph = new MemoryGraph();
+  const driver = new MockDriver([
+    JSON.stringify({ store: true, candidates: ["预算 5000"] }),
+    JSON.stringify({ contents: [{ dimensionKey: "NEW:budget", value: 5000 }] }),
+    JSON.stringify({ factMappings: [], entities: [], relations: [] }),
+  ]);
+  const outcome = await processTurn(
+    graph,
+    "预算 5000",
+    driver,
+    ctx,
+    { graphEnrichment: {} },
+  );
+  assert.equal(outcome.graph?.enriched, false);
+  assert.match(outcome.graph?.error ?? "", /omitted factRef/);
+  assert.equal(outcome.captures.length, 1);
+  assert.equal(graph.queryNodes({ type: "core:statement" }).length, 1);
+});
+
 test("runtime: conflicting turn surfaces conflict via capture", async () => {
   const graph = new MemoryGraph();
   const driver = new MockDriver([

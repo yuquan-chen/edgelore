@@ -18,6 +18,8 @@
 import type { GraphStore, MemoryGraph } from "../model/store.js";
 import type { DimensionNode, FactNodeState, StatementNode } from "../model/types.js";
 import { capture, type CaptureContext, type CaptureResult } from "./capture.js";
+import { runGraphEnrichment } from "./graph-enrichment.js";
+import { commitGraphWritePlan } from "./graph-write.js";
 import { runGate } from "./gate.js";
 import { runExtract } from "./extract.js";
 import type { KnownDimension } from "./prompt.js";
@@ -45,6 +47,14 @@ export interface TurnOutcome {
   /** Embedding failure after successful capture — the memory is stored but
    * the vector index is stale until re-embedded. */
   indexError?: string;
+  /** Present when graph enrichment was requested. Failure is non-fatal: the
+   * extracted facts still go through plain capture(). */
+  graph?: {
+    enriched: boolean;
+    createdEntities: number;
+    createdEdges: number;
+    error?: string;
+  };
 }
 
 /** Options for {@link processTurn}. */
@@ -54,6 +64,16 @@ export interface ProcessTurnOptions {
   /** When configured, context selection switches from "latest 50" to
    * hybrid retrieval, and new statements are embedded after capture. */
   retrieval?: RetrievalConfig;
+  /** Optional third pass: organize immutable extracted facts into entities,
+   * events, and Statement-originating relations. */
+  graphEnrichment?: GraphEnrichmentConfig;
+}
+
+export interface GraphEnrichmentConfig {
+  /** Defaults to the gate/extract driver. May be a cheaper organizer model. */
+  driver?: LlmDriver;
+  /** Existing entity hints exposed to the organizer (default 40). */
+  maxEntityHints?: number;
 }
 
 /** Retrieval plumbing for the context recipes and the embedding write path. */
@@ -139,7 +159,40 @@ export async function processTurn(
       indexed: 0,
     };
   }
-  const captures = extract.contents.map((content) => capture(graph, content, ctx));
+  let captures: CaptureResult[];
+  let graphOutcome: TurnOutcome["graph"];
+  if (opts?.graphEnrichment) {
+    try {
+      const plan = await runGraphEnrichment({
+        text,
+        contents: extract.contents,
+        knownDimensions: knownDims,
+        graph,
+        driver: opts.graphEnrichment.driver ?? driver,
+        scope: ctx.scope,
+        ...(opts.graphEnrichment.maxEntityHints !== undefined
+          ? { maxEntityHints: opts.graphEnrichment.maxEntityHints }
+          : {}),
+      });
+      const result = commitGraphWritePlan(graph, plan, ctx);
+      captures = result.captures;
+      graphOutcome = {
+        enriched: true,
+        createdEntities: result.createdEntityIds.length,
+        createdEdges: result.createdEdgeIds.length,
+      };
+    } catch (err) {
+      captures = extract.contents.map((content) => capture(graph, content, ctx));
+      graphOutcome = {
+        enriched: false,
+        createdEntities: 0,
+        createdEdges: 0,
+        error: (err as Error).message,
+      };
+    }
+  } else {
+    captures = extract.contents.map((content) => capture(graph, content, ctx));
+  }
 
   // Embedding write path: after capture, index each new statement AND each
   // new dimension (so similarDimensions can find it next time). Failures
@@ -172,7 +225,13 @@ export async function processTurn(
       indexError = (err as Error).message;
     }
   }
-  return { gate: { store: true }, captures, indexed, indexError };
+  return {
+    gate: { store: true },
+    captures,
+    indexed,
+    indexError,
+    ...(graphOutcome ? { graph: graphOutcome } : {}),
+  };
 }
 
 /**

@@ -160,7 +160,10 @@ test("expandHit: conflict sibling and constraint verdict ride along", () => {
   assert.equal(expansion.siblings[0]?.value, 5000); // the conflict counterpart
   assert.equal(expansion.siblings[0]?.state, "accepted");
   assert.equal(expansion.constraints.length, 1);
-  assert.equal(expansion.constraints[0]?.evaluation, "violated"); // M1: avg(5000,8000)=6500 > 6000
+  // Retrieval discloses the tentative challenger, but the constraint engine
+  // evaluates the current accepted belief only. Candidate arbitration builds
+  // its own hypothetical accepted snapshot in conflicts.ts.
+  assert.equal(expansion.constraints[0]?.evaluation, "satisfied");
 });
 
 test("in-memory vector store roundtrips", () => {

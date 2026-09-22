@@ -147,6 +147,35 @@ test("graph write: entity and dimension identity are isolated by owner scope", (
   });
 });
 
+test("graph write: harmless entity-key spelling differences reuse identity", () => {
+  forBackend((graph) => {
+    const first = commitGraphWritePlan(
+      graph,
+      {
+        entities: [
+          { ref: "place", type: "geo:place", key: "Washington D.C.", value: "Washington D.C.", scope: "global" },
+        ],
+        facts: [],
+        relations: [],
+      },
+      aliceCtx,
+    );
+    const second = commitGraphWritePlan(
+      graph,
+      {
+        entities: [
+          { ref: "place", type: "geo:place", key: "washington-d-c", value: "Washington, DC", scope: "global" },
+        ],
+        facts: [],
+        relations: [],
+      },
+      aliceCtx,
+    );
+    assert.equal(second.refs.place, first.refs.place);
+    assert.equal(graph.queryNodes({ type: "geo:place" }).length, 1);
+  });
+});
+
 test("graph write: a failed relation rolls the whole plan back", () => {
   forBackend((graph) => {
     const bad = hawaiiPlan();

@@ -84,6 +84,18 @@ function entityScope(draft: EntityDraft, contextScope?: Scope): Scope | undefine
   return draft.scope === "global" ? undefined : contextScope;
 }
 
+/** Conservative identity normalisation: spelling separators and case do not
+ * create a second entity, while semantic similarity never auto-merges. */
+export function canonicalEntityKey(key: string): string {
+  return key
+    .normalize("NFKC")
+    .trim()
+    .toLocaleLowerCase("en-US")
+    .replace(/[’']/gu, "")
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/gu, "");
+}
+
 /**
  * Resolve and atomically commit one graph write plan.
  *
@@ -104,20 +116,47 @@ export function commitGraphWritePlan(
     const createdEntityIds: string[] = [];
     const createdEdgeIds: string[] = [];
 
+    // Facts are committed first so entity state can be derived from the
+    // statements that actually support it (rather than model-authored).
+    for (const draft of plan.facts) {
+      const result = capture(graph, draft.content, ctx);
+      if (!result.statementId) {
+        throw new AgentError(`capture returned no statement id for fact ref: ${draft.ref}`);
+      }
+      refs[draft.ref] = result.statementId;
+      captures.push(result);
+    }
+
     for (const draft of plan.entities) {
       const scope = entityScope(draft, ctx.scope);
-      const existing = graph
-        .queryNodes({ type: draft.type, key: draft.key })
-        .find((node) => scopesEqual(node.scope, scope));
+      const key = canonicalEntityKey(draft.key);
+      if (!key) throw new AgentError(`entity "${draft.ref}" has no usable identity key`);
+      const matches = graph
+        .queryNodes({ type: draft.type })
+        .filter(
+          (node) =>
+            node.key !== undefined &&
+            canonicalEntityKey(node.key) === key &&
+            scopesEqual(node.scope, scope),
+        );
+      if (matches.length > 1) {
+        throw new AgentError(
+          `ambiguous entity identity for ${draft.type}:${draft.key} in the requested scope`,
+        );
+      }
+      const existing = matches[0];
       if (existing) {
+        if (existing.state === "tentative" && derivedEntityState(plan, draft.ref, refs, graph) === "accepted") {
+          graph.transitionNodeState(existing.id, "accepted");
+        }
         refs[draft.ref] = existing.id;
         continue;
       }
       const node = graph.addNode({
         type: draft.type,
-        key: draft.key,
+        key,
         value: draft.value,
-        state: draft.state,
+        state: draft.state ?? derivedEntityState(plan, draft.ref, refs, graph),
         scope,
         attributes: draft.attributes,
         tags: draft.tags,
@@ -127,15 +166,6 @@ export function commitGraphWritePlan(
       });
       refs[draft.ref] = node.id;
       createdEntityIds.push(node.id);
-    }
-
-    for (const draft of plan.facts) {
-      const result = capture(graph, draft.content, ctx);
-      if (!result.statementId) {
-        throw new AgentError(`capture returned no statement id for fact ref: ${draft.ref}`);
-      }
-      refs[draft.ref] = result.statementId;
-      captures.push(result);
     }
 
     for (const draft of plan.relations) {
@@ -162,4 +192,20 @@ export function commitGraphWritePlan(
 
     return { refs, captures, createdEntityIds, createdEdgeIds };
   });
+}
+
+/** Entity identity is accepted when at least one accepted Statement supports
+ * it; otherwise it remains tentative. Relations retain the detailed trust. */
+function derivedEntityState(
+  plan: GraphWritePlan,
+  entityRef: string,
+  refs: Readonly<Record<string, string>>,
+  graph: GraphStore,
+): FactNodeState {
+  for (const relation of plan.relations) {
+    if (relation.to !== entityRef) continue;
+    const statementId = refs[relation.from];
+    if (statementId && graph.getNode(statementId)?.state === "accepted") return "accepted";
+  }
+  return "tentative";
 }

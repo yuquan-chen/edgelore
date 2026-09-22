@@ -17,6 +17,9 @@ import {
   buildBatchExtractionPrompt,
   normalizeBatchContents,
   scanEventCandidates,
+  detectLang,
+  dominantLang,
+  filterByLanguage,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
 
@@ -119,6 +122,7 @@ function knownDims() {
 
 let done = 0;
 let skippedTotal = 0;
+let langDroppedTotal = 0;
 for (const t of targets) {
   const transcript = t.turns.map((turn) => `[${turn.role}] ${turn.content}`).join("\n");
   if (!transcript.trim()) continue;
@@ -148,6 +152,37 @@ for (const t of targets) {
         ),
       );
       batch = normalizeBatchContents(parsed.contents ?? []);
+    }
+    // 与 ingest.mjs 相同的语言钉死·代码层（E5）：质检要覆盖它
+    const expectedLang = dominantLang(transcript);
+    let langDropped = 0;
+    if (expectedLang) {
+      let lf = filterByLanguage(batch.contents, (c) => c.value, expectedLang);
+      if (lf.dropped.length > 0 && lf.keep.length <= batch.contents.length / 2) {
+        parsed = parseJsonReply(
+          await driver.complete(
+            buildBatchExtractionPrompt({
+              ...promptOpts,
+              extraFragments: [
+                `NOTE: your previous reply mixed languages. The session is in ${
+                  expectedLang === "zh" ? "Chinese" : expectedLang === "es" ? "Spanish" : "English"
+                }: write EVERY value in that language ONLY.`,
+                "Entries written in any other language are discarded.",
+              ],
+            }),
+          ),
+        );
+        const retried = normalizeBatchContents(parsed.contents ?? []);
+        lf = filterByLanguage(retried.contents, (c) => c.value, expectedLang);
+        batch = { contents: lf.keep, skipped: retried.skipped };
+      } else {
+        batch = { contents: lf.keep, skipped: batch.skipped };
+      }
+      langDropped = lf.dropped.length;
+      langDroppedTotal += langDropped;
+      if (langDropped > 0) {
+        console.log(`\n[warn] ${t.qid}: dropped ${langDropped} wrong-language entries (expected ${expectedLang})`);
+      }
     }
     if (batch.skipped > 0) skippedTotal += batch.skipped;
     for (const c of batch.contents) {
@@ -183,6 +218,15 @@ for (const r of rows.sort((a, b) => b.neu - a.neu)) {
   );
 }
 console.log(`\n覆盖率显著提升的题: ${improved}/${targets.length}`);
+console.log(`语言钉死: 丢弃错误语言语句 ${langDroppedTotal} 条`);
+const langStats = { zh: 0, en: 0, es: 0, ambiguous: 0 };
+for (const s of allNew) {
+  const v = String(s.value ?? "");
+  const l = detectLang(v);
+  if (l === null) langStats.ambiguous += 1;
+  else langStats[l] += 1;
+}
+console.log(`新库语言分布: zh=${langStats.zh} en=${langStats.en} es=${langStats.es} 歧义=${langStats.ambiguous}`);
 console.log(`新库 saidBy 分布: assistant=${saidByStats.assistant} user=${saidByStats.user} 无=${saidByStats.absent}`);
 console.log(`新库总语句: ${allNew.length} | 跳过的坏条目: ${skippedTotal}`);
 graph.close();

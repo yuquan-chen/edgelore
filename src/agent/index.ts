@@ -10,6 +10,7 @@ export * from "./errors.js";
 export * from "./llm-driver.js";
 export * from "./prompt.js";
 export * from "./gate.js";
+export * from "./lang.js";
 export * from "./extract.js";
 export * from "./runtime.js";
 export * from "./openai-compat-driver.js";

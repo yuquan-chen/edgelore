@@ -21,6 +21,8 @@ import {
   normalizeBatchContents,
   relevantDimensionsOf,
   scanEventCandidates,
+  dominantLang,
+  filterByLanguage,
   usageTotals,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
@@ -140,6 +142,7 @@ if (shardIdx !== -1) {
 }
 let processed = 0;
 let factsStored = 0;
+let langDroppedTotal = 0;
 let ordinal = -1;
 const t0 = Date.now();
 
@@ -197,8 +200,40 @@ for (const [sid, session] of sessions) {
       );
       batch = normalizeBatchContents(parsed.contents ?? []);
     }
+    // 语言钉死·代码层（E5）：与会话语言不符的语句是脏数据——确定性的丢，
+    // 漂移占主导时带提示重抽一次。歧义载荷（纯数字/专名）一律放行。
+    const expectedLang = dominantLang(transcript);
+    let langDropped = 0;
+    if (expectedLang) {
+      let lf = filterByLanguage(batch.contents, (c) => c.value, expectedLang);
+      if (lf.dropped.length > 0 && lf.keep.length <= batch.contents.length / 2) {
+        parsed = parseJsonReply(
+          await driver.complete(
+            buildBatchExtractionPrompt({
+              ...promptOpts,
+              extraFragments: [
+                `NOTE: your previous reply mixed languages. The session is in ${
+                  expectedLang === "zh" ? "Chinese" : expectedLang === "es" ? "Spanish" : "English"
+                }: write EVERY value in that language ONLY.`,
+                "Entries written in any other language are discarded.",
+              ],
+            }),
+          ),
+        );
+        const retried = normalizeBatchContents(parsed.contents ?? []);
+        lf = filterByLanguage(retried.contents, (c) => c.value, expectedLang);
+        batch = { contents: lf.keep, skipped: retried.skipped };
+      } else {
+        batch = { contents: lf.keep, skipped: batch.skipped };
+      }
+      langDropped = lf.dropped.length;
+      langDroppedTotal += langDropped;
+    }
     if (batch.skipped > 0) {
       console.log(`\n[warn] session ${sid}: skipped ${batch.skipped} malformed entries`);
+    }
+    if (langDropped > 0) {
+      console.log(`\n[warn] session ${sid}: dropped ${langDropped} wrong-language entries (expected ${expectedLang})`);
     }
     const contents = batch.contents;
     ctx.source_refs = [sid];
@@ -230,6 +265,7 @@ for (const [sid, session] of sessions) {
 
 const dims = graph.queryNodes({ type: "core:dimension" }).length;
 console.log(`\ndone: ${processed} sessions this run, ${factsStored} facts this run`);
+console.log(`language pinning: ${langDroppedTotal} wrong-language entries dropped`);
 console.log(`store: ${dims} dimensions, ${graph.queryNodes({ type: "core:statement" }).length} statements`);
 const usage = usageTotals();
 console.log(`API usage: ${usage.calls} calls, ${usage.inputTokens} input tokens, ${usage.outputTokens} output tokens, ${usage.errors} errors`);

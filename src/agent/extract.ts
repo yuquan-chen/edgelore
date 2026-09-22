@@ -11,6 +11,7 @@
 
 import type { CaptureContent } from "./capture.js";
 import { AgentError } from "./errors.js";
+import { detectLang, dominantLang, type Lang } from "./lang.js";
 import { parseJsonReply, type LlmDriver } from "./llm-driver.js";
 import { buildExtractPrompt, type KnownDimension } from "./prompt.js";
 
@@ -79,10 +80,34 @@ export async function runExtract(input: ExtractInput): Promise<ExtractResult> {
     throw new AgentError('extract reply field "contents" must be an array');
   }
   const contents = parsed.contents.map((raw) => toCaptureContent(raw, knownKeys));
-  if (contents.length === 0) {
-    return { action: "NOOP", reason: "extractor produced no entries" };
+  const kept = keepInSessionLanguage(contents, input.text);
+  if (kept.length === 0) {
+    return {
+      action: "NOOP",
+      reason:
+        contents.length === 0
+          ? "extractor produced no entries"
+          : "every entry was written in a foreign language",
+    };
   }
-  return { action: "STORE", contents };
+  return { action: "STORE", contents: kept };
+}
+
+/**
+ * Language pinning, enforced (not just prompted): statements in a language
+ * the speaker never used are corrupt data — drop confident mismatches before
+ * they reach the graph. Ambiguous payloads (numbers, proper-noun strings)
+ * always pass; enforcement only fires when BOTH the turn's language and the
+ * entry's language are confidently known and differ.
+ */
+function keepInSessionLanguage(contents: CaptureContent[], turnText: string): CaptureContent[] {
+  const expected: Lang | null = dominantLang(turnText);
+  if (expected === null) return contents;
+  return contents.filter((c) => {
+    if (typeof c.value !== "string") return true;
+    const lang = detectLang(c.value);
+    return lang === null || lang === expected;
+  });
 }
 
 /**

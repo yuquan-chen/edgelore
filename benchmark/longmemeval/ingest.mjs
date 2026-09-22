@@ -6,10 +6,20 @@
 // knownDimensions growing as we go (anti-drift), vectors written after each
 // session. Resumable via a checkpoint file.
 //
-// Usage: node benchmark/longmemeval/ingest.mjs [--limit N] [--graph] [--db PATH]
+// Usage:
+//   node benchmark/longmemeval/ingest.mjs --graph --run-dir data/runs/<name>
+//   node benchmark/longmemeval/ingest.mjs --graph --run-dir data/runs/<name> --resume
+// Legacy: [--limit N] [--graph] [--db PATH]
 
-import { readFileSync, existsSync, writeFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import {
+  readFileSync,
+  existsSync,
+  writeFileSync,
+  appendFileSync,
+  mkdirSync,
+  readdirSync,
+} from "node:fs";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   SqliteGraph,
@@ -18,13 +28,15 @@ import {
   parseJsonReply,
   capture,
   buildBatchExtractionPrompt,
-  normalizeBatchContents,
+  normalizeBatchExtractionReply,
   relevantDimensionsOf,
   scanEventCandidates,
   dominantLang,
   filterByLanguage,
   runGraphEnrichment,
   commitGraphWritePlan,
+  archiveConversationEvidence,
+  conversationEvidenceText,
   usageTotals,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
@@ -43,17 +55,70 @@ if (!cfg.llm) {
 
 const dataDir = join(here, "data");
 const dataPath = join(dataDir, "longmemeval_oracle.json");
-const graphMode = process.argv.includes("--graph");
-const shardArg = process.argv.indexOf("--shard");
-const shardTag = shardArg !== -1 ? process.argv[shardArg + 1].replace("/", "-") : "main";
-const checkpointPath = join(dataDir, `ingest-checkpoint-${shardTag}${graphMode ? "-graph" : ""}.json`);
-const dbIdx = process.argv.indexOf("--db");
-const dbPath = dbIdx !== -1
-  ? process.argv[dbIdx + 1]
-  : join(dataDir, graphMode ? "memory-graph.db" : "memory.db");
+const args = process.argv.slice(2);
+function argVal(name) {
+  const index = args.indexOf(name);
+  return index === -1 ? undefined : args[index + 1];
+}
+const graphMode = args.includes("--graph");
+const resume = args.includes("--resume");
+const runDirArg = argVal("--run-dir");
+const dbArg = argVal("--db");
+if (runDirArg && dbArg) {
+  console.error("use either --run-dir or --db, never both");
+  process.exit(1);
+}
+
+let runDir;
+let checkpointPath;
+let dbPath;
+let runMetaPath;
+if (runDirArg) {
+  runDir = resolve(runDirArg);
+  if (existsSync(runDir) && readdirSync(runDir).length > 0 && !resume) {
+    console.error(`refusing to overwrite non-empty run directory: ${runDir}`);
+    console.error("choose a new --run-dir, or pass --resume for this exact run");
+    process.exit(1);
+  }
+  mkdirSync(runDir, { recursive: true });
+  checkpointPath = join(runDir, "ingest-checkpoint.json");
+  dbPath = join(runDir, "memory.db");
+  runMetaPath = join(runDir, "run-meta.json");
+  if (resume && (!existsSync(checkpointPath) || !existsSync(dbPath))) {
+    console.error(`cannot resume: memory.db and ingest-checkpoint.json must both exist in ${runDir}`);
+    process.exit(1);
+  }
+} else {
+  const shardTag = (argVal("--shard") ?? "main").replace("/", "-");
+  checkpointPath = join(dataDir, `ingest-checkpoint-${shardTag}${graphMode ? "-graph" : ""}.json`);
+  dbPath = dbArg ? resolve(dbArg) : join(dataDir, graphMode ? "memory-graph.db" : "memory.db");
+}
+
+// A run-local, append-only operational log makes long imports auditable and
+// survives terminal closure. It is installed only after the fresh-directory
+// guard, so creating the log can never make a new run look like a resume.
+if (runDir) {
+  const logPath = join(runDir, "ingest.log");
+  const terminalLog = console.log.bind(console);
+  const terminalError = console.error.bind(console);
+  const persist = (level, parts) => {
+    const rendered = parts
+      .map((part) => (typeof part === "string" ? part : JSON.stringify(part)))
+      .join(" ");
+    appendFileSync(logPath, `${new Date().toISOString()} ${level} ${rendered}\n`);
+  };
+  console.log = (...parts) => {
+    terminalLog(...parts);
+    persist("INFO", parts);
+  };
+  console.error = (...parts) => {
+    terminalError(...parts);
+    persist("ERROR", parts);
+  };
+}
 
 const dataset = JSON.parse(readFileSync(dataPath, "utf8"));
-const limit = Number(process.argv[process.argv.indexOf("--limit") + 1] ?? Infinity);
+const limit = Number(argVal("--limit") ?? Infinity);
 
 // unique sessions: sessionId -> { date, turns }
 const sessions = new Map();
@@ -68,6 +133,31 @@ for (const q of dataset) {
   });
 }
 console.log(`unique sessions: ${sessions.size}${Number.isFinite(limit) ? ` (limit ${limit})` : ""}`);
+if (runDir && !resume) {
+  writeFileSync(
+    runMetaPath,
+    JSON.stringify(
+      {
+        status: "running",
+        started_at: new Date().toISOString(),
+        run_dir: runDir,
+        database: dbPath,
+        checkpoint: checkpointPath,
+        dataset: dataPath,
+        dataset_sessions: sessions.size,
+        graph_mode: graphMode,
+        model: cfg.llm.model,
+        embedding_model: cfg.embedding?.model ?? null,
+        max_facts_per_session: cfg.extraction.maxFactsPerSession,
+        command_args: args,
+      },
+      null,
+      2,
+    ),
+  );
+}
+console.log(`database: ${dbPath}`);
+console.log(`checkpoint: ${checkpointPath}`);
 
 // --- checkpoint --------------------------------------------------------------
 
@@ -136,26 +226,27 @@ async function captureContents(contents, sessionId, date, transcript) {
 
 async function embedSession(sessionId) {
   if (!embedder) return;
-  const stmts = graph.queryNodes({ type: "core:statement" }).filter(
-    (s) => s.source_refs.includes(sessionId),
-  );
-  if (stmts.length === 0) return;
-  const texts = stmts.map((s) => {
-    const dim = graph.getNode(s.dimension_id);
-    return `${dim?.key ?? ""} ${JSON.stringify(s.value)}${s.unit ? ` ${s.unit}` : ""}`;
+  const nodes = [
+    ...graph.queryNodes({ type: "core:statement" }),
+    ...graph.queryNodes({ type: "core:message" }),
+  ].filter((node) => node.source_refs.includes(sessionId));
+  if (nodes.length === 0) return;
+  const texts = nodes.map((node) => {
+    if (node.type === "core:message") return conversationEvidenceText(node);
+    const dim = graph.getNode(node.dimension_id);
+    return `${dim?.key ?? ""} ${JSON.stringify(node.value)}${node.unit ? ` ${node.unit}` : ""}`;
   });
   // qwen embedding 单批上限 20 条——分批 ≤16 防止 400
   for (let i = 0; i < texts.length; i += 16) {
     const chunkTexts = texts.slice(i, i + 16);
-    const chunkStmts = stmts.slice(i, i + 16);
+    const chunkNodes = nodes.slice(i, i + 16);
     const vecs = await embedder.embed(chunkTexts);
-    chunkStmts.forEach((s, j) => vectors.put(s.id, vecs[j]));
+    chunkNodes.forEach((node, j) => vectors.put(node.id, vecs[j]));
   }
 }
 
 // --- main loop ---------------------------------------------------------------
 
-const args = process.argv;
 const limitIdx = args.indexOf("--limit");
 const maxSessions = limitIdx !== -1 ? Number(args[limitIdx + 1]) : Infinity;
 const shardIdx = args.indexOf("--shard"); // 过滤语法是 "i/N"；不带 "/" 的值只是 checkpoint 名（如 --shard v5）
@@ -166,7 +257,10 @@ if (shardIdx !== -1 && /^\d+\/\d+$/.test(args[shardIdx + 1])) {
 }
 let processed = 0;
 let factsStored = 0;
+let evidenceStored = 0;
 let langDroppedTotal = 0;
+let eventKeptTotal = 0;
+let eventDroppedTotal = 0;
 let ordinal = -1;
 const t0 = Date.now();
 
@@ -193,7 +287,19 @@ for (const [sid, session] of sessions) {
     continue;
   }
 
+  // Archive the immutable source before any probabilistic extraction. If the
+  // LLM violates its contract, the exact conversation still survives while
+  // the semantic pass remains uncheckpointed for a later resume.
+  const evidence = archiveConversationEvidence(graph, session.turns, {
+    created_by: "human:longmemeval_user",
+    source_ref: sid,
+    createdAt: session.date || undefined,
+    ...(graphMode ? { scope: { owner_id: "actor:longmemeval_user" } } : {}),
+  });
+  evidenceStored += evidence.length;
+
   try {
+    const eventCandidates = scanEventCandidates(transcript);
     const promptOpts = {
       transcript,
       // 相关 top-30 而非全量：全量清单 O(维度数) 增长，库后期每次 prompt 带
@@ -202,10 +308,28 @@ for (const [sid, session] of sessions) {
       maxFacts: cfg.extraction.maxFactsPerSession,
       sessionDate: session.date || undefined,
       // 事件扫描（触发层 v0）：旁插的"我 + 时间"句必须被逐条裁决，防静默丢失
-      mustConsiderEvents: scanEventCandidates(transcript).map((c) => c.sentence),
+      mustConsiderEvents: eventCandidates,
     };
     let parsed = parseJsonReply(await driver.complete(buildBatchExtractionPrompt(promptOpts)));
-    let batch = normalizeBatchContents(parsed.contents ?? []);
+    let batch;
+    try {
+      batch = normalizeBatchExtractionReply(parsed, eventCandidates.length);
+    } catch (err) {
+      if (eventCandidates.length === 0) throw err;
+      parsed = parseJsonReply(
+        await driver.complete(
+          buildBatchExtractionPrompt({
+            ...promptOpts,
+            extraFragments: [
+              `NOTE: your previous reply violated the eventDecisions contract: ${err.message}`,
+              "Return exactly one valid keep/drop decision for every listed eventId.",
+              "A keep decision must contain its complete memory content object.",
+            ],
+          }),
+        ),
+      );
+      batch = normalizeBatchExtractionReply(parsed, eventCandidates.length);
+    }
     if (batch.contents.length === 0) {
       // Empty-reply retry: flash overuses the [] exit on recommendation-heavy
       // sessions (smoke test: 7/20). One nudged re-ask costs a call only
@@ -222,7 +346,7 @@ for (const [sid, session] of sessions) {
           }),
         ),
       );
-      batch = normalizeBatchContents(parsed.contents ?? []);
+      batch = normalizeBatchExtractionReply(parsed, eventCandidates.length);
     }
     // 语言钉死·代码层（E5）：与会话语言不符的语句是脏数据——确定性的丢，
     // 漂移占主导时带提示重抽一次。歧义载荷（纯数字/专名）一律放行。
@@ -244,11 +368,11 @@ for (const [sid, session] of sessions) {
             }),
           ),
         );
-        const retried = normalizeBatchContents(parsed.contents ?? []);
+        const retried = normalizeBatchExtractionReply(parsed, eventCandidates.length);
         lf = filterByLanguage(retried.contents, (c) => c.value, expectedLang);
-        batch = { contents: lf.keep, skipped: retried.skipped };
+        batch = { ...retried, contents: lf.keep };
       } else {
-        batch = { contents: lf.keep, skipped: batch.skipped };
+        batch = { ...batch, contents: lf.keep };
       }
       langDropped = lf.dropped.length;
       langDroppedTotal += langDropped;
@@ -262,8 +386,9 @@ for (const [sid, session] of sessions) {
     const contents = batch.contents;
     const stored = await captureContents(contents, sid, session.date, transcript);
     workerFacts += stored;
-    checkpoint(sid); // facts are persisted — checkpoint immediately
     factsStored += stored;
+    eventKeptTotal += batch.eventKept;
+    eventDroppedTotal += batch.eventDropped;
     if (process.stdout.isTTY) {
       drawBar(processed, remainingTotal || 1, factsStored, t0);
     } else if (processed % 20 === 0) {
@@ -274,6 +399,9 @@ for (const [sid, session] of sessions) {
     } catch (err) {
       console.log(`[warn] session ${sid}: embed failed (facts kept): ${err.message}`);
     }
+    // The run-local checkpoint advances only after facts and the best-effort
+    // embedding pass. A crash before here safely replays through capture dedup.
+    checkpoint(sid);
   } catch (err) {
     console.log(`[warn] session ${sid}: ${err.message} — skipped (rerun to retry)`);
     continue; // not checkpointed: retried on next run
@@ -287,14 +415,48 @@ for (const [sid, session] of sessions) {
 }
 
 const dims = graph.queryNodes({ type: "core:dimension" }).length;
+const statements = graph.queryNodes({ type: "core:statement" }).length;
+const messages = graph.queryNodes({ type: "core:message" }).length;
+let entities = 0;
 console.log(`\ndone: ${processed} sessions this run, ${factsStored} facts this run`);
 console.log(`language pinning: ${langDroppedTotal} wrong-language entries dropped`);
-console.log(`store: ${dims} dimensions, ${graph.queryNodes({ type: "core:statement" }).length} statements`);
+console.log(`event decisions: ${eventKeptTotal} kept, ${eventDroppedTotal} dropped`);
+console.log(`store: ${dims} dimensions, ${statements} statements`);
+console.log(`evidence: ${messages} verbatim message chunks (${evidenceStored} this run)`);
 if (graphMode) {
-  const entities = graph.queryNodes({}).filter(
-    (node) => node.type !== "core:dimension" && node.type !== "core:statement",
+  entities = graph.queryNodes({}).filter(
+    (node) =>
+      node.type !== "core:dimension" &&
+      node.type !== "core:statement" &&
+      node.type !== "core:message",
   ).length;
   console.log(`graph: ${entities} entities/events, ${graph.queryEdges({}).length} edges`);
 }
 const usage = usageTotals();
 console.log(`API usage: ${usage.calls} calls, ${usage.inputTokens} input tokens, ${usage.outputTokens} output tokens, ${usage.errors} errors`);
+if (runDir) {
+  const completedSessions = [...sessions.keys()].filter((sid) => done.has(sid)).length;
+  writeFileSync(
+    join(runDir, "run-result.json"),
+    JSON.stringify(
+      {
+        status: completedSessions === sessions.size ? "complete" : "incomplete",
+        finished_at: new Date().toISOString(),
+        database: dbPath,
+        checkpoint: checkpointPath,
+        completed_sessions: completedSessions,
+        total_sessions: sessions.size,
+        dimensions: dims,
+        statements,
+        message_chunks: messages,
+        entities,
+        event_decisions: { kept: eventKeptTotal, dropped: eventDroppedTotal },
+        language_dropped: langDroppedTotal,
+        usage,
+      },
+      null,
+      2,
+    ),
+  );
+}
+graph.close();

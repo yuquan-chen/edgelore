@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { MemoryGraph } from "../../src/model/store.js";
 import { MockDriver } from "../../src/agent/llm-driver.js";
 import { capture } from "../../src/agent/capture.js";
+import { archiveConversationEvidence } from "../../src/agent/evidence.js";
 import { AgentError } from "../../src/agent/errors.js";
 import { MockEmbedder, type EmbeddingDriver } from "../../src/agent/embedding-driver.js";
 import { InMemoryVectorStore } from "../../src/agent/retrieval.js";
@@ -319,6 +320,25 @@ test("runtime: assistant-authored statements are labelled in grouped context", a
   assert.match(assistantLine ?? "", /\(assistant\)/);
   const userLine = lines.find((l) => l.includes("MySQL"));
   assert.ok(!/\(assistant\)/.test(userLine ?? ""));
+});
+
+test("runtime: verbatim evidence is rendered directly with speaker and date", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEvidence(
+    graph,
+    [{ role: "assistant", content: "The Lost Temple encounter contained exactly 4 mummies." }],
+    { created_by: "human:charles", source_ref: "session:temple", createdAt: "2023-04-18" },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(graph, "How many mummies were in the Lost Temple?", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+  });
+
+  assert.equal(lines.length, 1);
+  assert.match(lines[0] ?? "", /conversationEvidence \(verbatim assistant @2023-04-18\)/);
+  assert.match(lines[0] ?? "", /exactly 4 mummies/);
 });
 
 // --- 相关维度选择（批量抽取的 O(维度数) prompt 爆炸修复） -----------------------

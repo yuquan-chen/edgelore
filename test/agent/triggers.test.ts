@@ -19,6 +19,7 @@ test("scan: an aside event in a user turn is flagged with its time expression", 
   const hits = scanEventCandidates(t);
   assert.equal(hits.length, 1);
   assert.match(hits[0].sentence, /drove for six hours/);
+  assert.match(hits[0].context, /best route/);
   assert.match(hits[0].timeExpr, /recently/i);
 });
 
@@ -95,17 +96,43 @@ test("scan: candidates arrive in transcript order and verbatim", () => {
   assert.match(hits[1].sentence, /learning French/);
 });
 
+test("scan: local context preserves payload that follows a temporal anchor", () => {
+  const t =
+    "[user] By the way, I went birding a week ago. I saw robins and sparrows. " +
+    "I also noticed the American goldfinches returning to the area.";
+  const hits = scanEventCandidates(t);
+  assert.equal(hits.length, 1);
+  assert.match(hits[0].sentence, /went birding a week ago/);
+  assert.match(hits[0].context, /American goldfinches/);
+});
+
+test("scan: clock times and recurring weekdays are temporal signals", () => {
+  const t = [
+    "[user] I usually go to the gym at 6:00 pm.",
+    "[user] I like to wake up early on Saturdays.",
+  ].join("\n");
+  const hits = scanEventCandidates(t);
+  assert.equal(hits.length, 2);
+  assert.match(hits[0].timeExpr, /6:00 pm/i);
+  assert.match(hits[1].timeExpr, /Saturdays/i);
+});
+
 test("prompt: flagged sentences render as a must-decide block in the batch prompt", async () => {
   const { buildBatchExtractionPrompt } = await import("../../src/agent/prompt.js");
   const withEvents = buildBatchExtractionPrompt({
     transcript: "[user] I attended a workshop on the 3rd of June.",
     knownDimensions: [],
     maxFacts: 12,
-    mustConsiderEvents: ["I attended a workshop on the 3rd of June."],
+    mustConsiderEvents: [{
+      sentence: "I attended a workshop on the 3rd of June.",
+      context: "I attended a workshop on the 3rd of June. It covered graph databases.",
+    }],
   });
   assert.match(withEvents, /Reported experiences \(decide every one\)/);
   assert.match(withEvents, /Skipping a flagged\s+sentence without a decision is not allowed/);
-  assert.match(withEvents, /- I attended a workshop on the 3rd of June\./);
+  assert.match(withEvents, /E1 trigger: I attended a workshop on the 3rd of June\./);
+  assert.match(withEvents, /local context:.*graph databases/);
+  assert.match(withEvents, /eventDecisions MUST contain exactly: E1/);
 
   const withoutEvents = buildBatchExtractionPrompt({
     transcript: "[user] Hello!",

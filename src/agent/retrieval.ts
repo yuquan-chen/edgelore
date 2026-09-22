@@ -29,6 +29,7 @@ import type { SqliteGraph } from "../store/sqlite.js";
 import type { DimensionNode, FactNodeState, GraphNode, StatementNode } from "../model/types.js";
 import type { EvaluationResult } from "../engine/evaluate.js";
 import type { EmbeddingDriver } from "./embedding-driver.js";
+import { conversationEvidenceText } from "./evidence.js";
 
 /** How many retrieval routes to run. Ablation switch, default "hybrid". */
 export type RetrievalMode = "hybrid" | "vector" | "lexical";
@@ -84,6 +85,9 @@ export class SqliteVectorStore implements VectorStore {
 
 /** One retrieval result: a graph ADDRESS, not a text chunk. */
 export interface RetrievalHit {
+  /** Statements participate in governed dimension semantics; messages are
+   * immutable verbatim evidence and are rendered directly. */
+  nodeType?: "statement" | "message";
   statementId: string;
   dimensionId: string;
   dimensionKey: string;
@@ -93,6 +97,8 @@ export interface RetrievalHit {
   score: number;
   /** Which routes surfaced this hit. */
   via: string[];
+  /** Present for core:message evidence hits. */
+  role?: "user" | "assistant";
 }
 
 /** One hop of graph context around a hit. */
@@ -146,7 +152,10 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
   if (mode === "vector" && (!input.embedder || !input.vectors)) {
     throw new AgentError('retrieval mode "vector" requires an embedder and a vector store');
   }
-  const all = graph.queryNodes({ type: "core:statement" }) as StatementNode[];
+  const all = [
+    ...graph.queryNodes({ type: "core:statement" }),
+    ...graph.queryNodes({ type: "core:message" }),
+  ];
   if (all.length === 0) return [];
   // One candidate pre-filter (state / date window) shared by both routes.
   // Day normalization: legacy rows stored slash dates ("2023/05/28"); ASCII
@@ -154,28 +163,29 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
   // NOTE: scope (sourceRefsAllow) is applied as a SCORE BOOST after fusion,
   // not as a hard filter here — twin-session provenance (the same logical
   // conversation stored under different session ids) must stay reachable.
-  const stmts = all.filter((s) => {
-    if (input.states && !input.states.includes(s.state)) return false;
-    const day = s.created_at.slice(0, 10).replace(/\//g, "-");
+  const candidates = all.filter((node) => {
+    if (input.states && !input.states.includes(node.state)) return false;
+    const day = node.created_at.slice(0, 10).replace(/\//g, "-");
     if (input.dateFrom && day < input.dateFrom) return false;
     if (input.dateTo && day > input.dateTo) return false;
     return true;
   });
-  if (stmts.length === 0) return [];
+  if (candidates.length === 0) return [];
   const dims = new Map<string, GraphNode>(
     graph.queryNodes({ type: "core:dimension" }).map((d) => [d.id, d]),
   );
 
-  const routes: Array<{ name: string; ranked: string[] }> = [];
+  const routeLimit = Math.max(k * 8, 64);
+  const routes: Array<{ name: string; ranked: string[]; weight?: number }> = [];
 
   // Lexical route — always available, zero dependencies.
   const queryBigrams = bigrams(input.query);
   if (queryBigrams.size > 0) {
-    const scored = stmts
-      .map((s) => ({ id: s.id, score: lexicalScore(queryBigrams, docBigrams(graph, s)) }))
+    const scored = candidates
+      .map((node) => ({ id: node.id, score: lexicalScore(queryBigrams, docBigrams(graph, node)) }))
       .filter((d) => d.score > 0)
       .sort((a, b) => b.score - a.score);
-    routes.push({ name: "lexical", ranked: scored.map((d) => d.id) });
+    routes.push({ name: "lexical", ranked: scored.slice(0, routeLimit).map((d) => d.id) });
   }
 
   // Vector route — only when plumbing is provided.
@@ -188,12 +198,19 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
     } else {
       const [queryVector] = await input.embedder.embed([input.query]);
       const stored = new Map(input.vectors.all().map((e) => [e.id, e.vector]));
-      const scored = stmts
-        .filter((s) => stored.has(s.id))
-        .map((s) => ({ id: s.id, score: cosine(queryVector, stored.get(s.id) as number[]) }))
+      const scored = candidates
+        .filter((node) => stored.has(node.id))
+        .map((node) => ({ id: node.id, score: cosine(queryVector, stored.get(node.id) as number[]) }))
         .filter((d) => d.score > 0)
         .sort((a, b) => b.score - a.score);
-      routes.push({ name: "vector", ranked: scored.map((d) => d.id) });
+      // Dense similarity is the reliable recall route for paraphrased English
+      // questions. Give it a modest lead over character-bigram lexical ranks;
+      // exact lexical evidence still wins whenever it appears on both routes.
+      routes.push({
+        name: "vector",
+        ranked: scored.slice(0, routeLimit).map((d) => d.id),
+        weight: 1.25,
+      });
     }
   }
 
@@ -209,15 +226,15 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
   // the user's own card had weak word overlap. Identity biases ORDER, it
   // does not blind.
   const scopeSet = input.sourceRefsAllow ? new Set(input.sourceRefsAllow) : undefined;
-  const rankedAll = [...fused.entries()];
+  const rankedAll = [...fused.entries()].sort((a, b) => b[1].score - a[1].score);
   let ranked = rankedAll;
   if (scopeSet) {
-    const byId = new Map(stmts.map((s) => [s.id, s]));
+    const byId = new Map(candidates.map((node) => [node.id, node]));
     const inS: typeof rankedAll = [];
     const outS: typeof rankedAll = [];
     for (const entry of rankedAll) {
-      const stmt = byId.get(entry[0]) as StatementNode;
-      ((stmt.source_refs ?? []).some((r) => scopeSet.has(r)) ? inS : outS).push(entry);
+      const node = byId.get(entry[0]) as GraphNode;
+      ((node.source_refs ?? []).some((r) => scopeSet.has(r)) ? inS : outS).push(entry);
     }
     inS.sort((a, b) => b[1].score - a[1].score);
     outS.sort((a, b) => b[1].score - a[1].score);
@@ -226,9 +243,25 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
   return ranked
     .slice(0, k)
     .map(([statementId, meta]) => {
-      const stmt = stmts.find((s) => s.id === statementId) as StatementNode;
+      const node = candidates.find((candidate) => candidate.id === statementId) as GraphNode;
+      if (node.type === "core:message") {
+        const role = node.attributes?.role === "assistant" ? "assistant" : "user";
+        return {
+          nodeType: "message" as const,
+          statementId: node.id,
+          dimensionId: node.id,
+          dimensionKey: "conversationEvidence",
+          value: node.value,
+          state: node.state,
+          score: meta.score,
+          via: meta.via,
+          role,
+        };
+      }
+      const stmt = node as StatementNode;
       const dim = dims.get(stmt.dimension_id) as DimensionNode | undefined;
       return {
+        nodeType: "statement" as const,
         statementId,
         dimensionId: stmt.dimension_id,
         dimensionKey: dim?.key ?? "?",
@@ -252,6 +285,9 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
  * @returns siblings and constraint verdicts
  */
 export function expandHit(graph: MemoryGraph, hit: RetrievalHit, maxSiblings = 5): HitExpansion {
+  // Verbatim message evidence is already a terminal retrieval object. It has
+  // no governed dimension siblings or constraint verdicts to expand.
+  if (hit.nodeType === "message") return { siblings: [], constraints: [] };
   const siblings = (graph.queryNodes({ type: "core:statement" }) as StatementNode[])
     .filter((s) => s.dimension_id === hit.dimensionId && s.id !== hit.statementId)
     .slice(0, maxSiblings)
@@ -326,12 +362,16 @@ export function bigrams(text: string): Set<string> {
 const docBigramCache = new Map<string, Set<string>>();
 const DOC_BIGRAM_CACHE_MAX = 50_000;
 
-function docBigrams(graph: GraphStore, s: StatementNode): Set<string> {
-  let doc = docBigramCache.get(s.id);
+function docBigrams(graph: GraphStore, node: GraphNode): Set<string> {
+  let doc = docBigramCache.get(node.id);
   if (!doc) {
     if (docBigramCache.size >= DOC_BIGRAM_CACHE_MAX) docBigramCache.clear();
-    doc = bigrams(statementText(graph, s));
-    docBigramCache.set(s.id, doc);
+    doc = bigrams(
+      node.type === "core:message"
+        ? conversationEvidenceText(node)
+        : statementText(graph, node as StatementNode),
+    );
+    docBigramCache.set(node.id, doc);
   }
   return doc;
 }
@@ -368,14 +408,14 @@ function cosine(a: number[], b: number[]): number {
  * routes beats topping a single one. k=60 is the standard smoothing constant.
  */
 function fuseRRF(
-  routes: Array<{ name: string; ranked: string[] }>,
+  routes: Array<{ name: string; ranked: string[]; weight?: number }>,
   smoothing = 60,
 ): Map<string, { score: number; via: string[] }> {
   const fused = new Map<string, { score: number; via: string[] }>();
   for (const route of routes) {
     route.ranked.forEach((id, index) => {
       const entry = fused.get(id) ?? { score: 0, via: [] };
-      entry.score += 1 / (smoothing + index + 1);
+      entry.score += (route.weight ?? 1) / (smoothing + index + 1);
       if (!entry.via.includes(route.name)) entry.via.push(route.name);
       fused.set(id, entry);
     });

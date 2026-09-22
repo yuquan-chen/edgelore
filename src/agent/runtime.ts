@@ -369,9 +369,14 @@ export async function retrievalContext(
   query: string,
   config: RetrievalConfig,
 ): Promise<RetrievalContext> {
+  const semanticHitLimit = config.k ?? 8;
   const hits = await retrieveRelevant(graph, {
     query,
-    k: config.k,
+    // Statements and verbatim evidence are complementary lanes. Search a
+    // wider pool so message chunks cannot consume every semantic-dimension
+    // slot, and exact payloads buried in a long source response remain
+    // available for provenance-aware promotion below.
+    k: Math.max(semanticHitLimit * 4, 32),
     mode: config.mode,
     embedder: config.embedder,
     vectors: config.vectors,
@@ -384,6 +389,43 @@ export async function retrievalContext(
   const dimById = new Map(
     (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).map((d) => [d.id, d]),
   );
+  const statementHits = hits
+    .filter((hit) => hit.nodeType !== "message")
+    .slice(0, semanticHitLimit);
+  const sourcePriority = new Map<string, number>();
+  statementHits.forEach((hit, statementRank) => {
+    for (const sourceRef of graph.getNode(hit.statementId)?.source_refs ?? []) {
+      if (!sourcePriority.has(sourceRef)) sourcePriority.set(sourceRef, statementRank);
+    }
+  });
+  const rankedMessages = hits
+    .filter((hit) => hit.nodeType === "message")
+    .map((hit, rank) => ({ hit, rank }))
+    .map((entry) => ({
+      ...entry,
+      sourceRank: Math.min(
+        ...(graph.getNode(entry.hit.statementId)?.source_refs ?? []).map(
+          (ref) => sourcePriority.get(ref) ?? Number.POSITIVE_INFINITY,
+        ),
+        Number.POSITIVE_INFINITY,
+      ),
+    }));
+  // Take a small bundle from each of the best semantic sources. This follows
+  // provenance from a concise statement back to the exact response that
+  // produced it, while preventing one long conversation from monopolizing
+  // every evidence slot.
+  const messageHits: typeof hits = [];
+  const sourceRanks = [...new Set(rankedMessages.map((entry) => entry.sourceRank))].sort(
+    (a, b) => a - b,
+  );
+  for (const sourceRank of sourceRanks) {
+    const group = rankedMessages
+      .filter((entry) => entry.sourceRank === sourceRank)
+      .sort((a, b) => a.rank - b.rank)
+      .slice(0, 3);
+    messageHits.push(...group.map(({ hit }) => hit));
+    if (messageHits.length >= 6) break;
+  }
 
   // Group statements by dimension once (per-dimension completeness is the
   // point of grouped rendering); chronological inside each group. Scope
@@ -409,12 +451,29 @@ export async function retrievalContext(
     .getAllConstraints()
     .filter((c) => c.activation_state === "active");
   const lines: string[] = [];
-  const hitDims = [...new Set(hits.map((h) => h.dimensionId))];
+  // Verbatim evidence is rendered directly, not grouped into mutable fact
+  // dimensions. Cap it so exact payloads are available without letting long
+  // source messages crowd all semantic memories out of the context window.
+  for (const hit of messageHits.slice(0, 6)) {
+    if (lines.length >= maxLines) break;
+    const node = graph.getNode(hit.statementId);
+    if (!node) continue;
+    const fallbackOut =
+      scopeSet !== undefined &&
+      scopeSet.size > 0 &&
+      !(node.source_refs ?? []).some((sourceRef) => scopeSet.has(sourceRef));
+    const tag = fallbackOut ? " (non-user-account)" : "";
+    lines.push(
+      `conversationEvidence (verbatim ${hit.role ?? "user"} @${node.created_at.slice(0, 10)})${tag}: ${JSON.stringify(hit.value)}`,
+    );
+  }
+
+  const hitDims = [...new Set(statementHits.map((h) => h.dimensionId))];
   for (const dimId of hitDims) {
     const allMembers = membersByDim.get(dimId) ?? [];
     const scoped = scopeSet ? allMembers.filter(inScopeOf) : [];
     const members = scoped.length > 0 ? scoped : allMembers;
-    const key = dimById.get(dimId)?.key ?? hits.find((h) => h.dimensionId === dimId)?.dimensionKey ?? "?";
+    const key = dimById.get(dimId)?.key ?? statementHits.find((h) => h.dimensionId === dimId)?.dimensionKey ?? "?";
     // Double-ended selection: oldest half + newest half. Oldest-only rendering
     // systematically hid the LATEST value of fast-growing dimensions (the
     // exact entries knowledge-update questions need).
@@ -460,7 +519,7 @@ export async function retrievalContext(
   const units = borrowUnits(graph);
   const seen = new Set<string>();
   const similarDimensions: KnownDimension[] = [];
-  for (const hit of hits) {
+  for (const hit of statementHits) {
     if (seen.has(hit.dimensionId)) continue;
     seen.add(hit.dimensionId);
     const dim = dimById.get(hit.dimensionId);

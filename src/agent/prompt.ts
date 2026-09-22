@@ -203,7 +203,10 @@ export interface BatchExtractionPromptInput {
    * speaker's own experiences paired with a time expression. Each one must
    * get an explicit keep/drop decision — the scan guarantees they are SEEN;
    * the normal worth-storing rules still decide what is KEPT. */
-  mustConsiderEvents?: readonly string[];
+  mustConsiderEvents?: readonly (
+    | string
+    | { sentence: string; context?: string }
+  )[];
   /** Extra fragments appended to the rules zone (retry nudges). */
   extraFragments?: readonly string[];
 }
@@ -225,6 +228,11 @@ export function buildBatchExtractionPrompt(input: BatchExtractionPromptInput): s
     input.knownDimensions.length > 0
       ? input.knownDimensions.map((d) => JSON.stringify(d)).join("\n")
       : "(none yet)";
+  const reportedEvents = (input.mustConsiderEvents ?? []).map((event, index) => ({
+    id: `E${index + 1}`,
+    sentence: typeof event === "string" ? event : event.sentence,
+    context: typeof event === "string" ? event : (event.context ?? event.sentence),
+  }));
   return [
     "You are a Personal Memory Organizer. You read ONE session of a conversation",
     "between a user and an assistant, and extract the facts worth remembering",
@@ -268,18 +276,26 @@ export function buildBatchExtractionPrompt(input: BatchExtractionPromptInput): s
     "  write English; if Chinese, write Chinese. NEVER switch languages mid-session.",
     "- Dimension keys stay English regardless of session language.",
     "",
-    ...(input.mustConsiderEvents && input.mustConsiderEvents.length > 0
+    ...(reportedEvents.length > 0
       ? [
           "### Reported experiences (decide every one)",
           "",
           "The sentences below pair the speaker's own words with a specific time. For",
-          "EACH one, make an explicit decision: keep it as an entry when it is a one-off",
+          "EACH one has an eventId. Return exactly one eventDecisions item for every",
+          "eventId. Keep it as an entry when it is a one-off",
           "event or lasting fact (purchases, milestones, incidents, visits, things",
           "acquired, given away, or given up), and drop it only when it is transient",
           "state, small talk, or a duplicate of another entry. Skipping a flagged",
-          "sentence without a decision is not allowed.",
+          "sentence without a decision is not allowed. A keep decision MUST carry its",
+          "own complete memory content object; a drop decision MUST explain why.",
+          "For a kept event, preserve the speaker as the actor: do not reduce 'I",
+          "attended Jen's wedding' to merely 'Jen got married'. Keep participation,",
+          "ownership, quantities, and sequence when they are stated.",
           "",
-          ...input.mustConsiderEvents.map((s) => `- ${s}`),
+          ...reportedEvents.flatMap((event) => [
+            `- ${event.id} trigger: ${event.sentence}`,
+            `  local context: ${event.context}`,
+          ]),
           "",
         ]
       : []),
@@ -302,7 +318,9 @@ export function buildBatchExtractionPrompt(input: BatchExtractionPromptInput): s
     "of its CURRENT state (fact count, latest value, key changes). These help future",
     "sessions quickly understand the user's situation without reading every detail.",
     "",
-    `Extract at most ${input.maxFacts} facts per session — prefer the durable and important.`,
+    `Extract at most ${input.maxFacts} facts in contents — prefer the durable and important.`,
+    "Kept reported experiences are returned separately in eventDecisions and do NOT",
+    "compete for that general-fact budget.",
     "An EMPTY list is a LAST RESORT: re-read the transcript (assistant",
     "recommendations count too) before returning [].",
     ...(input.extraFragments ?? []),
@@ -311,6 +329,13 @@ export function buildBatchExtractionPrompt(input: BatchExtractionPromptInput): s
     "Session transcript:",
     input.transcript,
     "",
-    'Respond with ONLY one JSON object, no fences: { "contents": [ ... ] }',
+    'Respond with ONLY one JSON object, no fences: { "contents": [ ... ],',
+    '  "eventDecisions": [',
+    '    { "eventId": "E1", "decision": "keep", "content": { <same fact fields> } },',
+    '    { "eventId": "E2", "decision": "drop", "reason": "transient|small talk|duplicate: ..." }',
+    "  ] }",
+    reportedEvents.length > 0
+      ? `eventDecisions MUST contain exactly: ${reportedEvents.map((e) => e.id).join(", ")}`
+      : "There are no reported events in this session; return eventDecisions: [].",
   ].join("\n");
 }

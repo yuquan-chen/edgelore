@@ -10,6 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MemoryGraph } from "../../src/model/store.js";
 import { capture } from "../../src/agent/capture.js";
+import { archiveConversationEvidence } from "../../src/agent/evidence.js";
 import type { StatementNode } from "../../src/model/types.js";
 import type { EmbeddingDriver } from "../../src/agent/embedding-driver.js";
 import {
@@ -46,6 +47,26 @@ test("lexical route: unrelated query returns nothing", async () => {
   capture(graph, { dimensionKey: "owner", value: "charles" }, ctx);
   const hits = await retrieveRelevant(graph, { query: "完全无关的查询内容", mode: "lexical" });
   assert.equal(hits.length, 0); // no bigram overlap -> empty route -> no results
+});
+
+test("lexical route: verbatim assistant evidence preserves exact payloads", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEvidence(
+    graph,
+    [{ role: "assistant", content: "The Plesiosaur has a blue scaly body and a long neck." }],
+    { created_by: "human:charles", source_ref: "session:plesiosaur", createdAt: "2023-05-20" },
+  );
+
+  const hits = await retrieveRelevant(graph, {
+    query: "What color is the Plesiosaur's scaly body?",
+    mode: "lexical",
+  });
+
+  assert.equal(hits[0]?.nodeType, "message");
+  assert.equal(hits[0]?.dimensionKey, "conversationEvidence");
+  assert.equal(hits[0]?.role, "assistant");
+  assert.match(String(hits[0]?.value), /blue scaly body/);
+  assert.deepEqual(expandHit(graph, hits[0]!), { siblings: [], constraints: [] });
 });
 
 test("vector route: fake embedder ranks the semantically-close statement first", async () => {
@@ -101,6 +122,31 @@ test("RRF fusion: mid-rank on TWO routes beats the leader of ONE", async () => {
   // RRF: budget = 1/62 + 1/61 (both routes) beats alpha = 1/61 (vector only)
   assert.equal(hits[0]?.dimensionKey, "budget");
   assert.deepEqual(hits[0]?.via.sort(), ["lexical", "vector"]);
+});
+
+test("RRF fusion returns descending fused scores, not first-route insertion order", async () => {
+  const graph = new MemoryGraph();
+  capture(graph, { dimensionKey: "lexicalOnly", value: "target filler" }, ctx);
+  capture(graph, { dimensionKey: "bothRoutes", value: "target exact" }, ctx);
+  const nodes = graph.queryNodes({ type: "core:statement" }) as StatementNode[];
+  const docs = new Map(nodes.map((node) => [node.id, statementText(graph, node)]));
+  const table = new Map<string, number[]>([["target", [1, 0]]]);
+  for (const [id, text] of docs) {
+    const node = nodes.find((candidate) => candidate.id === id)!;
+    table.set(text, node.dimension_id === graph.queryNodes({ type: "core:dimension" }).find((d) => d.key === "bothRoutes")?.id ? [1, 0] : [0, 1]);
+  }
+  const vectors = new InMemoryVectorStore();
+  for (const [id, text] of docs) vectors.put(id, table.get(text)!);
+
+  const hits = await retrieveRelevant(graph, {
+    query: "target",
+    mode: "hybrid",
+    embedder: new FakeEmbedder(table),
+    vectors,
+  });
+
+  assert.equal(hits[0]?.dimensionKey, "bothRoutes");
+  assert.ok((hits[0]?.score ?? 0) >= (hits[1]?.score ?? 0));
 });
 
 test("mode ablation: vector-only and lexical-only return their own rankings", async () => {

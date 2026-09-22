@@ -161,47 +161,6 @@ test("M0: edge requires existing endpoints", () => {
   );
 });
 
-test("M0: relation assertions require a predicate and existing role-bound nodes", () => {
-  const g = new MemoryGraph();
-  const car = g.addNode({ type: "vehicle:car", key: "current-car", created_by: AGENT });
-  const interior = g.addNode({
-    type: "vehicle:interior",
-    key: "current-car-interior",
-    created_by: AGENT,
-  });
-  assert.throws(
-    () =>
-      g.addNode({
-        type: "core:relation",
-        bindings: { part: interior.id, whole: car.id },
-        created_by: AGENT,
-      }),
-    /predicate/,
-  );
-  assert.throws(
-    () =>
-      g.addNode({
-        type: "core:relation",
-        predicate: "core:part_of",
-        bindings: { part: interior.id },
-        created_by: AGENT,
-      }),
-    /at least two role bindings/,
-  );
-  const relation = g.addNode({
-    type: "core:relation",
-    predicate: "core:part_of",
-    bindings: { part: interior.id, whole: car.id },
-    state: "accepted",
-    created_by: AGENT,
-  });
-  assert.equal(relation.type, "core:relation");
-  assert.deepEqual(
-    (relation as { bindings: Record<string, string> }).bindings,
-    { part: interior.id, whole: car.id },
-  );
-});
-
 test("M0: id generators are well-formed & unique", () => {
   const a = nodeId("core:dimension");
   const b = nodeId("core:dimension");

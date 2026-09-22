@@ -6,12 +6,7 @@
 // Statement storage primitive. Constraint proposals stay on their governed
 // path and are deliberately not authored by this writer.
 
-import type {
-  FactNodeState,
-  NamespacedType,
-  RelationAssertionNode,
-  Scope,
-} from "../model/types.js";
+import type { FactNodeState, NamespacedType, Scope } from "../model/types.js";
 import type { GraphStore } from "../model/store.js";
 import { scopesEqual } from "../model/store.js";
 import { capture, type CaptureContent, type CaptureContext, type CaptureResult } from "./capture.js";
@@ -37,24 +32,7 @@ export interface EntityDraft {
 /** One claim persisted through the existing capture primitive. */
 export interface FactDraft {
   ref: string;
-  /** Optional plan-local alias for capture()'s resolved Dimension node. */
-  dimensionRef?: string;
   content: CaptureContent;
-}
-
-/**
- * A governed structural relation. Role names remain open-world, while the
- * relation itself is a stateful node that may participate in another one.
- */
-export interface RelationAssertionDraft {
-  ref: string;
-  predicate: NamespacedType;
-  /** Open role -> plan-local fact/entity/dimension/relation ref. */
-  bindings: Record<string, string>;
-  /** Fact refs whose trust and provenance support this relation claim. */
-  supportedBy: string[];
-  attributes?: Record<string, unknown>;
-  tags?: string[];
 }
 
 /** Open-world relation between two plan-local facts/entities. */
@@ -70,7 +48,6 @@ export interface GraphWritePlan {
   entities: EntityDraft[];
   facts: FactDraft[];
   relations: RelationDraft[];
-  relationAssertions?: RelationAssertionDraft[];
 }
 
 export interface GraphWriteResult {
@@ -78,13 +55,11 @@ export interface GraphWriteResult {
   refs: Record<string, string>;
   captures: CaptureResult[];
   createdEntityIds: string[];
-  createdRelationIds: string[];
   createdEdgeIds: string[];
 }
 
 function validatePlan(plan: GraphWritePlan): void {
   const refs = new Set<string>();
-  const factRefs = new Set<string>();
   const addRef = (ref: string, label: string) => {
     if (!ref) throw new AgentError(`${label}.ref must be non-empty`);
     if (refs.has(ref)) throw new AgentError(`duplicate graph-write ref: ${ref}`);
@@ -94,48 +69,7 @@ function validatePlan(plan: GraphWritePlan): void {
     addRef(entity.ref, "entity");
     if (!entity.key) throw new AgentError(`entity "${entity.ref}" requires a stable key`);
   }
-  for (const fact of plan.facts) {
-    addRef(fact.ref, "fact");
-    factRefs.add(fact.ref);
-    if (fact.dimensionRef) addRef(fact.dimensionRef, "fact.dimensionRef");
-  }
-  for (const assertion of plan.relationAssertions ?? []) {
-    addRef(assertion.ref, "relationAssertion");
-  }
-  for (const assertion of plan.relationAssertions ?? []) {
-    if (Object.keys(assertion.bindings).length < 2) {
-      throw new AgentError(
-        `relation assertion "${assertion.ref}" requires at least two role bindings`,
-      );
-    }
-    for (const [role, ref] of Object.entries(assertion.bindings)) {
-      if (!/^[a-z][a-zA-Z0-9_]*$/.test(role)) {
-        throw new AgentError(
-          `relation assertion "${assertion.ref}" has invalid role: ${role}`,
-        );
-      }
-      if (!refs.has(ref)) {
-        throw new AgentError(
-          `relation assertion "${assertion.ref}" has unknown binding ref: ${ref}`,
-        );
-      }
-      if (factRefs.has(ref)) {
-        throw new AgentError(
-          `relation assertion "${assertion.ref}" cannot bind Statement ref ${ref}; use supportedBy`,
-        );
-      }
-    }
-    if (assertion.supportedBy.length === 0) {
-      throw new AgentError(`relation assertion "${assertion.ref}" requires supporting facts`);
-    }
-    for (const ref of assertion.supportedBy) {
-      if (!factRefs.has(ref)) {
-        throw new AgentError(
-          `relation assertion "${assertion.ref}" has unknown supporting fact: ${ref}`,
-        );
-      }
-    }
-  }
+  for (const fact of plan.facts) addRef(fact.ref, "fact");
   for (const relation of plan.relations) {
     if (!refs.has(relation.from)) {
       throw new AgentError(`relation ${relation.type} has unknown from ref: ${relation.from}`);
@@ -180,7 +114,6 @@ export function commitGraphWritePlan(
     const refs: Record<string, string> = {};
     const captures: CaptureResult[] = [];
     const createdEntityIds: string[] = [];
-    const createdRelationIds: string[] = [];
     const createdEdgeIds: string[] = [];
 
     // Facts are committed first so entity state can be derived from the
@@ -191,7 +124,6 @@ export function commitGraphWritePlan(
         throw new AgentError(`capture returned no statement id for fact ref: ${draft.ref}`);
       }
       refs[draft.ref] = result.statementId;
-      if (draft.dimensionRef) refs[draft.dimensionRef] = result.dimensionId;
       captures.push(result);
     }
 
@@ -236,88 +168,6 @@ export function commitGraphWritePlan(
       createdEntityIds.push(node.id);
     }
 
-    // RelationAssertions are reified hyperedges. Resolve them after ordinary
-    // participants, with a small topological loop so one relation may bind to
-    // another relation assertion without turning semantic claims into bare
-    // entity-to-entity edges.
-    const pending = [...(plan.relationAssertions ?? [])];
-    while (pending.length > 0) {
-      const readyIndex = pending.findIndex((draft) =>
-        Object.values(draft.bindings).every((ref) => refs[ref] !== undefined),
-      );
-      if (readyIndex === -1) {
-        throw new AgentError(
-          `unresolvable relation assertion bindings: ${pending.map((draft) => draft.ref).join(", ")}`,
-        );
-      }
-      const draft = pending.splice(readyIndex, 1)[0]!;
-      const bindings = Object.fromEntries(
-        Object.entries(draft.bindings).map(([role, ref]) => [role, refs[ref] as string]),
-      );
-      const supportIds = [...new Set(draft.supportedBy.map((ref) => refs[ref] as string))];
-      const state = supportIds.some((id) => graph.getNode(id)?.state === "accepted")
-        ? "accepted"
-        : "tentative";
-      const matches = (graph.queryNodes({ type: "core:relation" }) as RelationAssertionNode[])
-        .filter(
-          (node) =>
-            node.predicate === draft.predicate &&
-            bindingsEqual(node.bindings, bindings) &&
-            scopesEqual(node.scope, ctx.scope),
-        );
-      if (matches.length > 1) {
-        throw new AgentError(
-          `ambiguous relation identity for ${draft.predicate} ${JSON.stringify(bindings)}`,
-        );
-      }
-      let relation = matches[0];
-      if (!relation) {
-        relation = graph.addNode({
-          type: "core:relation",
-          predicate: draft.predicate,
-          bindings,
-          state,
-          scope: ctx.scope,
-          attributes: draft.attributes,
-          tags: draft.tags,
-          created_by: ctx.created_by,
-          created_at: ctx.createdAt,
-          source_refs: ctx.source_refs,
-        }) as RelationAssertionNode;
-        createdRelationIds.push(relation.id);
-      } else if (relation.state === "tentative" && state === "accepted") {
-        graph.transitionNodeState(relation.id, "accepted");
-      }
-      refs[draft.ref] = relation.id;
-
-      if (state === "accepted") {
-        for (const participantId of Object.values(bindings)) {
-          const participant = graph.getNode(participantId);
-          if (participant?.state === "tentative") {
-            graph.transitionNodeState(participantId, "accepted");
-          }
-        }
-      }
-
-      for (const supportId of supportIds) {
-        const duplicate = graph
-          .queryEdges({ type: "core:supports", from: supportId, to: relation.id })
-          .find((edge) => scopesEqual(edge.scope, ctx.scope));
-        if (duplicate) continue;
-        const edge = graph.addEdge({
-          type: "core:supports",
-          from: supportId,
-          to: relation.id,
-          scope: ctx.scope,
-          created_by: ctx.created_by,
-          created_at: ctx.createdAt,
-          source_refs: ctx.source_refs,
-          attributes: { role: "evidence" },
-        });
-        createdEdgeIds.push(edge.id);
-      }
-    }
-
     for (const draft of plan.relations) {
       const from = refs[draft.from];
       const to = refs[draft.to];
@@ -340,14 +190,8 @@ export function commitGraphWritePlan(
       createdEdgeIds.push(edge.id);
     }
 
-    return { refs, captures, createdEntityIds, createdRelationIds, createdEdgeIds };
+    return { refs, captures, createdEntityIds, createdEdgeIds };
   });
-}
-
-function bindingsEqual(a: Record<string, string>, b: Record<string, string>): boolean {
-  const aEntries = Object.entries(a).sort(([left], [right]) => left.localeCompare(right));
-  const bEntries = Object.entries(b).sort(([left], [right]) => left.localeCompare(right));
-  return JSON.stringify(aEntries) === JSON.stringify(bEntries);
 }
 
 /** Entity identity is accepted when at least one accepted Statement supports

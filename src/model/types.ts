@@ -162,20 +162,6 @@ export interface StatementNode extends BaseNode {
   attributes: Record<string, unknown>;
 }
 
-/**
- * A governed N-ary relation claim. Unlike a bare GraphEdge, the relation is a
- * first-class fact node: it has acceptance state, provenance, open role names,
- * and can itself participate in another RelationAssertion.
- */
-export interface RelationAssertionNode extends BaseNode {
-  type: "core:relation";
-  /** Open-world relation meaning, e.g. core:part_of or core:instance_of. */
-  predicate: NamespacedType;
-  /** Open role -> participant node id, e.g. { part, whole }. */
-  bindings: Record<string, string>;
-  attributes: Record<string, unknown>;
-}
-
 /** All built-in core node shapes. */
 export type CoreNode =
   | ActorNode
@@ -184,8 +170,7 @@ export type CoreNode =
   | MessageNode
   | SourceNode
   | DimensionNode
-  | StatementNode
-  | RelationAssertionNode;
+  | StatementNode;
 
 /** Any node whose type lives outside the `core:` namespace. */
 export interface OpenNode extends BaseNode {
@@ -209,7 +194,6 @@ export type CoreEdgeType =
   | "core:refines" // statement -> earlier statement (adds compatible detail)
   | "core:contradicts" // statement -> incompatible statement
   | "core:supersedes" // node -> node (correction / replacement)
-  | "core:supports" // statement -> relation assertion
   | "core:participates_in"; // dimension -> constraint (index of hyperedge)
 
 export interface GraphEdge extends Provenance {
@@ -223,7 +207,7 @@ export interface GraphEdge extends Provenance {
 }
 
 // ---------------------------------------------------------------------------
-// Constraint (the hyperedge / multi-arity rule). M0 spec §2.4.
+// Constraint (the hyperedge / multi-arity rule). M0 spec §2.3.
 // ---------------------------------------------------------------------------
 
 /**

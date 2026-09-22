@@ -81,7 +81,6 @@
 | `core:source` | 出处 | `ref` |
 | `core:statement` | 某维度的一个候选值 | `value`, `dimension_id` |
 | `core:dimension` | 维度身份（如"项目 P 的设计费"） | `key`, `project_id`, `phase_id` |
-| `core:relation` | 有状态、可追溯的 N 元关系声明 | `predicate`, `bindings` |
 
 > 维度身份唯一（同 project+phase+key 只有一个 dimension）；其下可有多个来源不同的 `core:statement`（D02）。
 
@@ -98,46 +97,11 @@
 | `core:refines` | statement → statement | 为已有事实补充兼容细节 |
 | `core:contradicts` | statement → statement | 两条事实在同一语境下不能同时成立 |
 | `core:supersedes` | node → node | 被纠正 / 取代 |
-| `core:supports` | statement → relation | Statement 为关系声明提供证据 |
 | `core:participates_in` | dimension → constraint | 超边成员（与 `constraint.participants` 互为索引） |
 
 边的基础字段同样含 `created_by` / `created_at` / `schema_version`。
 
-### 2.3 RelationAssertion（有状态的关系超边）
-
-语义关系不能只是一条裸边。裸边没有独立状态，无法表达“助手提出、用户确认、出现冲突、后来被取代”，也无法让一条关系参与另一条关系。因此结构关系被具体化为 `core:relation` 节点：
-
-```text
-RelationAssertion {
-  type:       "core:relation"
-  predicate:  "core:part_of"             // open-world namespaced type
-  bindings:   { part: node_id,
-                whole: node_id }          // open role -> participant
-  state:      accepted | tentative | conflict | superseded | rejected
-  provenance: ...
-}
-```
-
-`bindings` 的角色名是开放的，不预先声明业务属性。二元关系、多元关系以及“关系之间的关系”使用同一个结构；因为 RelationAssertion 自己也是节点，它可以成为另一条 RelationAssertion 的参与者。
-
-例如“这辆车的内饰”允许多重归属，而不是被迫放进一棵树：
-
-```text
-core:part_of
-  { part: 当前车辆的内饰, whole: 当前车辆 }
-
-core:instance_of
-  { instance: 当前车辆的内饰, class: 装饰 }
-
-core:dimension_of
-  { dimension: carInteriorProtectionTips, subject: 当前车辆的内饰 }
-```
-
-每条关系至少由一个 Statement 通过 `core:supports` 提供证据。关系状态由支持它的 Statement 的信任状态导出：只有 tentative 支持时关系保持 tentative；出现 accepted 支持后才可转为 accepted。这样实体结构不会绕开 Statement 的 provenance 和信任边界。
-
-GraphEdge 仍然保留，用于 `core:about`、`core:supports` 等索引/证据连接；需要独立判断真假的领域语义使用 RelationAssertion。
-
-### 2.4 Constraint（规则超边 / 约束节点）★ 核心
+### 2.3 Constraint（超边 / 约束节点）★ 核心
 
 ```
 Constraint {

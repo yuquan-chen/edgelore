@@ -190,6 +190,7 @@ export type CoreEdgeType =
   | "core:has_source" // statement -> source
   | "core:belongs_to" // dimension -> project|deliverable
   | "core:branch" // node -> node (git-like branch)
+  | "core:equivalent_to" // statement -> materially duplicate statement
   | "core:refines" // statement -> earlier statement (adds compatible detail)
   | "core:contradicts" // statement -> incompatible statement
   | "core:supersedes" // node -> node (correction / replacement)

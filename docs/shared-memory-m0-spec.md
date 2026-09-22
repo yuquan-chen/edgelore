@@ -93,6 +93,9 @@
 | `core:has_source` | statement → source | 出处 |
 | `core:belongs_to` | dimension → (project \| deliverable) | 维度归属 |
 | `core:branch` | node → node | 类 Git 分支 / 版本（D04） |
+| `core:equivalent_to` | statement → statement | 语义等价 / 重复事实（保留各自 provenance） |
+| `core:refines` | statement → statement | 为已有事实补充兼容细节 |
+| `core:contradicts` | statement → statement | 两条事实在同一语境下不能同时成立 |
 | `core:supersedes` | node → node | 被纠正 / 取代 |
 | `core:participates_in` | dimension → constraint | 超边成员（与 `constraint.participants` 互为索引） |
 

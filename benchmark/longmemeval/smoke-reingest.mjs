@@ -16,6 +16,7 @@ import {
   capture,
   buildBatchExtractionPrompt,
   normalizeBatchContents,
+  scanEventCandidates,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
 
@@ -126,6 +127,9 @@ for (const t of targets) {
       transcript,
       knownDimensions: knownDims(),
       maxFacts: cfg.extraction.maxFactsPerSession,
+      // 以下两项与 ingest.mjs 对齐（此前 smoke 缺 sessionDate，日期锚定没被质检到）
+      sessionDate: t.date || undefined,
+      mustConsiderEvents: scanEventCandidates(transcript).map((c) => c.sentence),
     };
     let parsed = parseJsonReply(await driver.complete(buildBatchExtractionPrompt(promptOpts)));
     let batch = normalizeBatchContents(parsed.contents ?? []);

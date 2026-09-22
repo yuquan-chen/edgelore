@@ -89,7 +89,6 @@ function union(a, b) {
   parent.set(find(a), find(b));
 }
 
-const comparisons = dims.length * (dims.length - 1) / 2;
 let mergePairs = 0;
 for (let i = 0; i < dims.length; i++) {
   for (let j = i + 1; j < dims.length; j++) {
@@ -128,7 +127,7 @@ const countStmts = db.prepare(
 
 let totalMoved = 0;
 let totalMerged = 0;
-for (const [rootId, group] of groups) {
+for (const [, group] of groups) {
   if (group.length <= 1) continue;
   // canonical: the dim with the most statements (keep the "heaviest" one)
   const withCounts = group.map((d) => ({

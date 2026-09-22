@@ -199,6 +199,11 @@ export interface BatchExtractionPromptInput {
   maxFacts: number;
   /** ISO date anchoring relative-time resolution ("two months ago"). */
   sessionDate?: string;
+  /** Sentences flagged by the event scan (src/agent/triggers.ts): the
+   * speaker's own experiences paired with a time expression. Each one must
+   * get an explicit keep/drop decision — the scan guarantees they are SEEN;
+   * the normal worth-storing rules still decide what is KEPT. */
+  mustConsiderEvents?: readonly string[];
   /** Extra fragments appended to the rules zone (retry nudges). */
   extraFragments?: readonly string[];
 }
@@ -263,6 +268,21 @@ export function buildBatchExtractionPrompt(input: BatchExtractionPromptInput): s
     "  write English; if Chinese, write Chinese. NEVER switch languages mid-session.",
     "- Dimension keys stay English regardless of session language.",
     "",
+    ...(input.mustConsiderEvents && input.mustConsiderEvents.length > 0
+      ? [
+          "### Reported experiences (decide every one)",
+          "",
+          "The sentences below pair the speaker's own words with a specific time. For",
+          "EACH one, make an explicit decision: keep it as an entry when it is a one-off",
+          "event or lasting fact (purchases, milestones, incidents, visits, things",
+          "acquired, given away, or given up), and drop it only when it is transient",
+          "state, small talk, or a duplicate of another entry. Skipping a flagged",
+          "sentence without a decision is not allowed.",
+          "",
+          ...input.mustConsiderEvents.map((s) => `- ${s}`),
+          "",
+        ]
+      : []),
     "### Known dimensions",
     "(REUSE one of these keys if a fact is the same slot — never mint a new key for",
     "an existing concept)",

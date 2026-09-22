@@ -20,6 +20,7 @@ import {
   buildBatchExtractionPrompt,
   normalizeBatchContents,
   relevantDimensionsOf,
+  scanEventCandidates,
   usageTotals,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
@@ -173,6 +174,8 @@ for (const [sid, session] of sessions) {
       knownDimensions: relevantDimensionsOf(graph, transcript, 30),
       maxFacts: cfg.extraction.maxFactsPerSession,
       sessionDate: session.date || undefined,
+      // 事件扫描（触发层 v0）：旁插的"我 + 时间"句必须被逐条裁决，防静默丢失
+      mustConsiderEvents: scanEventCandidates(transcript).map((c) => c.sentence),
     };
     let parsed = parseJsonReply(await driver.complete(buildBatchExtractionPrompt(promptOpts)));
     let batch = normalizeBatchContents(parsed.contents ?? []);

@@ -5,8 +5,6 @@
 // read the totals at end-of-run (answer.mjs / ingest.mjs / cli print).
 // Local JSONL log for post-hoc cost analysis; no external service.
 
-import { AgentError } from "./errors.js";
-
 export interface UsageEntry {
   /** Pipeline stage identifier: "gate" | "extract" | "answer" | "embedding" | "decision" | "unknown". */
   stage: string;

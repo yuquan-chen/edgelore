@@ -17,6 +17,8 @@ import type {
   StatementNode,
 } from "../model/types.js";
 import type { GraphStore } from "../model/store.js";
+import { scopesEqual } from "../model/store.js";
+import type { Scope } from "../model/types.js";
 import { AgentError } from "./errors.js";
 
 /** ② Agent-operated content — the ONLY fields the Agent authors. This is the
@@ -51,6 +53,8 @@ export interface CaptureContext {
   created_by: string;
   /** Resolved source references (message / conversation ids). */
   source_refs: string[];
+  /** Identity boundary. Equal dimension keys in different scopes stay apart. */
+  scope?: Scope;
   /** When the fact was actually said — for importing historical data. Omit
    * for live captures (defaults to now). ISO-8601. */
   createdAt?: string;
@@ -89,9 +93,11 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
   }
   const saidByAssistant = content.saidBy === "assistant";
 
-  // 1. Resolve dimension (global scope in M3; scope is a future extension).
+  // 1. Resolve dimension by stable key INSIDE the caller's identity scope.
   const dimensions = graph.queryNodes({ type: "core:dimension" }) as DimensionNode[];
-  const existing = dimensions.find((d) => d.key === content.dimensionKey);
+  const existing = dimensions.find(
+    (d) => d.key === content.dimensionKey && scopesEqual(d.scope, ctx.scope),
+  );
   let dimension: GraphNode;
   let created = false;
   if (existing) {
@@ -101,6 +107,9 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
       type: "core:dimension",
       key: content.dimensionKey,
       cardinality: content.cardinality ?? "multi",
+      scope: ctx.scope,
+      project_id: ctx.scope?.project_id,
+      phase_id: ctx.scope?.phase_id,
       // description rides in open metadata (M0 §1.3: narrow state, wide
       // metadata) — it is what future extractors match phrases against.
       attributes: content.description ? { description: content.description } : {},
@@ -175,6 +184,7 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
     created_by: ctx.created_by,
     created_at: ctx.createdAt,
     source_refs: ctx.source_refs,
+    scope: ctx.scope,
   }) as StatementNode;
 
   // Only USER-side tentative states flag the dimension (see above).

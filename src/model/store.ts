@@ -130,8 +130,28 @@ function assertValidId(id: string, label = "id"): void {
 export interface GraphQueryFilter {
   type?: NamespacedType;
   state?: FactNodeState;
+  key?: string;
+  owner_id?: string;
   project_id?: string;
   phase_id?: string;
+}
+
+export interface GraphEdgeQueryFilter {
+  type?: NamespacedType;
+  from?: string;
+  to?: string;
+  owner_id?: string;
+  project_id?: string;
+  phase_id?: string;
+}
+
+/** Exact scope equality. Missing scope means the shared/global scope. */
+export function scopesEqual(a?: Scope, b?: Scope): boolean {
+  return (
+    a?.owner_id === b?.owner_id &&
+    a?.project_id === b?.project_id &&
+    a?.phase_id === b?.phase_id
+  );
 }
 
 export interface GraphStore {
@@ -139,6 +159,10 @@ export interface GraphStore {
   getNode(id: string): GraphNode | undefined;
   queryNodes(filter: GraphQueryFilter): GraphNode[];
   transitionNodeState(id: string, to: FactNodeState): GraphNode;
+  addEdge(input: AddEdgeInput): GraphEdge;
+  queryEdges(filter: GraphEdgeQueryFilter): GraphEdge[];
+  /** Execute a graph mutation atomically for both memory and durable stores. */
+  transaction<T>(fn: () => T): T;
 }
 
 export class MemoryGraph implements GraphStore {
@@ -201,7 +225,12 @@ export class MemoryGraph implements GraphStore {
         };
         break;
       default:
-        node = base;
+        node = {
+          ...base,
+          ...(input.key !== undefined ? { key: input.key } : {}),
+          ...(input.value !== undefined ? { value: input.value } : {}),
+          ...(input.unit !== undefined ? { unit: input.unit } : {}),
+        };
     }
 
     this.nodes.set(node.id, node);
@@ -257,6 +286,20 @@ export class MemoryGraph implements GraphStore {
 
   getEdge(id: string): GraphEdge | undefined {
     return this.edges.get(id);
+  }
+
+  queryEdges(filter: GraphEdgeQueryFilter): GraphEdge[] {
+    const out: GraphEdge[] = [];
+    for (const edge of this.edges.values()) {
+      if (filter.type && edge.type !== filter.type) continue;
+      if (filter.from && edge.from !== filter.from) continue;
+      if (filter.to && edge.to !== filter.to) continue;
+      if (filter.owner_id && edge.scope?.owner_id !== filter.owner_id) continue;
+      if (filter.project_id && edge.scope?.project_id !== filter.project_id) continue;
+      if (filter.phase_id && edge.scope?.phase_id !== filter.phase_id) continue;
+      out.push(edge);
+    }
+    return out;
   }
 
   // ---------------------------------------------------------- constraints
@@ -389,11 +432,27 @@ export class MemoryGraph implements GraphStore {
     for (const n of this.nodes.values()) {
       if (filter.type && n.type !== filter.type) continue;
       if (filter.state && n.state !== filter.state) continue;
+      if (filter.key && n.key !== filter.key) continue;
+      if (filter.owner_id && n.scope?.owner_id !== filter.owner_id) continue;
       if (filter.project_id && n.scope?.project_id !== filter.project_id) continue;
       if (filter.phase_id && n.scope?.phase_id !== filter.phase_id) continue;
       out.push(n);
     }
     return out;
+  }
+
+  transaction<T>(fn: () => T): T {
+    const nodesBefore = structuredClone(this.nodes);
+    const edgesBefore = structuredClone(this.edges);
+    const constraintsBefore = structuredClone(this.constraints);
+    try {
+      return fn();
+    } catch (error) {
+      this.nodes = nodesBefore;
+      this.edges = edgesBefore;
+      this.constraints = constraintsBefore;
+      throw error;
+    }
   }
 
   getAllNodes(): GraphNode[] {

@@ -158,6 +158,27 @@ export class SqliteGraph extends MemoryGraph {
     return c;
   }
 
+  override transaction<T>(fn: () => T): T {
+    const nodesBefore = structuredClone(this.nodes);
+    const edgesBefore = structuredClone(this.edges);
+    const constraintsBefore = structuredClone(this.constraints);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = fn();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } finally {
+        this.nodes = nodesBefore;
+        this.edges = edgesBefore;
+        this.constraints = constraintsBefore;
+      }
+      throw error;
+    }
+  }
+
   private persistConstraint(c: Constraint): void {
     this.db
       .prepare("INSERT OR REPLACE INTO constraints (id, kind, state, data) VALUES (?, ?, ?, ?)")

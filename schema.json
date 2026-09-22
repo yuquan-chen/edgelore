@@ -13,6 +13,7 @@
     "scope": {
       "type": "object",
       "properties": {
+        "owner_id": { "type": "string" },
         "project_id": { "type": "string" },
         "phase_id": { "type": "string" }
       },

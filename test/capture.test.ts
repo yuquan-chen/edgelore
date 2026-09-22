@@ -262,3 +262,29 @@ test("capture: invalid saidBy is rejected", () => {
     );
   });
 });
+
+test("capture: equal keys in different owner scopes create different dimensions", () => {
+  forBackend((g) => {
+    const alice = capture(g, { dimensionKey: "familyTrips", value: "Hawaii" }, {
+      ...ctx,
+      scope: { owner_id: "actor:alice" },
+    });
+    const bob = capture(g, { dimensionKey: "familyTrips", value: "Hawaii" }, {
+      ...ctx,
+      scope: { owner_id: "actor:bob" },
+    });
+    assert.notEqual(alice.dimensionId, bob.dimensionId);
+    assert.equal(g.getNode(alice.dimensionId)?.scope?.owner_id, "actor:alice");
+    assert.equal(g.getNode(bob.dimensionId)?.scope?.owner_id, "actor:bob");
+  });
+});
+
+test("capture: equal keys in the same owner scope reuse one dimension", () => {
+  forBackend((g) => {
+    const scoped = { ...ctx, scope: { owner_id: "actor:alice" } };
+    const first = capture(g, { dimensionKey: "familyTrips", value: "Hawaii" }, scoped);
+    const second = capture(g, { dimensionKey: "familyTrips", value: "Paris" }, scoped);
+    assert.equal(first.dimensionId, second.dimensionId);
+    assert.equal(g.queryNodes({ type: "core:dimension", owner_id: "actor:alice" }).length, 1);
+  });
+});

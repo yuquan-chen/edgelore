@@ -6,6 +6,7 @@
 // orchestrates: gate -> extract -> (runtime injects provenance) -> capture.
 
 export * from "./capture.js";
+export * from "./graph-write.js";
 export * from "./errors.js";
 export * from "./llm-driver.js";
 export * from "./prompt.js";

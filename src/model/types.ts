@@ -39,6 +39,8 @@ export interface Provenance {
 
 /** Applicability boundary for a node / edge / constraint (M0 spec §2, Q06). */
 export interface Scope {
+  /** Person / account whose memory this object belongs to. */
+  owner_id?: string;
   project_id?: string;
   phase_id?: string;
 }
@@ -83,6 +85,12 @@ export interface BaseNode extends Provenance {
   attributes: Record<string, unknown>;
   /** Open labels — the other extension point. */
   tags: string[];
+  /** Optional stable identity within `type + scope` for open-world entities. */
+  key?: string;
+  /** Optional generic payload for open-world entities. */
+  value?: unknown;
+  /** Optional unit accompanying a generic payload. */
+  unit?: string;
   /**
    * Cardinality — how many accepted statements a dimension may hold.
    * Carried on every node for model flatness (everything is a Node, no
@@ -178,10 +186,12 @@ export type GraphNode = CoreNode | OpenNode;
 /** Built-in core edge kinds (M0 spec §2.2). */
 export type CoreEdgeType =
   | "core:said_by" // statement -> actor
-  | "core:about" // statement -> project|deliverable|dimension
+  | "core:about" // statement -> the entity / event the claim describes
   | "core:has_source" // statement -> source
   | "core:belongs_to" // dimension -> project|deliverable
   | "core:branch" // node -> node (git-like branch)
+  | "core:refines" // statement -> earlier statement (adds compatible detail)
+  | "core:contradicts" // statement -> incompatible statement
   | "core:supersedes" // node -> node (correction / replacement)
   | "core:participates_in"; // dimension -> constraint (index of hyperedge)
 

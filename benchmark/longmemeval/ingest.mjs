@@ -20,6 +20,7 @@ import {
   buildBatchExtractionPrompt,
   normalizeBatchContents,
   relevantDimensionsOf,
+  usageTotals,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
 
@@ -227,3 +228,5 @@ for (const [sid, session] of sessions) {
 const dims = graph.queryNodes({ type: "core:dimension" }).length;
 console.log(`\ndone: ${processed} sessions this run, ${factsStored} facts this run`);
 console.log(`store: ${dims} dimensions, ${graph.queryNodes({ type: "core:statement" }).length} statements`);
+const usage = usageTotals();
+console.log(`API usage: ${usage.calls} calls, ${usage.inputTokens} input tokens, ${usage.outputTokens} output tokens, ${usage.errors} errors`);

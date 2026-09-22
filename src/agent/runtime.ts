@@ -53,6 +53,7 @@ export interface TurnOutcome {
     enriched: boolean;
     createdEntities: number;
     createdEdges: number;
+    warnings?: string[];
     error?: string;
   };
 }
@@ -180,6 +181,7 @@ export async function processTurn(
         enriched: true,
         createdEntities: result.createdEntityIds.length,
         createdEdges: result.createdEdgeIds.length,
+        ...(plan.warnings.length > 0 ? { warnings: plan.warnings } : {}),
       };
     } catch (err) {
       captures = extract.contents.map((content) => capture(graph, content, ctx));

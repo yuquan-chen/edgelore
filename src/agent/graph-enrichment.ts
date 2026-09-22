@@ -7,7 +7,7 @@
 
 import type { GraphStore } from "../model/store.js";
 import { scopesEqual } from "../model/store.js";
-import type { GraphNode, NamespacedType, Scope } from "../model/types.js";
+import type { DimensionNode, GraphNode, NamespacedType, Scope, StatementNode } from "../model/types.js";
 import type { CaptureContent } from "./capture.js";
 import { AgentError } from "./errors.js";
 import type { EntityDraft, GraphWritePlan, RelationDraft } from "./graph-write.js";
@@ -17,6 +17,11 @@ import type { KnownDimension } from "./prompt.js";
 const LOWER_CAMEL_CASE = /^[a-z][a-zA-Z0-9]*$/;
 const NAMESPACED_TYPE = /^[a-z][a-z0-9._-]*:[a-z][a-z0-9._-]*$/i;
 const FACT_REF = (index: number) => `fact:${index}`;
+const GOVERNED_STATEMENT_RELATIONS = new Set([
+  "core:contradicts",
+  "core:refines",
+  "core:supersedes",
+]);
 
 export interface GraphEnrichmentInput {
   text: string;
@@ -28,11 +33,23 @@ export interface GraphEnrichmentInput {
   maxEntityHints?: number;
 }
 
+export interface GraphEnrichmentPlan extends GraphWritePlan {
+  /** Recoverable model-output defects. Facts remain complete; only the bad
+   * entity/relation is omitted or rewritten. */
+  warnings: string[];
+}
+
 interface FactMapping {
   factRef: string;
   dimensionKey: string;
   dimensionDescription?: string;
   cardinality?: "single" | "multi";
+}
+
+export interface DimensionHint extends KnownDimension {
+  /** A small, bounded sample makes semantic reuse possible even when keys use
+   * different wording (for example gasMileage vs carPerformanceMetrics). */
+  sampleValues: unknown[];
 }
 
 export interface EntityHint {
@@ -49,8 +66,10 @@ export interface EntityHint {
  * and speaker attribution are copied from the trusted extraction result and
  * are never accepted back from the model.
  */
-export async function runGraphEnrichment(input: GraphEnrichmentInput): Promise<GraphWritePlan> {
-  if (input.contents.length === 0) return { entities: [], facts: [], relations: [] };
+export async function runGraphEnrichment(input: GraphEnrichmentInput): Promise<GraphEnrichmentPlan> {
+  if (input.contents.length === 0) {
+    return { entities: [], facts: [], relations: [], warnings: [] };
+  }
 
   const hints = entityHintsOf(
     input.graph,
@@ -60,18 +79,22 @@ export async function runGraphEnrichment(input: GraphEnrichmentInput): Promise<G
   const prompt = buildGraphEnrichmentPrompt({
     text: input.text,
     contents: input.contents,
-    knownDimensions: input.knownDimensions,
+    dimensionHints: dimensionHintsOf(input.graph, input.knownDimensions, input.scope),
     entityHints: hints,
+    relationTypes: [...new Set(input.graph.queryEdges({}).map((edge) => edge.type))].slice(0, 40),
   });
   const parsed = parseJsonReply(await input.driver.complete(prompt));
-  return normalizeGraphEnrichment(parsed, input.contents);
+  const plan = normalizeGraphEnrichment(parsed, input.contents);
+  guardDimensionRemapping(plan, input.contents);
+  return plan;
 }
 
 export interface GraphEnrichmentPromptInput {
   text: string;
   contents: readonly CaptureContent[];
-  knownDimensions: readonly KnownDimension[];
+  dimensionHints: readonly DimensionHint[];
   entityHints: readonly EntityHint[];
+  relationTypes: readonly NamespacedType[];
 }
 
 /** Prompt is exported so benchmark smoke tests can inspect the contract. */
@@ -85,19 +108,23 @@ export function buildGraphEnrichmentPrompt(input: GraphEnrichmentPromptInput): s
   return [
     "You organize already-extracted memories into a reusable graph.",
     "This is NOT another extraction pass. Preserve every supplied fact exactly once; never add, drop, merge, or rewrite a fact value.",
-    "Choose reusable subject-free dimension categories. A destination or event instance belongs in an entity, not in the dimension key: use familyTrips for both a Hawaii trip and a Paris trip, never familyTripHawaii/familyTripParis.",
+    "Choose reusable subject-free dimension categories. A Dimension is the reusable QUESTION/CATEGORY; its Statements are the answers or event instances. A destination, person, product, date, or event identity belongs in an entity/Statement, never in the dimension key.",
+    "For every factMapping, dimensionKey MUST be either an exact key from Known dimensions or NEW:<lowerCamelCase>. Reuse an existing key whenever its sample values answer the same kind of question, even if its wording differs. Use NEW: only when no existing Dimension can hold the fact.",
+    "Example: Hawaii and Paris family trips both map to familyTrips; their destinations and trip instances differ only in entities/Statements. Never create familyTripHawaii/familyTripParis.",
     "Represent a distinct real-world occurrence as an event entity (for example travel:trip). Reuse an existing entity only when it is the same identity, not merely a similar kind.",
     "All claim-sensitive semantic relations MUST start at a factRef (the persisted Statement), so their trust follows that statement. Use core:about from a fact to its main entity/event.",
+    "Never output core:contradicts, core:refines, or core:supersedes. Those epistemic decisions belong to a separate governed fact reconciler, not graph organization.",
     "Never output ids, provenance, timestamps, state, saidBy, or fact values. The runtime owns those fields.",
     "Entity and relation types are open-world namespaced strings such as travel:trip, geo:place, travel:destination, or core:about.",
-    `Known dimensions:\n${JSON.stringify(input.knownDimensions)}`,
+    `Known dimensions with real stored examples:\n${JSON.stringify(input.dimensionHints)}`,
     `Existing entities in the applicable context (reuse type+key only for the same identity):\n${JSON.stringify(input.entityHints)}`,
+    `Existing relation types (reuse when the meaning matches; invent a new namespaced type only when necessary):\n${JSON.stringify(input.relationTypes)}`,
     `Immutable extracted facts:\n${JSON.stringify(facts)}`,
     `Source conversation:\n${input.text}`,
     `Respond with ONLY one JSON object:
 {
   "factMappings": [
-    {"factRef":"fact:0","dimensionKey":"familyTrips","dimensionDescription":"Family travel experiences","cardinality":"multi"}
+    {"factRef":"fact:0","dimensionKey":"NEW:familyTrips","dimensionDescription":"Family travel experiences","cardinality":"multi"}
   ],
   "entities": [
     {"ref":"tripHawaii","type":"travel:trip","key":"hawaii-2023-05","value":"Hawaii family trip","scope":"context"},
@@ -115,7 +142,7 @@ export function buildGraphEnrichmentPrompt(input: GraphEnrichmentPromptInput): s
 export function normalizeGraphEnrichment(
   raw: unknown,
   contents: readonly CaptureContent[],
-): GraphWritePlan {
+): GraphEnrichmentPlan {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     throw new AgentError("graph enrichment reply must be a JSON object");
   }
@@ -162,21 +189,65 @@ export function normalizeGraphEnrichment(
     };
   });
 
-  const entities = reply.entities.map(normalizeEntityDraft);
-  const allRefs = new Set(facts.map((fact) => fact.ref));
-  for (const entity of entities) {
-    if (allRefs.has(entity.ref)) throw new AgentError(`duplicate graph enrichment ref: ${entity.ref}`);
-    allRefs.add(entity.ref);
-  }
-  const relations = reply.relations.map((value) => normalizeRelationDraft(value, allRefs));
-  for (const relation of relations) {
-    if (!expectedRefs.has(relation.from)) {
-      throw new AgentError(
-        `claim-sensitive relation ${relation.type} must start at a factRef, got: ${relation.from}`,
-      );
+  const warnings: string[] = [];
+  const entities: EntityDraft[] = [];
+  for (const value of reply.entities) {
+    try {
+      entities.push(normalizeEntityDraft(value));
+    } catch (err) {
+      warnings.push((err as Error).message);
     }
   }
-  return { entities, facts, relations };
+  const allRefs = new Set(facts.map((fact) => fact.ref));
+  const uniqueEntities: EntityDraft[] = [];
+  for (const entity of entities) {
+    if (allRefs.has(entity.ref)) {
+      warnings.push(`duplicate graph enrichment ref skipped: ${entity.ref}`);
+      continue;
+    }
+    allRefs.add(entity.ref);
+    uniqueEntities.push(entity);
+  }
+  const relationCandidates: RelationDraft[] = [];
+  for (const value of reply.relations) {
+    try {
+      const relation = normalizeRelationDraft(value, allRefs);
+      if (GOVERNED_STATEMENT_RELATIONS.has(relation.type)) {
+        warnings.push(`governed statement relation skipped during enrichment: ${relation.type}`);
+        continue;
+      }
+      relationCandidates.push(relation);
+    } catch (err) {
+      warnings.push((err as Error).message);
+    }
+  }
+  const relations: RelationDraft[] = [];
+  for (const relation of relationCandidates) {
+    if (expectedRefs.has(relation.from)) {
+      relations.push(relation);
+      continue;
+    }
+    // Models naturally emit entity->entity triples. Preserve Statement-level
+    // trust by projecting the relation back to the unique fact that introduced
+    // or described the source entity. Ambiguous support is skipped, not guessed.
+    const supporters = relationCandidates.filter(
+      (candidate) =>
+        candidate.type === "core:about" &&
+        candidate.to === relation.from &&
+        expectedRefs.has(candidate.from),
+    );
+    if (supporters.length === 1) {
+      relations.push({ ...relation, from: supporters[0]!.from });
+      warnings.push(
+        `relation ${relation.type} was projected from entity ${relation.from} to supporting ${supporters[0]!.from}`,
+      );
+      continue;
+    }
+    warnings.push(
+      `claim-sensitive relation ${relation.type} skipped: no unique supporting fact for ${relation.from}`,
+    );
+  }
+  return { entities: uniqueEntities, facts, relations, warnings };
 }
 
 function normalizeFactMapping(raw: unknown): FactMapping {
@@ -255,6 +326,80 @@ function entityHintsOf(graph: GraphStore, scope: Scope | undefined, limit: numbe
     if (hints.length >= limit) break;
   }
   return hints;
+}
+
+function dimensionHintsOf(
+  graph: GraphStore,
+  known: readonly KnownDimension[],
+  scope?: Scope,
+): DimensionHint[] {
+  const wanted = new Set(known.map((dimension) => dimension.key));
+  const dimensions = (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).filter(
+    (dimension) => wanted.has(dimension.key) && scopesEqual(dimension.scope, scope),
+  );
+  const byKey = new Map(dimensions.map((dimension) => [dimension.key, dimension.id]));
+  const samples = new Map<string, unknown[]>();
+  for (const statement of graph.queryNodes({ type: "core:statement" }) as StatementNode[]) {
+    const values = samples.get(statement.dimension_id) ?? [];
+    if (values.length >= 2) continue;
+    values.push(statement.value);
+    samples.set(statement.dimension_id, values);
+  }
+  return known.map((dimension) => ({
+    ...dimension,
+    sampleValues: samples.get(byKey.get(dimension.key) ?? "") ?? [],
+  }));
+}
+
+/**
+ * Prevent topical catch-all dimensions. The organizer may remap a fact to an
+ * existing OR newly proposed Dimension only when its key describes the same
+ * predicate as the extractor's original key. This is deliberately
+ * conservative: uncertain cases keep the original slot and can be merged
+ * later with evidence; a false merge destroys retrieval boundaries immediately.
+ */
+function guardDimensionRemapping(
+  plan: GraphEnrichmentPlan,
+  originals: readonly CaptureContent[],
+): void {
+  plan.facts.forEach((fact, index) => {
+    const original = originals[index];
+    if (!original) return;
+    const proposed = fact.content.dimensionKey;
+    if (
+      proposed === original.dimensionKey ||
+      dimensionKeysCompatible(original.dimensionKey, proposed)
+    ) {
+      return;
+    }
+    fact.content = { ...original };
+    plan.warnings.push(
+      `unsafe dimension remap rejected: ${original.dimensionKey} -> ${proposed}`,
+    );
+  });
+}
+
+function dimensionKeysCompatible(a: string, b: string): boolean {
+  const left = keyTokens(a);
+  const right = keyTokens(b);
+  if (left.size === 0 || right.size === 0) return false;
+  let overlap = 0;
+  for (const token of left) {
+    if (right.has(token)) overlap += 1;
+  }
+  if (overlap < 2) return false;
+  return overlap / Math.min(left.size, right.size) >= 0.5;
+}
+
+function keyTokens(key: string): Set<string> {
+  const words = key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US")
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((word) => word.length >= 3)
+    .map((word) => (word.length > 4 && word.endsWith("s") ? word.slice(0, -1) : word));
+  return new Set(words);
 }
 
 function entityScopeKind(node: GraphNode, contextScope?: Scope): "context" | "global" | null {

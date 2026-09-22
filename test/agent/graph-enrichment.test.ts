@@ -80,6 +80,104 @@ test("graph enrichment: collapses event-specific keys without rewriting facts", 
   assert.equal(graph.queryEdges({ type: "core:about" }).length, 2);
 });
 
+test("graph enrichment: prompt exposes stored dimension examples and NEW protocol", async () => {
+  const graph = new MemoryGraph();
+  commitGraphWritePlan(
+    graph,
+    {
+      entities: [],
+      facts: [
+        {
+          ref: "fact",
+          content: { dimensionKey: "gasMileage", value: "32 miles per gallon", saidBy: "user" },
+        },
+      ],
+      relations: [],
+    },
+    { created_by: "agent:ingestion:1", source_refs: ["session:old"] },
+  );
+  let seenPrompt = "";
+  const driver = {
+    async complete(prompt: string): Promise<string> {
+      seenPrompt = prompt;
+      return JSON.stringify({
+        factMappings: [{ factRef: "fact:0", dimensionKey: "gasMileage" }],
+        entities: [],
+        relations: [],
+      });
+    },
+  };
+  await runGraphEnrichment({
+    text: "The car gets 32 mpg",
+    contents: [{ dimensionKey: "carPerformance", value: "The car gets 32 mpg" }],
+    knownDimensions: [
+      { key: "gasMileage", description: "Vehicle fuel economy", cardinality: "multi" },
+    ],
+    graph,
+    driver,
+  });
+  assert.match(seenPrompt, /32 miles per gallon/);
+  assert.match(seenPrompt, /NEW:<lowerCamelCase>/);
+});
+
+test("graph enrichment: rejects broad remaps but keeps compatible family reuse", async () => {
+  const graph = new MemoryGraph();
+  const driver = new MockDriver([
+    JSON.stringify({
+      factMappings: [
+        { factRef: "fact:0", dimensionKey: "productivityStrategies" },
+        { factRef: "fact:1", dimensionKey: "familyTrips" },
+      ],
+      entities: [],
+      relations: [],
+    }),
+  ]);
+  const original = [
+    { dimensionKey: "dataVizCommunicationTips", value: "Tell a clear data story" },
+    { dimensionKey: "familyTripHawaii", value: "Family trip to Hawaii" },
+  ];
+  const plan = await runGraphEnrichment({
+    text: "Data storytelling and a family trip",
+    contents: original,
+    knownDimensions: [
+      { key: "productivityStrategies", description: "Ways to work productively", cardinality: "multi" },
+      { key: "familyTrips", description: "Family travel experiences", cardinality: "multi" },
+    ],
+    graph,
+    driver,
+  });
+  assert.equal(plan.facts[0]?.content.dimensionKey, "dataVizCommunicationTips");
+  assert.equal(plan.facts[1]?.content.dimensionKey, "familyTrips");
+  assert.match(plan.warnings.at(-1) ?? "", /unsafe dimension remap rejected/);
+});
+
+test("graph enrichment: rejects a newly invented catch-all dimension", async () => {
+  const plan = await runGraphEnrichment({
+    text: "Bought a car and used it to help a friend move",
+    contents: [
+      { dimensionKey: "carPurchase", value: "Bought a silver Honda Civic" },
+      { dimensionKey: "friendMoveHelp", value: "Used the car to help Emily move" },
+    ],
+    knownDimensions: [],
+    graph: new MemoryGraph(),
+    driver: new MockDriver([
+      JSON.stringify({
+        factMappings: [
+          { factRef: "fact:0", dimensionKey: "NEW:carUse" },
+          { factRef: "fact:1", dimensionKey: "NEW:carUse" },
+        ],
+        entities: [],
+        relations: [],
+      }),
+    ]),
+  });
+  assert.deepEqual(plan.facts.map((fact) => fact.content.dimensionKey), [
+    "carPurchase",
+    "friendMoveHelp",
+  ]);
+  assert.equal(plan.warnings.length, 2);
+});
+
 test("graph enrichment: refuses to lose a fact", () => {
   const parsed = JSON.parse(reply()) as { factMappings: unknown[] };
   parsed.factMappings.pop();
@@ -89,7 +187,7 @@ test("graph enrichment: refuses to lose a fact", () => {
   );
 });
 
-test("graph enrichment: relations cannot bypass statement trust", () => {
+test("graph enrichment: entity relations are projected onto their supporting statement", () => {
   const parsed = JSON.parse(reply()) as {
     relations: Array<{ type: string; from: string; to: string }>;
   };
@@ -98,10 +196,27 @@ test("graph enrichment: relations cannot bypass statement trust", () => {
     from: "hawaiiTrip",
     to: "hawaii",
   });
-  assert.throws(
-    () => normalizeGraphEnrichment(parsed, contents),
-    /must start at a factRef/,
-  );
+  const plan = normalizeGraphEnrichment(parsed, contents);
+  const projected = plan.relations.at(-1);
+  assert.equal(projected?.from, "fact:0");
+  assert.equal(projected?.to, "hawaii");
+  assert.match(plan.warnings[0] ?? "", /projected from entity hawaiiTrip/);
+});
+
+test("graph enrichment: malformed relations are skipped without losing graph facts", () => {
+  const parsed = JSON.parse(reply()) as {
+    relations: Array<{ type: string; from: string; to: string }>;
+  };
+  parsed.relations.push({ type: "tradeIn", from: "fact:0", to: "hawaii" });
+  parsed.relations.push({ type: "travel:uses", from: "fact:0", to: "missing-car" });
+  parsed.relations.push({ type: "core:contradicts", from: "fact:1", to: "fact:0" });
+  const plan = normalizeGraphEnrichment(parsed, contents);
+  assert.equal(plan.facts.length, 2);
+  assert.equal(plan.relations.length, 4);
+  assert.equal(plan.warnings.length, 3);
+  assert.match(plan.warnings[0] ?? "", /must be namespaced/);
+  assert.match(plan.warnings[1] ?? "", /unknown to ref/);
+  assert.match(plan.warnings[2] ?? "", /governed statement relation skipped/);
 });
 
 test("graph enrichment: assistant-only entities inherit tentative trust", () => {

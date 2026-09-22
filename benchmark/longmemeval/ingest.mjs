@@ -118,6 +118,9 @@ async function captureContents(contents, sessionId, date, transcript) {
         driver,
         scope: captureCtx.scope,
       });
+      if (plan.warnings.length > 0) {
+        console.log(`\n[warn] session ${sessionId}: graph enrichment recovered ${plan.warnings.length} issue(s)`);
+      }
       return commitGraphWritePlan(graph, plan, captureCtx).captures.length;
     } catch (err) {
       console.log(`\n[warn] session ${sessionId}: graph enrichment failed; facts kept (${err.message})`);

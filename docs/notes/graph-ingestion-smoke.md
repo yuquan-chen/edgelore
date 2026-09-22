@@ -92,6 +92,30 @@ The run therefore validated the proposal-only governance boundary while also
 showing that typed structural relations are needed before widening candidate
 generation beyond the same Dimension.
 
+## Governed RelationAssertion smoke
+
+A real-session enrichment rerun used the ten previously extracted facts from
+LongMemEval session `answer_4be1b6b4_1` and its original transcript. It wrote
+only to an in-memory graph.
+
+- one model call: 4,742 input tokens and 1,123 output tokens
+- zero parser warnings and no lost or rewritten facts
+- `carInteriorProtectionTips` was bound by `core:dimension_of` to a specific
+  `vehicle:interior` node
+- the interior was connected to the current car by a governed
+  `core:part_of` RelationAssertion
+- both relations were accepted because their supporting Statement was
+  user-authored; route and recommendation relations supported only by the
+  assistant remained tentative
+- the trip used the car through `travel:uses_vehicle`, rather than pretending
+  that the trip event was physically part of the car
+
+An earlier attempt showed the model overusing `core:part_of` for events,
+insurance policies, and advice. The core predicate now requires the exact
+`{ part, whole }` roles and a shared structural namespace; event/non-event
+mixes and edge-only predicates are locally rejected. Open-world custom
+predicates remain available for associations such as `travel:uses_vehicle`.
+
 ## Next capability work
 
 1. Add the FactReconciler (`duplicate | refines | supersedes | contradicts |

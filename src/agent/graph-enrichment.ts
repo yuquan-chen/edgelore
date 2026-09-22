@@ -10,17 +10,33 @@ import { scopesEqual } from "../model/store.js";
 import type { DimensionNode, GraphNode, NamespacedType, Scope, StatementNode } from "../model/types.js";
 import type { CaptureContent } from "./capture.js";
 import { AgentError } from "./errors.js";
-import type { EntityDraft, GraphWritePlan, RelationDraft } from "./graph-write.js";
+import type {
+  EntityDraft,
+  GraphWritePlan,
+  RelationAssertionDraft,
+  RelationDraft,
+} from "./graph-write.js";
 import { parseJsonReply, type LlmDriver } from "./llm-driver.js";
 import type { KnownDimension } from "./prompt.js";
 
 const LOWER_CAMEL_CASE = /^[a-z][a-zA-Z0-9]*$/;
 const NAMESPACED_TYPE = /^[a-z][a-z0-9._-]*:[a-z][a-z0-9._-]*$/i;
 const FACT_REF = (index: number) => `fact:${index}`;
+const DIMENSION_REF = (index: number) => `dimension:${index}`;
 const GOVERNED_STATEMENT_RELATIONS = new Set([
+  "core:equivalent_to",
   "core:contradicts",
   "core:refines",
   "core:supersedes",
+]);
+const EDGE_ONLY_PREDICATES = new Set([
+  "core:said_by",
+  "core:about",
+  "core:has_source",
+  "core:belongs_to",
+  "core:branch",
+  "core:supports",
+  "core:participates_in",
 ]);
 
 export interface GraphEnrichmentInput {
@@ -68,7 +84,7 @@ export interface EntityHint {
  */
 export async function runGraphEnrichment(input: GraphEnrichmentInput): Promise<GraphEnrichmentPlan> {
   if (input.contents.length === 0) {
-    return { entities: [], facts: [], relations: [], warnings: [] };
+    return { entities: [], facts: [], relations: [], relationAssertions: [], warnings: [] };
   }
 
   const hints = entityHintsOf(
@@ -81,7 +97,15 @@ export async function runGraphEnrichment(input: GraphEnrichmentInput): Promise<G
     contents: input.contents,
     dimensionHints: dimensionHintsOf(input.graph, input.knownDimensions, input.scope),
     entityHints: hints,
-    relationTypes: [...new Set(input.graph.queryEdges({}).map((edge) => edge.type))].slice(0, 40),
+    relationTypes: [
+      ...new Set([
+        ...input.graph.queryEdges({}).map((edge) => edge.type),
+        ...input.graph
+          .queryNodes({ type: "core:relation" })
+          .map((node) => ("predicate" in node ? node.predicate : undefined))
+          .filter((predicate): predicate is string => typeof predicate === "string"),
+      ]),
+    ].slice(0, 40),
   });
   const parsed = parseJsonReply(await input.driver.complete(prompt));
   const plan = normalizeGraphEnrichment(parsed, input.contents);
@@ -112,8 +136,11 @@ export function buildGraphEnrichmentPrompt(input: GraphEnrichmentPromptInput): s
     "For every factMapping, dimensionKey MUST be either an exact key from Known dimensions or NEW:<lowerCamelCase>. Reuse an existing key whenever its sample values answer the same kind of question, even if its wording differs. Use NEW: only when no existing Dimension can hold the fact.",
     "Example: Hawaii and Paris family trips both map to familyTrips; their destinations and trip instances differ only in entities/Statements. Never create familyTripHawaii/familyTripParis.",
     "Represent a distinct real-world occurrence as an event entity (for example travel:trip). Reuse an existing entity only when it is the same identity, not merely a similar kind.",
-    "All claim-sensitive semantic relations MUST start at a factRef (the persisted Statement), so their trust follows that statement. Use core:about from a fact to its main entity/event.",
-    "Never output core:contradicts, core:refines, or core:supersedes. Those epistemic decisions belong to a separate governed fact reconciler, not graph organization.",
+    "Use ordinary relations only for Statement-originating links such as core:about. All claim-sensitive ordinary relations MUST start at a factRef so their trust follows that Statement.",
+    "Use relationAssertions for structural or taxonomic claims between entities, Dimensions, or other relations. Each assertion is a governed hyperedge with an open-world predicate, named role bindings, and one or more supportedBy factRefs.",
+    "A fact's resolved Dimension is available as dimension:<index>. Use core:dimension_of to bind that Dimension to its precise subject/aspect. Use core:part_of only for a constitutive component -> whole in the same structural domain (for example vehicle:interior -> vehicle:car), never for an event, policy, product, advice, or program that merely uses, covers, recommends, or concerns an object. Use a precise custom predicate for those associations. Use core:instance_of for instance/subtype -> class. Do not infer a taxonomy merely from word similarity.",
+    "Relations may have multiple parents: an interior may be part_of a particular car and instance_of a decoration concept. Keep those as separate relationAssertions; never force a tree.",
+    "Never output core:equivalent_to, core:contradicts, core:refines, or core:supersedes. Those epistemic decisions belong to a separate governed fact reconciler, not graph organization.",
     "Never output ids, provenance, timestamps, state, saidBy, or fact values. The runtime owns those fields.",
     "Entity and relation types are open-world namespaced strings such as travel:trip, geo:place, travel:destination, or core:about.",
     `Known dimensions with real stored examples:\n${JSON.stringify(input.dimensionHints)}`,
@@ -127,12 +154,17 @@ export function buildGraphEnrichmentPrompt(input: GraphEnrichmentPromptInput): s
     {"factRef":"fact:0","dimensionKey":"NEW:familyTrips","dimensionDescription":"Family travel experiences","cardinality":"multi"}
   ],
   "entities": [
-    {"ref":"tripHawaii","type":"travel:trip","key":"hawaii-2023-05","value":"Hawaii family trip","scope":"context"},
-    {"ref":"hawaii","type":"geo:place","key":"hawaii","value":"Hawaii","scope":"global"}
+    {"ref":"car","type":"vehicle:car","key":"current-car","value":"Current car","scope":"context"},
+    {"ref":"interior","type":"vehicle:interior","key":"current-car-interior","value":"Car interior","scope":"context"},
+    {"ref":"decoration","type":"concept:category","key":"decoration","value":"Decoration","scope":"global"}
   ],
   "relations": [
-    {"type":"core:about","from":"fact:0","to":"tripHawaii"},
-    {"type":"travel:destination","from":"fact:0","to":"hawaii"}
+    {"type":"core:about","from":"fact:0","to":"interior"}
+  ],
+  "relationAssertions": [
+    {"ref":"interiorPartOfCar","predicate":"core:part_of","bindings":{"part":"interior","whole":"car"},"supportedBy":["fact:0"]},
+    {"ref":"interiorIsDecoration","predicate":"core:instance_of","bindings":{"instance":"interior","class":"decoration"},"supportedBy":["fact:0"]},
+    {"ref":"tipsDimensionSubject","predicate":"core:dimension_of","bindings":{"dimension":"dimension:0","subject":"interior"},"supportedBy":["fact:0"]}
   ]
 }`,
   ].join("\n\n");
@@ -156,6 +188,9 @@ export function normalizeGraphEnrichment(
   if (!Array.isArray(reply.relations)) {
     throw new AgentError('graph enrichment field "relations" must be an array');
   }
+  if (reply.relationAssertions !== undefined && !Array.isArray(reply.relationAssertions)) {
+    throw new AgentError('graph enrichment field "relationAssertions" must be an array');
+  }
 
   const expectedRefs = new Set(contents.map((_content, index) => FACT_REF(index)));
   const mappings = new Map<string, FactMapping>();
@@ -178,6 +213,7 @@ export function normalizeGraphEnrichment(
     const mapping = mappings.get(ref) as FactMapping;
     return {
       ref,
+      dimensionRef: DIMENSION_REF(index),
       content: {
         ...content,
         dimensionKey: mapping.dimensionKey,
@@ -198,7 +234,9 @@ export function normalizeGraphEnrichment(
       warnings.push((err as Error).message);
     }
   }
-  const allRefs = new Set(facts.map((fact) => fact.ref));
+  const allRefs = new Set(
+    facts.flatMap((fact) => [fact.ref, fact.dimensionRef as string]),
+  );
   const uniqueEntities: EntityDraft[] = [];
   for (const entity of entities) {
     if (allRefs.has(entity.ref)) {
@@ -208,10 +246,73 @@ export function normalizeGraphEnrichment(
     allRefs.add(entity.ref);
     uniqueEntities.push(entity);
   }
+
+  const rawAssertions = (reply.relationAssertions ?? []) as unknown[];
+  const proposedAssertionRefs = new Set<string>();
+  const assertionRows: Array<{ raw: unknown; ref: string }> = [];
+  for (const value of rawAssertions) {
+    try {
+      const entry = objectEntry(value, "relation assertion");
+      const ref = requiredString(entry.ref, "relationAssertion.ref");
+      if (allRefs.has(ref) || proposedAssertionRefs.has(ref)) {
+        warnings.push(`duplicate graph enrichment ref skipped: ${ref}`);
+        continue;
+      }
+      proposedAssertionRefs.add(ref);
+      assertionRows.push({ raw: value, ref });
+    } catch (err) {
+      warnings.push((err as Error).message);
+    }
+  }
+  for (const ref of proposedAssertionRefs) allRefs.add(ref);
+  const refTypes = new Map<string, string>();
+  for (const fact of facts) {
+    refTypes.set(fact.ref, "core:statement");
+    refTypes.set(fact.dimensionRef as string, "core:dimension");
+  }
+  for (const entity of uniqueEntities) refTypes.set(entity.ref, entity.type);
+  for (const ref of proposedAssertionRefs) refTypes.set(ref, "core:relation");
+  let relationAssertions: RelationAssertionDraft[] = [];
+  for (const row of assertionRows) {
+    try {
+      relationAssertions.push(
+        normalizeRelationAssertionDraft(row.raw, allRefs, expectedRefs, refTypes),
+      );
+    } catch (err) {
+      warnings.push((err as Error).message);
+    }
+  }
+  // Resolve assertion dependencies now. This both orders nested relations and
+  // turns a missing/cyclic assertion dependency into a local warning instead
+  // of rolling the whole fact commit back later.
+  const baseRefs = new Set(
+    [...allRefs].filter((ref) => !proposedAssertionRefs.has(ref)),
+  );
+  const orderedAssertions: RelationAssertionDraft[] = [];
+  const pendingAssertions = [...relationAssertions];
+  const availableRefs = new Set(baseRefs);
+  while (pendingAssertions.length > 0) {
+    const readyIndex = pendingAssertions.findIndex((draft) =>
+      Object.values(draft.bindings).every((ref) => availableRefs.has(ref)),
+    );
+    if (readyIndex === -1) {
+      for (const dropped of pendingAssertions) {
+        warnings.push(
+          `relation assertion ${dropped.ref} skipped: dependency is missing or cyclic`,
+        );
+      }
+      break;
+    }
+    const ready = pendingAssertions.splice(readyIndex, 1)[0]!;
+    orderedAssertions.push(ready);
+    availableRefs.add(ready.ref);
+  }
+  relationAssertions = orderedAssertions;
+  const validRefs = new Set([...baseRefs, ...relationAssertions.map((draft) => draft.ref)]);
   const relationCandidates: RelationDraft[] = [];
   for (const value of reply.relations) {
     try {
-      const relation = normalizeRelationDraft(value, allRefs);
+      const relation = normalizeRelationDraft(value, validRefs);
       if (GOVERNED_STATEMENT_RELATIONS.has(relation.type)) {
         warnings.push(`governed statement relation skipped during enrichment: ${relation.type}`);
         continue;
@@ -247,7 +348,7 @@ export function normalizeGraphEnrichment(
       `claim-sensitive relation ${relation.type} skipped: no unique supporting fact for ${relation.from}`,
     );
   }
-  return { entities: uniqueEntities, facts, relations, warnings };
+  return { entities: uniqueEntities, facts, relations, relationAssertions, warnings };
 }
 
 function normalizeFactMapping(raw: unknown): FactMapping {
@@ -309,6 +410,105 @@ function normalizeRelationDraft(raw: unknown, refs: ReadonlySet<string>): Relati
     ...(isRecord(entry.attributes) ? { attributes: entry.attributes } : {}),
     ...(stringArray(entry.tags) ? { tags: entry.tags as string[] } : {}),
   };
+}
+
+function normalizeRelationAssertionDraft(
+  raw: unknown,
+  refs: ReadonlySet<string>,
+  factRefs: ReadonlySet<string>,
+  refTypes: ReadonlyMap<string, string>,
+): RelationAssertionDraft {
+  const entry = objectEntry(raw, "relation assertion");
+  const ref = requiredString(entry.ref, "relationAssertion.ref");
+  const predicate = requiredString(entry.predicate, "relationAssertion.predicate");
+  if (!NAMESPACED_TYPE.test(predicate)) {
+    throw new AgentError(`relationAssertion.predicate must be namespaced: ${predicate}`);
+  }
+  if (GOVERNED_STATEMENT_RELATIONS.has(predicate)) {
+    throw new AgentError(
+      `governed statement relation skipped during enrichment: ${predicate}`,
+    );
+  }
+  if (EDGE_ONLY_PREDICATES.has(predicate)) {
+    throw new AgentError(
+      `edge-only predicate cannot be a relation assertion: ${predicate}`,
+    );
+  }
+  if (!isRecord(entry.bindings) || Object.keys(entry.bindings).length < 2) {
+    throw new AgentError(`relationAssertion.bindings requires at least two roles: ${ref}`);
+  }
+  const bindings: Record<string, string> = {};
+  for (const [role, value] of Object.entries(entry.bindings)) {
+    if (!/^[a-z][a-zA-Z0-9_]*$/.test(role)) {
+      throw new AgentError(`relationAssertion has invalid role: ${role}`);
+    }
+    const target = requiredString(value, `relationAssertion.bindings.${role}`);
+    if (!refs.has(target)) {
+      throw new AgentError(`relationAssertion has unknown binding ref: ${target}`);
+    }
+    if (factRefs.has(target)) {
+      throw new AgentError(
+        `relationAssertion cannot bind Statement ref ${target}; use supportedBy`,
+      );
+    }
+    bindings[role] = target;
+  }
+  validateCoreRelationShape(predicate, bindings, refTypes);
+  if (!Array.isArray(entry.supportedBy) || entry.supportedBy.length === 0) {
+    throw new AgentError(`relationAssertion.supportedBy requires at least one factRef: ${ref}`);
+  }
+  const supportedBy = [...new Set(entry.supportedBy.map((value) =>
+    requiredString(value, "relationAssertion.supportedBy"),
+  ))];
+  for (const support of supportedBy) {
+    if (!factRefs.has(support)) {
+      throw new AgentError(`relationAssertion has unknown supporting fact: ${support}`);
+    }
+  }
+  return {
+    ref,
+    predicate,
+    bindings,
+    supportedBy,
+    ...(isRecord(entry.attributes) ? { attributes: entry.attributes } : {}),
+    ...(stringArray(entry.tags) ? { tags: entry.tags as string[] } : {}),
+  };
+}
+
+function validateCoreRelationShape(
+  predicate: string,
+  bindings: Readonly<Record<string, string>>,
+  refTypes: ReadonlyMap<string, string>,
+): void {
+  const roles = Object.keys(bindings).sort().join(",");
+  if (predicate === "core:part_of") {
+    if (roles !== "part,whole") {
+      throw new AgentError("core:part_of requires exactly { part, whole }");
+    }
+    const partType = refTypes.get(bindings.part!);
+    const wholeType = refTypes.get(bindings.whole!);
+    if (partType?.startsWith("event:") !== wholeType?.startsWith("event:")) {
+      throw new AgentError(
+        `core:part_of cannot mix an event with a non-event whole: ${partType} -> ${wholeType}`,
+      );
+    }
+    if (partType?.split(":", 1)[0] !== wholeType?.split(":", 1)[0]) {
+      throw new AgentError(
+        `core:part_of participants must share a structural namespace: ${partType} -> ${wholeType}`,
+      );
+    }
+  }
+  if (predicate === "core:instance_of" && roles !== "class,instance") {
+    throw new AgentError("core:instance_of requires exactly { instance, class }");
+  }
+  if (predicate === "core:dimension_of") {
+    if (roles !== "dimension,subject") {
+      throw new AgentError("core:dimension_of requires exactly { dimension, subject }");
+    }
+    if (refTypes.get(bindings.dimension!) !== "core:dimension") {
+      throw new AgentError("core:dimension_of dimension role must bind a Dimension");
+    }
+  }
 }
 
 function entityHintsOf(graph: GraphStore, scope: Scope | undefined, limit: number): EntityHint[] {

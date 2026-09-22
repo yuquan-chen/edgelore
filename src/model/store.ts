@@ -50,6 +50,20 @@ export class ModelError extends Error {
   }
 }
 
+const EDGE_ONLY_RELATION_PREDICATES = new Set([
+  "core:said_by",
+  "core:about",
+  "core:has_source",
+  "core:belongs_to",
+  "core:branch",
+  "core:equivalent_to",
+  "core:refines",
+  "core:contradicts",
+  "core:supersedes",
+  "core:supports",
+  "core:participates_in",
+]);
+
 // --- input shapes: caller supplies the meaningful fields; store fills the rest.
 
 export interface AddNodeInput {
@@ -69,6 +83,9 @@ export interface AddNodeInput {
   dimension_id?: string;
   value?: unknown;
   unit?: string;
+  /** core:relation predicate and open role bindings. */
+  predicate?: NamespacedType;
+  bindings?: Record<string, string>;
   /** Content-axis speaker (statements only) — validated at the boundary. */
   saidBy?: SaidBy;
   cardinality?: "single" | "multi";
@@ -222,6 +239,36 @@ export class MemoryGraph implements GraphStore {
           value: input.value,
           unit: input.unit,
           ...(input.saidBy !== undefined ? { saidBy: input.saidBy } : {}),
+        };
+        break;
+      case "core:relation":
+        if (!input.predicate) throw new ModelError("core:relation requires `predicate`");
+        assertValidType(input.predicate);
+        if (EDGE_ONLY_RELATION_PREDICATES.has(input.predicate)) {
+          throw new ModelError(
+            `core:relation predicate ${input.predicate} is reserved for GraphEdge`,
+          );
+        }
+        if (!input.bindings || Object.keys(input.bindings).length < 2) {
+          throw new ModelError("core:relation requires at least two role bindings");
+        }
+        for (const [role, participantId] of Object.entries(input.bindings)) {
+          if (!/^[a-z][a-zA-Z0-9_]*$/.test(role)) {
+            throw new ModelError(`core:relation has invalid binding role: ${role}`);
+          }
+          assertValidId(participantId, `core:relation.bindings.${role}`);
+          if (!this.nodes.has(participantId)) {
+            throw new ModelError(
+              `core:relation binding "${role}" references unknown node: ${participantId}`,
+            );
+          }
+        }
+        assertCoreRelationShape(input.predicate, input.bindings, this.nodes);
+        node = {
+          ...base,
+          type: "core:relation",
+          predicate: input.predicate,
+          bindings: { ...input.bindings },
         };
         break;
       default:
@@ -466,6 +513,42 @@ export class MemoryGraph implements GraphStore {
   }
   getAllConstraints(): Constraint[] {
     return [...this.constraints.values()];
+  }
+}
+
+function assertCoreRelationShape(
+  predicate: string,
+  bindings: Readonly<Record<string, string>>,
+  nodes: ReadonlyMap<string, GraphNode>,
+): void {
+  const roles = Object.keys(bindings).sort().join(",");
+  if (predicate === "core:part_of") {
+    if (roles !== "part,whole") {
+      throw new ModelError("core:part_of requires exactly { part, whole }");
+    }
+    const partType = nodes.get(bindings.part!)?.type;
+    const wholeType = nodes.get(bindings.whole!)?.type;
+    if (partType?.startsWith("event:") !== wholeType?.startsWith("event:")) {
+      throw new ModelError(
+        `core:part_of cannot mix an event with a non-event whole: ${partType} -> ${wholeType}`,
+      );
+    }
+    if (partType?.split(":", 1)[0] !== wholeType?.split(":", 1)[0]) {
+      throw new ModelError(
+        `core:part_of participants must share a structural namespace: ${partType} -> ${wholeType}`,
+      );
+    }
+  }
+  if (predicate === "core:instance_of" && roles !== "class,instance") {
+    throw new ModelError("core:instance_of requires exactly { instance, class }");
+  }
+  if (predicate === "core:dimension_of") {
+    if (roles !== "dimension,subject") {
+      throw new ModelError("core:dimension_of requires exactly { dimension, subject }");
+    }
+    if (nodes.get(bindings.dimension!)?.type !== "core:dimension") {
+      throw new ModelError("core:dimension_of dimension role must bind a Dimension");
+    }
   }
 }
 

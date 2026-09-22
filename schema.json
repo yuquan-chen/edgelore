@@ -67,6 +67,16 @@
             "dimension_id": { "type": "string", "description": "required for core:statement" },
             "value": {},
             "unit": { "type": "string" },
+            "predicate": {
+              "$ref": "#/definitions/namespacedType",
+              "description": "required for core:relation"
+            },
+            "bindings": {
+              "type": "object",
+              "minProperties": 2,
+              "additionalProperties": { "type": "string" },
+              "description": "open role -> participant node id; required for core:relation"
+            },
             "saidBy": {
               "type": "string",
               "enum": ["user", "assistant"],

@@ -134,11 +134,11 @@ async function embedSession(sessionId) {
 const args = process.argv;
 const limitIdx = args.indexOf("--limit");
 const maxSessions = limitIdx !== -1 ? Number(args[limitIdx + 1]) : Infinity;
-const shardIdx = args.indexOf("--shard"); // --shard i/N
+const shardIdx = args.indexOf("--shard"); // 过滤语法是 "i/N"；不带 "/" 的值只是 checkpoint 名（如 --shard v5）
 let shardFilter = null;
-if (shardIdx !== -1) {
+if (shardIdx !== -1 && /^\d+\/\d+$/.test(args[shardIdx + 1])) {
   const [i, n] = args[shardIdx + 1].split("/").map(Number);
-  shardFilter = (ordinal) => ordinal % n === i;
+  if (n > 0) shardFilter = (ordinal) => ordinal % n === i;
 }
 let processed = 0;
 let factsStored = 0;

@@ -274,7 +274,10 @@ export function normalizeBatchExtractionReply(
       const contentCandidate = decision.content ?? decision.entry ?? decision.memory ?? inlineContent;
       const normalized = normalizeBatchContents([contentCandidate], knownKeys);
       if (normalized.contents.length !== 1 || normalized.skipped !== 0) {
-        throw new AgentError(`${eventId} keep decision must carry one valid content object`);
+        const preview = JSON.stringify(contentCandidate)?.slice(0, 500) ?? "undefined";
+        throw new AgentError(
+          `${eventId} keep decision must carry one valid content object; received: ${preview}`,
+        );
       }
       eventContents.push(normalized.contents[0]);
       eventKept += 1;
@@ -356,8 +359,9 @@ export function normalizeBatchContents(
     // Models sometimes lowercase the protocol prefix ("new:key") — accept
     // any case, strip it, then enforce camelCase on the key itself.
     if (/^new:/i.test(dimensionKey)) {
-      const key = dimensionKey.slice(dimensionKey.indexOf(":") + 1);
-      if (!LOWER_CAMEL_CASE.test(key)) {
+      const rawKey = dimensionKey.slice(dimensionKey.indexOf(":") + 1);
+      const key = repairBatchDimensionKey(rawKey);
+      if (!key) {
         skipped += 1;
         continue;
       }
@@ -382,6 +386,23 @@ export function normalizeBatchContents(
     contents.push(content);
   }
   return { contents, skipped };
+}
+
+/**
+ * Repair common provider drift for explicitly-new keys in the bulk importer.
+ * The stored key still obeys lowerCamelCase; the strict product extractor is
+ * intentionally unaffected. Numeric-leading concepts receive a neutral
+ * `fact` prefix, while separators are folded into camelCase.
+ */
+function repairBatchDimensionKey(raw: string): string | undefined {
+  if (LOWER_CAMEL_CASE.test(raw)) return raw;
+  let repaired = raw
+    .trim()
+    .replace(/[^A-Za-z0-9]+([A-Za-z0-9])/g, (_match, next: string) => next.toUpperCase())
+    .replace(/[^A-Za-z0-9]/g, "");
+  if (/^[0-9]/.test(repaired)) repaired = `fact${repaired}`;
+  if (/^[A-Z]/.test(repaired)) repaired = repaired[0].toLowerCase() + repaired.slice(1);
+  return LOWER_CAMEL_CASE.test(repaired) ? repaired : undefined;
 }
 
 /**

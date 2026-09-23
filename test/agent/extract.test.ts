@@ -350,6 +350,20 @@ test("batch: keep decisions accept equivalent inline fact fields", async () => {
   assert.match(String(result.contents[0]?.value), /70-200mm/);
 });
 
+test("batch: explicitly-new provider keys are repaired into lowerCamelCase", async () => {
+  const { normalizeBatchContents } = await import("../../src/agent/extract.js");
+  const result = normalizeBatchContents([
+    { dimensionKey: "NEW:50mmLens", value: "50mm prime" },
+    { dimensionKey: "NEW:new70_200mmLens", value: "70-200mm zoom" },
+    { dimensionKey: "NEW:5kRunResult", value: "27:12 personal best" },
+  ]);
+  assert.equal(result.skipped, 0);
+  assert.deepEqual(
+    result.contents.map((content) => content.dimensionKey),
+    ["fact50mmLens", "new70200mmLens", "fact5kRunResult"],
+  );
+});
+
 test("batch: missing or content-free event decisions fail loud", async () => {
   const { normalizeBatchExtractionReply } = await import("../../src/agent/extract.js");
   assert.throws(

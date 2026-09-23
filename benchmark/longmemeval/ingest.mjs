@@ -3,8 +3,8 @@
 // Ingests every unique session of the dataset into ONE shared memory store:
 // one extract call per session (batch mode — cheaper than per-turn), facts
 // captured with the SESSION's date (temporal reasoning needs real dates),
-// knownDimensions growing as we go (anti-drift), vectors written after each
-// session. Resumable via a checkpoint file.
+// knownDimensions growing as we go (anti-drift), Claim vectors backfilled in
+// large batches after semantic ingestion. Resumable via a checkpoint file.
 //
 // Usage:
 //   node benchmark/longmemeval/ingest.mjs --graph --run-dir data/runs/<name>
@@ -28,15 +28,16 @@ import {
   parseJsonReply,
   capture,
   buildBatchExtractionPrompt,
+  buildIntegratedGraphExtractionPrompt,
   normalizeBatchExtractionReply,
+  normalizeIntegratedGraphExtractionReply,
   relevantDimensionsOf,
   scanEventCandidates,
   dominantLang,
   filterByLanguage,
-  runGraphEnrichment,
   commitGraphWritePlan,
-  archiveConversationEvidence,
-  conversationEvidenceText,
+  archiveConversationEpisode,
+  statementText,
   usageTotals,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
@@ -191,25 +192,46 @@ function knownDimensions() {
 }
 void knownDimensions;
 
-async function captureContents(contents, sessionId, date, transcript) {
+function graphHints() {
+  const entities = graph
+    .queryNodes({})
+    .filter((node) =>
+      node.type !== "core:dimension" &&
+      node.type !== "core:statement" &&
+      node.type !== "core:message" &&
+      typeof node.key === "string"
+    )
+    .slice(-40)
+    .map((node) => ({
+      type: node.type,
+      key: node.key,
+      ...(node.value !== undefined ? { value: node.value } : {}),
+      scope: "context",
+    }));
+  return {
+    entityHints: entities,
+    relationTypes: [...new Set(graph.queryEdges({}).map((edge) => edge.type))].slice(-40),
+  };
+}
+
+function buildIngestPrompt(options) {
+  return graphMode
+    ? buildIntegratedGraphExtractionPrompt({ ...options, ...graphHints() })
+    : buildBatchExtractionPrompt(options);
+}
+
+async function captureContents(contents, sessionId, date, plan) {
   const captureCtx = {
     created_by: "human:longmemeval_user",
     source_refs: [sessionId],
     createdAt: date || undefined,
     ...(graphMode ? { scope: { owner_id: "actor:longmemeval_user" } } : {}),
   };
-  if (graphMode) {
+  if (graphMode && plan) {
     try {
-      const plan = await runGraphEnrichment({
-        text: transcript,
-        contents,
-        knownDimensions: relevantDimensionsOf(graph, transcript, 30),
-        graph,
-        driver,
-        scope: captureCtx.scope,
-      });
       if (plan.warnings.length > 0) {
         console.log(`\n[warn] session ${sessionId}: graph enrichment recovered ${plan.warnings.length} issue(s)`);
+        for (const warning of plan.warnings) console.log(`  - ${warning}`);
       }
       return commitGraphWritePlan(graph, plan, captureCtx).captures.length;
     } catch (err) {
@@ -224,24 +246,41 @@ async function captureContents(contents, sessionId, date, transcript) {
   return stored;
 }
 
-async function embedSession(sessionId) {
+async function embedPendingClaims() {
   if (!embedder) return;
-  const nodes = [
-    ...graph.queryNodes({ type: "core:statement" }),
-    ...graph.queryNodes({ type: "core:message" }),
-  ].filter((node) => node.source_refs.includes(sessionId));
+  const indexed = new Set(graph.allVectors().map((entry) => entry.nodeId));
+  const nodes = graph
+    .queryNodes({ type: "core:statement" })
+    .filter((node) => !indexed.has(node.id));
   if (nodes.length === 0) return;
-  const texts = nodes.map((node) => {
-    if (node.type === "core:message") return conversationEvidenceText(node);
-    const dim = graph.getNode(node.dimension_id);
-    return `${dim?.key ?? ""} ${JSON.stringify(node.value)}${node.unit ? ` ${node.unit}` : ""}`;
-  });
-  // qwen embedding 单批上限 20 条——分批 ≤16 防止 400
+  const texts = nodes.map((node) => statementText(graph, node));
+  // qwen embedding 单批上限 20 条——分批 ≤16 防止 400；三个批次
+  // 并发，与语义摄入解耦。失败批不影响其他批，resume 会自动补缺口。
+  const batches = [];
   for (let i = 0; i < texts.length; i += 16) {
-    const chunkTexts = texts.slice(i, i + 16);
-    const chunkNodes = nodes.slice(i, i + 16);
-    const vecs = await embedder.embed(chunkTexts);
-    chunkNodes.forEach((node, j) => vectors.put(node.id, vecs[j]));
+    batches.push({ texts: texts.slice(i, i + 16), nodes: nodes.slice(i, i + 16) });
+  }
+  const failures = [];
+  let completed = 0;
+  for (let i = 0; i < batches.length; i += 3) {
+    const group = batches.slice(i, i + 3);
+    const results = await Promise.allSettled(group.map((batch) => embedder.embed(batch.texts)));
+    results.forEach((result, index) => {
+      const batch = group[index];
+      if (result.status === "fulfilled") {
+        batch.nodes.forEach((node, j) => vectors.put(node.id, result.value[j]));
+      } else {
+        failures.push(result.reason);
+      }
+      completed += batch.nodes.length;
+    });
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\rembedding Claims: ${completed}/${texts.length}`);
+    }
+  }
+  if (process.stdout.isTTY) process.stdout.write("\n");
+  if (failures.length > 0) {
+    throw new Error(`${failures.length} embedding batch(es) failed; resume will retry them`);
   }
 }
 
@@ -290,13 +329,14 @@ for (const [sid, session] of sessions) {
   // Archive the immutable source before any probabilistic extraction. If the
   // LLM violates its contract, the exact conversation still survives while
   // the semantic pass remains uncheckpointed for a later resume.
-  const evidence = archiveConversationEvidence(graph, session.turns, {
+  const episodeExisted = graph.getEpisode(sid) !== undefined;
+  archiveConversationEpisode(graph, session.turns, {
     created_by: "human:longmemeval_user",
     source_ref: sid,
     createdAt: session.date || undefined,
     ...(graphMode ? { scope: { owner_id: "actor:longmemeval_user" } } : {}),
   });
-  evidenceStored += evidence.length;
+  if (!episodeExisted) evidenceStored += 1;
 
   try {
     const eventCandidates = scanEventCandidates(transcript);
@@ -310,7 +350,7 @@ for (const [sid, session] of sessions) {
       // 事件扫描（触发层 v0）：旁插的"我 + 时间"句必须被逐条裁决，防静默丢失
       mustConsiderEvents: eventCandidates,
     };
-    let parsed = parseJsonReply(await driver.complete(buildBatchExtractionPrompt(promptOpts)));
+    let parsed = parseJsonReply(await driver.complete(buildIngestPrompt(promptOpts)));
     let batch;
     try {
       batch = normalizeBatchExtractionReply(parsed, eventCandidates.length);
@@ -318,7 +358,7 @@ for (const [sid, session] of sessions) {
       if (eventCandidates.length === 0) throw err;
       parsed = parseJsonReply(
         await driver.complete(
-          buildBatchExtractionPrompt({
+          buildIngestPrompt({
             ...promptOpts,
             extraFragments: [
               `NOTE: your previous reply violated the eventDecisions contract: ${err.message}`,
@@ -336,7 +376,7 @@ for (const [sid, session] of sessions) {
       // when it fires.
       parsed = parseJsonReply(
         await driver.complete(
-          buildBatchExtractionPrompt({
+          buildIngestPrompt({
             ...promptOpts,
             extraFragments: [
               "NOTE: your previous reply was EMPTY, but this session is not empty.",
@@ -357,7 +397,7 @@ for (const [sid, session] of sessions) {
       if (lf.dropped.length > 0 && lf.keep.length <= batch.contents.length / 2) {
         parsed = parseJsonReply(
           await driver.complete(
-            buildBatchExtractionPrompt({
+            buildIngestPrompt({
               ...promptOpts,
               extraFragments: [
                 `NOTE: your previous reply mixed languages. The session is in ${
@@ -383,8 +423,21 @@ for (const [sid, session] of sessions) {
     if (langDropped > 0) {
       console.log(`\n[warn] session ${sid}: dropped ${langDropped} wrong-language entries (expected ${expectedLang})`);
     }
-    const contents = batch.contents;
-    const stored = await captureContents(contents, sid, session.date, transcript);
+    let contents = batch.contents;
+    let graphPlan;
+    if (graphMode && langDropped === 0) {
+      try {
+        const integrated = normalizeIntegratedGraphExtractionReply(
+          parsed,
+          eventCandidates.length,
+        );
+        graphPlan = integrated.plan;
+        contents = integrated.batch.contents;
+      } catch (err) {
+        console.log(`\n[warn] session ${sid}: integrated graph metadata invalid; Claims kept (${err.message})`);
+      }
+    }
+    const stored = await captureContents(contents, sid, session.date, graphPlan);
     workerFacts += stored;
     factsStored += stored;
     eventKeptTotal += batch.eventKept;
@@ -394,13 +447,9 @@ for (const [sid, session] of sessions) {
     } else if (processed % 20 === 0) {
       console.log(`progress: ${processed} sessions, ${factsStored} facts, ${((Date.now() - t0) / 1000 / processed).toFixed(1)}s/session`);
     }
-    try {
-      await embedSession(sid); // best-effort: vectors are derived data, rebuildable
-    } catch (err) {
-      console.log(`[warn] session ${sid}: embed failed (facts kept): ${err.message}`);
-    }
-    // The run-local checkpoint advances only after facts and the best-effort
-    // embedding pass. A crash before here safely replays through capture dedup.
+    // Claim vectors are derived data and are backfilled in large batches after
+    // semantic ingestion. A crash safely resumes from this checkpoint and the
+    // final backfill discovers every still-missing vector.
     checkpoint(sid);
   } catch (err) {
     console.log(`[warn] session ${sid}: ${err.message} — skipped (rerun to retry)`);
@@ -414,15 +463,22 @@ for (const [sid, session] of sessions) {
   }
 }
 
+try {
+  await embedPendingClaims();
+} catch (err) {
+  console.log(`[warn] bulk Claim embedding failed (facts kept): ${err.message}`);
+}
+
 const dims = graph.queryNodes({ type: "core:dimension" }).length;
 const statements = graph.queryNodes({ type: "core:statement" }).length;
 const messages = graph.queryNodes({ type: "core:message" }).length;
+const episodes = graph.getAllEpisodes().length;
 let entities = 0;
 console.log(`\ndone: ${processed} sessions this run, ${factsStored} facts this run`);
 console.log(`language pinning: ${langDroppedTotal} wrong-language entries dropped`);
 console.log(`event decisions: ${eventKeptTotal} kept, ${eventDroppedTotal} dropped`);
 console.log(`store: ${dims} dimensions, ${statements} statements`);
-console.log(`evidence: ${messages} verbatim message chunks (${evidenceStored} this run)`);
+console.log(`evidence: ${episodes} cold episodes (${evidenceStored} this run), ${messages} legacy message nodes`);
 if (graphMode) {
   entities = graph.queryNodes({}).filter(
     (node) =>
@@ -433,7 +489,13 @@ if (graphMode) {
   console.log(`graph: ${entities} entities/events, ${graph.queryEdges({}).length} edges`);
 }
 const usage = usageTotals();
+const usageByStage = {
+  llm: usageTotals("llm"),
+  embedding: usageTotals("embedding"),
+};
 console.log(`API usage: ${usage.calls} calls, ${usage.inputTokens} input tokens, ${usage.outputTokens} output tokens, ${usage.errors} errors`);
+console.log(`  llm: ${usageByStage.llm.calls} calls, ${usageByStage.llm.inputTokens} input tokens, p50 ${usageByStage.llm.latencyMsP50}ms`);
+console.log(`  embedding: ${usageByStage.embedding.calls} calls, ${usageByStage.embedding.inputTokens} input tokens, p50 ${usageByStage.embedding.latencyMsP50}ms`);
 if (runDir) {
   const completedSessions = [...sessions.keys()].filter((sid) => done.has(sid)).length;
   writeFileSync(
@@ -449,10 +511,12 @@ if (runDir) {
         dimensions: dims,
         statements,
         message_chunks: messages,
+        episodes,
         entities,
         event_decisions: { kept: eventKeptTotal, dropped: eventDroppedTotal },
         language_dropped: langDroppedTotal,
         usage,
+        usage_by_stage: usageByStage,
       },
       null,
       2,

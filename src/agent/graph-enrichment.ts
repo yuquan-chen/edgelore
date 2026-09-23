@@ -13,6 +13,7 @@ import { AgentError } from "./errors.js";
 import type { EntityDraft, GraphWritePlan, RelationDraft } from "./graph-write.js";
 import { parseJsonReply, type LlmDriver } from "./llm-driver.js";
 import type { KnownDimension } from "./prompt.js";
+import { SCOPE_OWNER_SUBJECT, slotSubjectLabel, slotSubjectRef } from "./slots.js";
 
 const LOWER_CAMEL_CASE = /^[a-z][a-zA-Z0-9]*$/;
 const NAMESPACED_TYPE = /^[a-z][a-z0-9._-]*:[a-z][a-z0-9._-]*$/i;
@@ -41,12 +42,18 @@ export interface GraphEnrichmentPlan extends GraphWritePlan {
 
 interface FactMapping {
   factRef: string;
+  /** `$scopeOwner` or a plan-local entity ref. Resolved to a durable id by
+   * commitGraphWritePlan before capture. */
+  subjectRef: string;
   dimensionKey: string;
   dimensionDescription?: string;
   cardinality?: "single" | "multi";
 }
 
 export interface DimensionHint extends KnownDimension {
+  dimensionId: string;
+  subjectRef: string;
+  subjectLabel?: string;
   /** A small, bounded sample makes semantic reuse possible even when keys use
    * different wording (for example gasMileage vs carPerformanceMetrics). */
   sampleValues: unknown[];
@@ -108,9 +115,11 @@ export function buildGraphEnrichmentPrompt(input: GraphEnrichmentPromptInput): s
   return [
     "You organize already-extracted memories into a reusable graph.",
     "This is NOT another extraction pass. Preserve every supplied fact exactly once; never add, drop, merge, or rewrite a fact value.",
-    "Choose reusable subject-free dimension categories. A Dimension is the reusable QUESTION/CATEGORY; its Statements are the answers or event instances. A destination, person, product, date, or event identity belongs in an entity/Statement, never in the dimension key.",
-    "For every factMapping, dimensionKey MUST be either an exact key from Known dimensions or NEW:<lowerCamelCase>. Reuse an existing key whenever its sample values answer the same kind of question, even if its wording differs. Use NEW: only when no existing Dimension can hold the fact.",
-    "Example: Hawaii and Paris family trips both map to familyTrips; their destinations and trip instances differ only in entities/Statements. Never create familyTripHawaii/familyTripParis.",
+    "Treat dimensionKey as a reusable subject-free PROPERTY key. The runtime materializes a separate subject-bound Slot for (subjectRef, dimensionKey, scope); Statements are the Slot's candidate values.",
+    "For every factMapping, dimensionKey MUST be either an exact key from Known slots or NEW:<lowerCamelCase>. Reuse a key whenever the facts ask the same kind of question, even when their subjects differ. Use NEW: only when no known Property fits.",
+    `Every factMapping MUST include subjectRef. Use "${SCOPE_OWNER_SUBJECT}" for the memory owner's own preferences, plans, experiences, relationships, or assistant recommendations addressed to them. Use a plan-local entity ref for an intrinsic property of a specific entity/event; that ref MUST also appear in entities, even when reusing an existing entity.`,
+    `Example: Hawaii and Paris family trips both use dimensionKey familyTrips and subjectRef "${SCOPE_OWNER_SUBJECT}"; the trip events remain separate entities connected with core:about. Never create familyTripHawaii/familyTripParis.`,
+    'Example: an object\'s intrinsic color uses dimensionKey objectColor and that object\'s entity ref as subjectRef. Another object may reuse objectColor without sharing the same Slot or conflicting.',
     "Represent a distinct real-world occurrence as an event entity (for example travel:trip). Reuse an existing entity only when it is the same identity, not merely a similar kind.",
     "All claim-sensitive semantic relations MUST start at a factRef (the persisted Statement), so their trust follows that statement. Use core:about from a fact to its main entity/event.",
     "Never output core:contradicts, core:refines, or core:supersedes. Those epistemic decisions belong to a separate governed fact reconciler, not graph organization.",
@@ -124,7 +133,7 @@ export function buildGraphEnrichmentPrompt(input: GraphEnrichmentPromptInput): s
     `Respond with ONLY one JSON object:
 {
   "factMappings": [
-    {"factRef":"fact:0","dimensionKey":"NEW:familyTrips","dimensionDescription":"Family travel experiences","cardinality":"multi"}
+    {"factRef":"fact:0","subjectRef":"${SCOPE_OWNER_SUBJECT}","dimensionKey":"NEW:familyTrips","dimensionDescription":"Family travel experiences","cardinality":"multi"}
   ],
   "entities": [
     {"ref":"tripHawaii","type":"travel:trip","key":"hawaii-2023-05","value":"Hawaii family trip","scope":"context"},
@@ -180,6 +189,7 @@ export function normalizeGraphEnrichment(
       ref,
       content: {
         ...content,
+        subjectRef: mapping.subjectRef,
         dimensionKey: mapping.dimensionKey,
         ...(mapping.dimensionDescription
           ? { description: mapping.dimensionDescription }
@@ -253,12 +263,13 @@ export function normalizeGraphEnrichment(
 function normalizeFactMapping(raw: unknown): FactMapping {
   const entry = objectEntry(raw, "fact mapping");
   const factRef = requiredString(entry.factRef, "factMapping.factRef");
+  const subjectRef = requiredString(entry.subjectRef, "factMapping.subjectRef");
   let dimensionKey = requiredString(entry.dimensionKey, "factMapping.dimensionKey");
   if (/^new:/i.test(dimensionKey)) dimensionKey = dimensionKey.slice(dimensionKey.indexOf(":") + 1);
   if (!LOWER_CAMEL_CASE.test(dimensionKey)) {
     throw new AgentError(`graph enrichment dimensionKey must be lowerCamelCase: ${dimensionKey}`);
   }
-  const mapping: FactMapping = { factRef, dimensionKey };
+  const mapping: FactMapping = { factRef, subjectRef, dimensionKey };
   if (entry.dimensionDescription !== undefined) {
     mapping.dimensionDescription = requiredString(
       entry.dimensionDescription,
@@ -337,7 +348,7 @@ function dimensionHintsOf(
   const dimensions = (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).filter(
     (dimension) => wanted.has(dimension.key) && scopesEqual(dimension.scope, scope),
   );
-  const byKey = new Map(dimensions.map((dimension) => [dimension.key, dimension.id]));
+  const knownByKey = new Map(known.map((dimension) => [dimension.key, dimension]));
   const samples = new Map<string, unknown[]>();
   for (const statement of graph.queryNodes({ type: "core:statement" }) as StatementNode[]) {
     const values = samples.get(statement.dimension_id) ?? [];
@@ -345,9 +356,18 @@ function dimensionHintsOf(
     values.push(statement.value);
     samples.set(statement.dimension_id, values);
   }
-  return known.map((dimension) => ({
-    ...dimension,
-    sampleValues: samples.get(byKey.get(dimension.key) ?? "") ?? [],
+  return dimensions.map((dimension) => ({
+    ...(knownByKey.get(dimension.key) ?? {
+      key: dimension.key,
+      description: dimension.key,
+      cardinality: dimension.cardinality ?? "multi",
+    }),
+    dimensionId: dimension.id,
+    subjectRef: slotSubjectRef(dimension),
+    ...(slotSubjectLabel(graph, dimension)
+      ? { subjectLabel: slotSubjectLabel(graph, dimension) as string }
+      : {}),
+    sampleValues: samples.get(dimension.id) ?? [],
   }));
 }
 
@@ -372,6 +392,11 @@ function guardDimensionRemapping(
     ) {
       return;
     }
+    // Property and subject form one semantic address. Keeping a proposed
+    // entity subject after rejecting its Property remap can create nonsense
+    // such as `car.carAccessories = "Silver Honda Civic"`. Fall back as one
+    // unit; legacy extracted facts are owner-bound unless they already carry
+    // an explicit, trusted subject.
     fact.content = { ...original };
     plan.warnings.push(
       `unsafe dimension remap rejected: ${original.dimensionKey} -> ${proposed}`,

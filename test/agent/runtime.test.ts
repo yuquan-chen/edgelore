@@ -64,6 +64,7 @@ test("runtime: optional enrichment builds graph shape after fact extraction", as
       factMappings: [
         {
           factRef: "fact:0",
+          subjectRef: "$scopeOwner",
           dimensionKey: "familyTrips",
           dimensionDescription: "Family travel experiences",
           cardinality: "multi",

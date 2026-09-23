@@ -23,6 +23,7 @@ import { commitGraphWritePlan } from "./graph-write.js";
 import { runGate } from "./gate.js";
 import { runExtract } from "./extract.js";
 import type { KnownDimension } from "./prompt.js";
+import { slotLabel } from "./slots.js";
 import type { LlmDriver } from "./llm-driver.js";
 import type { EmbeddingDriver } from "./embedding-driver.js";
 import {
@@ -330,7 +331,7 @@ function toKnownDimension(d: DimensionNode, units: Map<string, string>): KnownDi
 export function contextMemoriesOf(graph: GraphStore, limit = 50): string[] {
   const keys = new Map<string, string>();
   for (const d of graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]) {
-    keys.set(d.id, d.key);
+    keys.set(d.id, slotLabel(graph, d));
   }
   const lines = (graph.queryNodes({ type: "core:statement" }) as StatementNode[]).map((s) => {
     const speaker = s.saidBy === "assistant" ? " (assistant)" : "";
@@ -473,7 +474,10 @@ export async function retrievalContext(
     const allMembers = membersByDim.get(dimId) ?? [];
     const scoped = scopeSet ? allMembers.filter(inScopeOf) : [];
     const members = scoped.length > 0 ? scoped : allMembers;
-    const key = dimById.get(dimId)?.key ?? statementHits.find((h) => h.dimensionId === dimId)?.dimensionKey ?? "?";
+    const dimension = dimById.get(dimId);
+    const key = dimension
+      ? slotLabel(graph, dimension)
+      : statementHits.find((h) => h.dimensionId === dimId)?.dimensionKey ?? "?";
     // Double-ended selection: oldest half + newest half. Oldest-only rendering
     // systematically hid the LATEST value of fast-growing dimensions (the
     // exact entries knowledge-update questions need).

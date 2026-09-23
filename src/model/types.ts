@@ -45,6 +45,22 @@ export interface Scope {
   phase_id?: string;
 }
 
+/** Lossless ingestion source kept outside the semantic graph. Episodes are
+ * immutable cold records: Claims point back through source_refs, while the
+ * original turns are neither graph nodes nor hot embeddings. */
+export interface EpisodeTurn {
+  role: string;
+  content: string;
+}
+
+export interface EpisodeRecord extends Provenance {
+  /** Stable source/session id, also used by Claim.source_refs. */
+  id: string;
+  scope?: Scope;
+  turns: EpisodeTurn[];
+  attributes: Record<string, unknown>;
+}
+
 // ---------------------------------------------------------------------------
 // State enums (closed, precise core semantics — see M0 spec §3).
 // ---------------------------------------------------------------------------

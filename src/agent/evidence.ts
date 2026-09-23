@@ -8,7 +8,7 @@
 // to operate only on core:statement nodes.
 
 import type { GraphStore } from "../model/store.js";
-import type { GraphNode, Scope } from "../model/types.js";
+import type { EpisodeRecord, GraphNode, Scope } from "../model/types.js";
 
 export const EVIDENCE_CHUNK_CHARS = 900;
 export const EVIDENCE_CHUNK_OVERLAP = 120;
@@ -23,6 +23,22 @@ export interface EvidenceContext {
   source_ref: string;
   createdAt?: string;
   scope?: Scope;
+}
+
+/** Store the lossless source once, outside the semantic node/edge graph. */
+export function archiveConversationEpisode(
+  graph: GraphStore,
+  turns: readonly EvidenceTurn[],
+  ctx: EvidenceContext,
+): EpisodeRecord {
+  return graph.putEpisode({
+    id: ctx.source_ref,
+    turns,
+    created_by: ctx.created_by,
+    created_at: ctx.createdAt,
+    scope: ctx.scope,
+    attributes: { kind: "conversation", verbatim: true },
+  });
 }
 
 function chunksOf(text: string): Array<{ value: string; start: number; end: number }> {

@@ -20,12 +20,23 @@ import type { GraphStore } from "../model/store.js";
 import { scopesEqual } from "../model/store.js";
 import type { Scope } from "../model/types.js";
 import { AgentError } from "./errors.js";
+import {
+  SCOPE_OWNER_SUBJECT,
+  SLOT_PROPERTY_KEY_ATTRIBUTE,
+  SLOT_SUBJECT_REF_ATTRIBUTE,
+  slotSubjectRef,
+} from "./slots.js";
 
 /** ② Agent-operated content — the ONLY fields the Agent authors. This is the
  * JSON/API contract between the Agent Memory layer and storage. */
 export interface CaptureContent {
-  /** Stable dimension key, e.g. "edgelore_author". Finds or creates the dimension. */
+  /** Stable Property key, persisted in the legacy dimension key during the
+   * compatibility experiment. */
   dimensionKey: string;
+  /** Subject owning this Property value. Omit for the current scope owner.
+   * Graph ingestion resolves plan-local entity refs to durable node ids before
+   * capture; direct/product capture may pass a stable subject ref itself. */
+  subjectRef?: string;
   /** The memory value (any JSON-serializable type). */
   value: unknown;
   /** Only used when CREATING a new dimension. Defaults to "multi". */
@@ -114,11 +125,20 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
     );
   }
   const saidByAssistant = content.saidBy === "assistant";
+  const subjectRef = content.subjectRef ?? SCOPE_OWNER_SUBJECT;
+  if (subjectRef.length === 0) {
+    throw new AgentError("CaptureContent.subjectRef must be non-empty when provided");
+  }
 
-  // 1. Resolve dimension by stable key INSIDE the caller's identity scope.
+  // 1. Resolve the physical Dimension as a semantic Slot. Slot identity is
+  // (subject, property, scope); legacy rows without subject metadata are the
+  // scope owner's Slot and remain readable without migration.
   const dimensions = graph.queryNodes({ type: "core:dimension" }) as DimensionNode[];
   const existing = dimensions.find(
-    (d) => d.key === content.dimensionKey && scopesEqual(d.scope, ctx.scope),
+    (d) =>
+      d.key === content.dimensionKey &&
+      slotSubjectRef(d) === subjectRef &&
+      scopesEqual(d.scope, ctx.scope),
   );
   let dimension: GraphNode;
   let created = false;
@@ -134,7 +154,11 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
       phase_id: ctx.scope?.phase_id,
       // description rides in open metadata (M0 §1.3: narrow state, wide
       // metadata) — it is what future extractors match phrases against.
-      attributes: content.description ? { description: content.description } : {},
+      attributes: {
+        ...(content.description ? { description: content.description } : {}),
+        [SLOT_PROPERTY_KEY_ATTRIBUTE]: content.dimensionKey,
+        [SLOT_SUBJECT_REF_ATTRIBUTE]: subjectRef,
+      },
       created_by: ctx.created_by,
       created_at: ctx.createdAt,
       source_refs: ctx.source_refs,

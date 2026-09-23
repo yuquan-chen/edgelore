@@ -32,6 +32,8 @@ import {
   SCHEMA_VERSION,
   type Constraint,
   type ConstraintState,
+  type EpisodeRecord,
+  type EpisodeTurn,
   type FactNodeState,
   type GraphEdge,
   type GraphNode,
@@ -105,6 +107,16 @@ export interface AddConstraintInput {
   tags?: string[];
 }
 
+export interface PutEpisodeInput {
+  id: string;
+  turns: readonly EpisodeTurn[];
+  created_by: string;
+  created_at?: string;
+  schema_version?: string;
+  scope?: Scope;
+  attributes?: Record<string, unknown>;
+}
+
 const now = () => new Date().toISOString();
 
 function assertValidCreatedBy(createdBy: string): void {
@@ -161,6 +173,9 @@ export interface GraphStore {
   transitionNodeState(id: string, to: FactNodeState): GraphNode;
   addEdge(input: AddEdgeInput): GraphEdge;
   queryEdges(filter: GraphEdgeQueryFilter): GraphEdge[];
+  putEpisode(input: PutEpisodeInput): EpisodeRecord;
+  getEpisode(id: string): EpisodeRecord | undefined;
+  getAllEpisodes(): EpisodeRecord[];
   /** Execute a graph mutation atomically for both memory and durable stores. */
   transaction<T>(fn: () => T): T;
 }
@@ -172,6 +187,42 @@ export class MemoryGraph implements GraphStore {
   protected nodes = new Map<string, GraphNode>();
   protected edges = new Map<string, GraphEdge>();
   protected constraints = new Map<string, Constraint>();
+  protected episodes = new Map<string, EpisodeRecord>();
+
+  // ------------------------------------------------------------- episodes
+
+  putEpisode(input: PutEpisodeInput): EpisodeRecord {
+    assertValidCreatedBy(input.created_by);
+    if (!input.id.trim()) throw new ModelError("episode requires a non-empty id");
+    const turns = input.turns.map((turn) => ({ role: turn.role, content: turn.content }));
+    const existing = this.episodes.get(input.id);
+    if (existing) {
+      if (JSON.stringify(existing.turns) !== JSON.stringify(turns)) {
+        throw new ModelError(`episode ${input.id} is immutable and already has different content`);
+      }
+      return existing;
+    }
+    const episode: EpisodeRecord = {
+      id: input.id,
+      turns,
+      created_by: input.created_by,
+      created_at: input.created_at ?? now(),
+      schema_version: input.schema_version ?? SCHEMA_VERSION,
+      source_refs: [input.id],
+      scope: input.scope,
+      attributes: input.attributes ?? {},
+    };
+    this.episodes.set(episode.id, episode);
+    return episode;
+  }
+
+  getEpisode(id: string): EpisodeRecord | undefined {
+    return this.episodes.get(id);
+  }
+
+  getAllEpisodes(): EpisodeRecord[] {
+    return [...this.episodes.values()];
+  }
 
   // ---------------------------------------------------------------- nodes
 
@@ -448,12 +499,14 @@ export class MemoryGraph implements GraphStore {
     const nodesBefore = structuredClone(this.nodes);
     const edgesBefore = structuredClone(this.edges);
     const constraintsBefore = structuredClone(this.constraints);
+    const episodesBefore = structuredClone(this.episodes);
     try {
       return fn();
     } catch (error) {
       this.nodes = nodesBefore;
       this.edges = edgesBefore;
       this.constraints = constraintsBefore;
+      this.episodes = episodesBefore;
       throw error;
     }
   }

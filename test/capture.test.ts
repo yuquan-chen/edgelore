@@ -170,11 +170,14 @@ test("capture: description is stored as attributes.description on new dimensions
   });
 });
 
-test("capture: no description -> attributes stay empty", () => {
+test("capture: new dimensions carry compatibility Slot coordinates", () => {
   forBackend((g) => {
     const r = capture(g, { dimensionKey: "author", value: "charles" }, ctx);
     const dim = g.getNode(r.dimensionId) as { attributes: Record<string, unknown> };
-    assert.deepEqual(dim.attributes, {});
+    assert.deepEqual(dim.attributes, {
+      propertyKey: "author",
+      subjectRef: "$scopeOwner",
+    });
   });
 });
 
@@ -301,5 +304,52 @@ test("capture: equal keys in the same owner scope reuse one dimension", () => {
     const second = capture(g, { dimensionKey: "familyTrips", value: "Paris" }, scoped);
     assert.equal(first.dimensionId, second.dimensionId);
     assert.equal(g.queryNodes({ type: "core:dimension", owner_id: "actor:alice" }).length, 1);
+  });
+});
+
+test("capture: equal Property keys on different subjects create isolated Slots", () => {
+  forBackend((g) => {
+    const scoped = { ...ctx, scope: { owner_id: "actor:alice" } };
+    const carA = capture(g, {
+      dimensionKey: "carColor",
+      subjectRef: "node:vehicle:car:a",
+      value: "black",
+      cardinality: "single",
+    }, scoped);
+    const carB = capture(g, {
+      dimensionKey: "carColor",
+      subjectRef: "node:vehicle:car:b",
+      value: "white",
+      cardinality: "single",
+    }, scoped);
+    assert.notEqual(carA.dimensionId, carB.dimensionId);
+    assert.equal(carA.conflict, false);
+    assert.equal(carB.conflict, false);
+    const dimensions = g.queryNodes({ type: "core:dimension", owner_id: "actor:alice" });
+    assert.equal(dimensions.length, 2);
+    assert.deepEqual(
+      dimensions.map((dimension) => dimension.attributes.subjectRef).sort(),
+      ["node:vehicle:car:a", "node:vehicle:car:b"],
+    );
+  });
+});
+
+test("capture: equal Property key and subject reuse one Slot", () => {
+  forBackend((g) => {
+    const scoped = { ...ctx, scope: { owner_id: "actor:alice" } };
+    const first = capture(g, {
+      dimensionKey: "carColor",
+      subjectRef: "node:vehicle:car:a",
+      value: "black",
+      cardinality: "single",
+    }, scoped);
+    const second = capture(g, {
+      dimensionKey: "carColor",
+      subjectRef: "node:vehicle:car:a",
+      value: "blue",
+      cardinality: "single",
+    }, scoped);
+    assert.equal(first.dimensionId, second.dimensionId);
+    assert.equal(second.conflict, true);
   });
 });

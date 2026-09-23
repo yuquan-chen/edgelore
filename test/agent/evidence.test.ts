@@ -2,9 +2,44 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MemoryGraph } from "../../src/model/store.js";
 import {
+  archiveConversationEpisode,
   archiveConversationEvidence,
   conversationEvidenceText,
 } from "../../src/agent/evidence.js";
+import { SqliteGraph } from "../../src/store/sqlite.js";
+import { mkdtempSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+test("evidence: archives one cold Episode without creating graph nodes", () => {
+  const graph = new MemoryGraph();
+  const turns = [
+    { role: "user", content: "My Honda is black." },
+    { role: "assistant", content: "Noted." },
+  ];
+  const episode = archiveConversationEpisode(graph, turns, {
+    created_by: "human:test",
+    source_ref: "session:cold",
+    createdAt: "2023-05-21",
+  });
+  assert.equal(episode.id, "session:cold");
+  assert.deepEqual(episode.turns, turns);
+  assert.equal(graph.queryNodes({}).length, 0);
+  assert.equal(graph.getAllEpisodes().length, 1);
+});
+
+test("evidence: cold Episodes survive SQLite reopen", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "edgelore-episode-")), "memory.db");
+  const first = new SqliteGraph(path);
+  archiveConversationEpisode(first, [{ role: "user", content: "Exact source" }], {
+    created_by: "human:test",
+    source_ref: "session:sqlite",
+  });
+  first.close();
+  const reopened = new SqliteGraph(path);
+  assert.equal(reopened.getEpisode("session:sqlite")?.turns[0]?.content, "Exact source");
+  reopened.close();
+});
 
 test("evidence: archives exact turns in bounded overlapping message chunks", () => {
   const graph = new MemoryGraph();

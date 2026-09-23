@@ -30,6 +30,7 @@ import type { DimensionNode, FactNodeState, GraphNode, StatementNode } from "../
 import type { EvaluationResult } from "../engine/evaluate.js";
 import type { EmbeddingDriver } from "./embedding-driver.js";
 import { conversationEvidenceText } from "./evidence.js";
+import { slotLabel } from "./slots.js";
 
 /** How many retrieval routes to run. Ablation switch, default "hybrid". */
 export type RetrievalMode = "hybrid" | "vector" | "lexical";
@@ -325,7 +326,8 @@ export function statementText(graph: GraphStore, stmt: StatementNode): string {
     dim.attributes.description !== dim.key
       ? ` ${dim.attributes.description}`
       : "";
-  return `${speaker}${dim?.key ?? ""}${desc} ${JSON.stringify(stmt.value)}${stmt.unit ? ` ${stmt.unit}` : ""}`;
+  const label = dim ? slotLabel(graph, dim) : "";
+  return `${speaker}${label}${desc} ${JSON.stringify(stmt.value)}${stmt.unit ? ` ${stmt.unit}` : ""}`;
 }
 
 // --- routes ------------------------------------------------------------------

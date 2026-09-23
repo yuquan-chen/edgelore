@@ -12,6 +12,7 @@ import {
   SqliteGraph,
   SqliteVectorStore,
   conversationEvidenceText,
+  statementText,
 } from "../../dist/src/index.js";
 import { boot, requireEmbedding } from "../lib/boot.mjs";
 
@@ -45,8 +46,7 @@ for (let i = 0; i < all.length; i += batch) {
   const chunk = all.slice(i, i + batch);
   const texts = chunk.map((node) => {
     if (node.type === "core:message") return conversationEvidenceText(node);
-    const dim = graph.getNode(node.dimension_id);
-    return `${dim?.key ?? ""} ${JSON.stringify(node.value)}${node.unit ? ` ${node.unit}` : ""}`;
+    return statementText(graph, node);
   });
   const vecs = await embedder.embed(texts);
   chunk.forEach((s, j) => vectors.put(s.id, vecs[j]));

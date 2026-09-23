@@ -176,6 +176,43 @@ test("graph write: harmless entity-key spelling differences reuse identity", () 
   });
 });
 
+test("graph write: resolves plan-local fact subjects into durable Slot identity", () => {
+  forBackend((graph) => {
+    const result = commitGraphWritePlan(
+      graph,
+      {
+        entities: [
+          { ref: "carA", type: "vehicle:car", key: "alice-honda", value: "Alice's Honda" },
+          { ref: "carB", type: "vehicle:car", key: "alice-toyota", value: "Alice's Toyota" },
+        ],
+        facts: [
+          {
+            ref: "carAColor",
+            content: { dimensionKey: "carColor", subjectRef: "carA", value: "black", cardinality: "single" },
+          },
+          {
+            ref: "carBColor",
+            content: { dimensionKey: "carColor", subjectRef: "carB", value: "white", cardinality: "single" },
+          },
+        ],
+        relations: [
+          { type: "core:about", from: "carAColor", to: "carA" },
+          { type: "core:about", from: "carBColor", to: "carB" },
+        ],
+      },
+      aliceCtx,
+    );
+
+    assert.equal(result.captures.length, 2);
+    assert.notEqual(result.captures[0]?.dimensionId, result.captures[1]?.dimensionId);
+    const slots = graph.queryNodes({ type: "core:dimension", owner_id: "actor:alice" });
+    assert.deepEqual(
+      slots.map((slot) => slot.attributes.subjectRef).sort(),
+      [result.refs.carA, result.refs.carB].sort(),
+    );
+  });
+});
+
 test("graph write: a failed relation rolls the whole plan back", () => {
   forBackend((graph) => {
     const bad = hawaiiPlan();

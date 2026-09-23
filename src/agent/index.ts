@@ -8,6 +8,7 @@
 export * from "./capture.js";
 export * from "./graph-write.js";
 export * from "./graph-enrichment.js";
+export * from "./graph-batch.js";
 export * from "./fact-reconciler.js";
 export * from "./errors.js";
 export * from "./llm-driver.js";
@@ -26,3 +27,4 @@ export * from "./conflicts.js";
 export * from "./ask.js";
 export * from "./triggers.js";
 export * from "./evidence.js";
+export * from "./slots.js";

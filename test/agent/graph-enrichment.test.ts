@@ -27,12 +27,14 @@ function reply(): string {
     factMappings: [
       {
         factRef: "fact:0",
+        subjectRef: "$scopeOwner",
         dimensionKey: "familyTrips",
         dimensionDescription: "Family travel experiences",
         cardinality: "multi",
       },
       {
         factRef: "fact:1",
+        subjectRef: "$scopeOwner",
         dimensionKey: "familyTrips",
         cardinality: "multi",
       },
@@ -101,7 +103,7 @@ test("graph enrichment: prompt exposes stored dimension examples and NEW protoco
     async complete(prompt: string): Promise<string> {
       seenPrompt = prompt;
       return JSON.stringify({
-        factMappings: [{ factRef: "fact:0", dimensionKey: "gasMileage" }],
+        factMappings: [{ factRef: "fact:0", subjectRef: "$scopeOwner", dimensionKey: "gasMileage" }],
         entities: [],
         relations: [],
       });
@@ -125,8 +127,8 @@ test("graph enrichment: rejects broad remaps but keeps compatible family reuse",
   const driver = new MockDriver([
     JSON.stringify({
       factMappings: [
-        { factRef: "fact:0", dimensionKey: "productivityStrategies" },
-        { factRef: "fact:1", dimensionKey: "familyTrips" },
+        { factRef: "fact:0", subjectRef: "$scopeOwner", dimensionKey: "productivityStrategies" },
+        { factRef: "fact:1", subjectRef: "$scopeOwner", dimensionKey: "familyTrips" },
       ],
       entities: [],
       relations: [],
@@ -163,8 +165,8 @@ test("graph enrichment: rejects a newly invented catch-all dimension", async () 
     driver: new MockDriver([
       JSON.stringify({
         factMappings: [
-          { factRef: "fact:0", dimensionKey: "NEW:carUse" },
-          { factRef: "fact:1", dimensionKey: "NEW:carUse" },
+          { factRef: "fact:0", subjectRef: "$scopeOwner", dimensionKey: "NEW:carUse" },
+          { factRef: "fact:1", subjectRef: "$scopeOwner", dimensionKey: "NEW:carUse" },
         ],
         entities: [],
         relations: [],
@@ -176,6 +178,34 @@ test("graph enrichment: rejects a newly invented catch-all dimension", async () 
     "friendMoveHelp",
   ]);
   assert.equal(plan.warnings.length, 2);
+});
+
+test("graph enrichment: rejected Property remaps also reject the proposed subject", async () => {
+  const plan = await runGraphEnrichment({
+    text: "I bought a silver Honda Civic on February 10.",
+    contents: [
+      { dimensionKey: "carAccessories", value: "Silver Honda Civic, bought on 2023-02-10" },
+    ],
+    knownDimensions: [],
+    graph: new MemoryGraph(),
+    driver: new MockDriver([
+      JSON.stringify({
+        factMappings: [
+          { factRef: "fact:0", subjectRef: "car", dimensionKey: "NEW:carIdentity" },
+        ],
+        entities: [
+          { ref: "car", type: "car:vehicle", key: "car", value: "User's car" },
+        ],
+        relations: [
+          { type: "core:about", from: "fact:0", to: "car" },
+        ],
+      }),
+    ]),
+  });
+
+  assert.equal(plan.facts[0]?.content.dimensionKey, "carAccessories");
+  assert.equal(plan.facts[0]?.content.subjectRef, undefined);
+  assert.match(plan.warnings.at(-1) ?? "", /unsafe dimension remap rejected/);
 });
 
 test("graph enrichment: refuses to lose a fact", () => {
@@ -224,7 +254,7 @@ test("graph enrichment: assistant-only entities inherit tentative trust", () => 
   const plan = normalizeGraphEnrichment(
     {
       factMappings: [
-        { factRef: "fact:0", dimensionKey: "travelRecommendations", cardinality: "multi" },
+        { factRef: "fact:0", subjectRef: "$scopeOwner", dimensionKey: "travelRecommendations", cardinality: "multi" },
       ],
       entities: [
         { ref: "trip", type: "travel:trip", key: "suggested-tybee-trip", scope: "context" },

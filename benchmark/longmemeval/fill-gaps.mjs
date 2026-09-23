@@ -14,6 +14,7 @@ import {
   buildBatchExtractionPrompt,
   normalizeBatchContents,
   relevantDimensionsOf,
+  statementText,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
 
@@ -84,10 +85,7 @@ for (let i = 0; i < targets.length; i++) {
     if (embedder) {
       const stmts = graph.queryNodes({ type: "core:statement" }).filter((s) => s.source_refs.includes(t.sid));
       if (stmts.length > 0) {
-        const texts = stmts.map((s) => {
-          const dim = graph.getNode(s.dimension_id);
-          return `${dim?.key ?? ""} ${JSON.stringify(s.value)}${s.unit ? ` ${s.unit}` : ""}`;
-        });
+        const texts = stmts.map((s) => statementText(graph, s));
         const vecs = await embedder.embed(texts);
         stmts.forEach((s, j) => vectors.put(s.id, vecs[j]));
       }

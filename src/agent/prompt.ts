@@ -76,7 +76,7 @@ const GATE_OUTPUT = [
 
 /** Input for building the gate prompt. */
 export interface GatePromptInput {
-  /** The conversation turn to judge. */
+  /** The conversation turn to assess. */
   text: string;
   /** Extra scenario fragments spliced in before the output contract (§4.3). */
   extraFragments?: readonly string[];
@@ -96,7 +96,7 @@ export function buildGatePrompt(input: GatePromptInput): string {
     "NOT worth storing (store=false):",
     GATE_REJECT_LIST,
     ...(input.extraFragments ?? []),
-    "Input text (the conversation turn to judge):",
+    "Input text (the conversation turn to assess):",
     input.text,
     GATE_OUTPUT,
   ];

@@ -11,6 +11,7 @@ import type { GraphStore } from "../model/store.js";
 import { scopesEqual } from "../model/store.js";
 import { capture, type CaptureContent, type CaptureContext, type CaptureResult } from "./capture.js";
 import { AgentError } from "./errors.js";
+import { SCOPE_OWNER_SUBJECT } from "./slots.js";
 
 /** An open-world entity or event that a fact may refer to. */
 export interface EntityDraft {
@@ -116,17 +117,10 @@ export function commitGraphWritePlan(
     const createdEntityIds: string[] = [];
     const createdEdgeIds: string[] = [];
 
-    // Facts are committed first so entity state can be derived from the
-    // statements that actually support it (rather than model-authored).
-    for (const draft of plan.facts) {
-      const result = capture(graph, draft.content, ctx);
-      if (!result.statementId) {
-        throw new AgentError(`capture returned no statement id for fact ref: ${draft.ref}`);
-      }
-      refs[draft.ref] = result.statementId;
-      captures.push(result);
-    }
-
+    // Resolve entity identities before facts: a subject-bound Slot needs the
+    // durable entity id. New entities start tentative unless the caller is an
+    // authoritative non-LLM writer; after facts exist, accepted supporting
+    // Claims promote them below.
     for (const draft of plan.entities) {
       const scope = entityScope(draft, ctx.scope);
       const key = canonicalEntityKey(draft.key);
@@ -146,9 +140,6 @@ export function commitGraphWritePlan(
       }
       const existing = matches[0];
       if (existing) {
-        if (existing.state === "tentative" && derivedEntityState(plan, draft.ref, refs, graph) === "accepted") {
-          graph.transitionNodeState(existing.id, "accepted");
-        }
         refs[draft.ref] = existing.id;
         continue;
       }
@@ -166,6 +157,41 @@ export function commitGraphWritePlan(
       });
       refs[draft.ref] = node.id;
       createdEntityIds.push(node.id);
+    }
+
+    for (const draft of plan.facts) {
+      const requestedSubject = draft.content.subjectRef;
+      let subjectRef = requestedSubject;
+      if (requestedSubject && requestedSubject !== SCOPE_OWNER_SUBJECT) {
+        subjectRef = refs[requestedSubject] ?? (graph.getNode(requestedSubject) ? requestedSubject : undefined);
+        if (!subjectRef) {
+          throw new AgentError(
+            `fact ${draft.ref} has unresolved subjectRef: ${requestedSubject}`,
+          );
+        }
+      }
+      const result = capture(
+        graph,
+        subjectRef ? { ...draft.content, subjectRef } : draft.content,
+        ctx,
+      );
+      if (!result.statementId) {
+        throw new AgentError(`capture returned no statement id for fact ref: ${draft.ref}`);
+      }
+      refs[draft.ref] = result.statementId;
+      captures.push(result);
+    }
+
+    // Derive entity trust only after the supporting Claims have durable ids.
+    for (const draft of plan.entities) {
+      const id = refs[draft.ref];
+      const node = id ? graph.getNode(id) : undefined;
+      if (
+        node?.state === "tentative" &&
+        derivedEntityState(plan, draft.ref, refs, graph) === "accepted"
+      ) {
+        graph.transitionNodeState(node.id, "accepted");
+      }
     }
 
     for (const draft of plan.relations) {

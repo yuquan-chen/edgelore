@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { MemoryGraph } from "../../src/model/store.js";
 import { MockDriver } from "../../src/agent/llm-driver.js";
 import { capture } from "../../src/agent/capture.js";
-import { archiveConversationEvidence } from "../../src/agent/evidence.js";
+import { archiveConversationEpisode, archiveConversationEvidence } from "../../src/agent/evidence.js";
 import { AgentError } from "../../src/agent/errors.js";
 import { MockEmbedder, type EmbeddingDriver } from "../../src/agent/embedding-driver.js";
 import { InMemoryVectorStore } from "../../src/agent/retrieval.js";
@@ -340,6 +340,132 @@ test("runtime: verbatim evidence is rendered directly with speaker and date", as
   assert.equal(lines.length, 1);
   assert.match(lines[0] ?? "", /conversationEvidence \(verbatim assistant @2023-04-18\)/);
   assert.match(lines[0] ?? "", /exactly 4 mummies/);
+});
+
+test("runtime: a Claim hit recovers focused verbatim evidence from its cold Episode", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [
+      { role: "user", content: "Which database would fit the analytics service?" },
+      {
+        role: "assistant",
+        content: "I recommend PostgreSQL 16 because the workload needs JSONB and reliable transactions.",
+      },
+      { role: "user", content: "Thanks, I will compare hosting prices later." },
+    ],
+    { created_by: "human:charles", source_ref: "session:database", createdAt: "2023-06-12" },
+  );
+  capture(
+    graph,
+    {
+      dimensionKey: "databaseRecommendation",
+      value: "PostgreSQL for the analytics service",
+      saidBy: "assistant",
+    },
+    { ...ctx, source_refs: ["session:database"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(graph, "Which database did the assistant recommend?", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+  });
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence"));
+  assert.ok(evidence.some((line) => line.includes("PostgreSQL 16")));
+  assert.ok(evidence.some((line) => line.includes("source session:database")));
+  assert.equal(graph.queryNodes({ type: "core:message" }).length, 0, "cold recovery must not create Message nodes");
+});
+
+test("runtime: cold Episode recovery respects account scope and does not mix fallback sources", async () => {
+  const graph = new MemoryGraph();
+  for (const [source, answer] of [["s:alice", "Alice chose PostgreSQL"], ["s:bob", "Bob chose MySQL"]] as const) {
+    archiveConversationEpisode(
+      graph,
+      [{ role: "assistant", content: answer }],
+      { created_by: "human:charles", source_ref: source, createdAt: "2023-06-12" },
+    );
+    capture(
+      graph,
+      { dimensionKey: "databaseChoice", value: answer, saidBy: "assistant" },
+      { ...ctx, source_refs: [source] },
+    );
+  }
+  const lines = await contextMemoriesViaRetrieval(graph, "database choice PostgreSQL MySQL", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+    scopeSessionIds: ["s:alice"],
+  });
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /Alice chose PostgreSQL/);
+  assert.ok(!evidence.includes("Bob chose MySQL"));
+});
+
+test("runtime: scoped cold lexical fallback recovers a fact missing from Claims", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [{ role: "assistant", content: "The song Evolution best demonstrates the band's growth on the Fifth Album." }],
+    { created_by: "human:charles", source_ref: "s:fifth-album", createdAt: "2023-05-20" },
+  );
+  // The extractor retained an unrelated memory but completely missed the
+  // requested assistant detail. There is deliberately no Claim for Evolution.
+  capture(
+    graph,
+    { dimensionKey: "musicGenre", value: "indie folk" },
+    { ...ctx, source_refs: ["s:fifth-album"] },
+  );
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "Which Fifth Album song best demonstrated the band's growth?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:fifth-album"],
+    },
+  );
+  assert.ok(lines.some((line) => line.includes("song Evolution")));
+});
+
+test("runtime: core:about expands a direct Claim to a bounded related Slot", async () => {
+  const graph = new MemoryGraph();
+  const trip = graph.addNode({
+    type: "travel:trip",
+    key: "hawaii-trip",
+    value: "Hawaii family trip",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const summaryResult = capture(
+    graph,
+    { dimensionKey: "familyTrips", value: "Family trip to Hawaii" },
+    ctx,
+  );
+  const activityResult = capture(
+    graph,
+    { dimensionKey: "tripActivities", value: "Snorkeling at Hanauma Bay" },
+    ctx,
+  );
+  const summary = graph.getNode(summaryResult.statementId!);
+  const activity = graph.getNode(activityResult.statementId!);
+  assert.ok(summary);
+  assert.ok(activity);
+  graph.addEdge({ type: "core:about", from: summary.id, to: trip.id, created_by: "human:charles" });
+  graph.addEdge({ type: "core:about", from: activity.id, to: trip.id, created_by: "human:charles" });
+
+  const lines = await contextMemoriesViaRetrieval(graph, "Tell me about the Hawaii family trip", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+    k: 1,
+    maxGraphExpansionHits: 1,
+  });
+  const joined = lines.join("\n");
+  assert.match(joined, /familyTrips/);
+  assert.match(joined, /tripActivities/);
+  assert.match(joined, /Snorkeling at Hanauma Bay/);
 });
 
 // --- 相关维度选择（批量抽取的 O(维度数) prompt 爆炸修复） -----------------------

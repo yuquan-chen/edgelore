@@ -80,7 +80,16 @@ test("ask: rule 3 states the recency principle without referencing any benchmark
   assert.match(p, /LATEST USER-stated/);
   assert.match(p, /even if it is still tentative/);
   assert.match(p, /never overrides an accepted user value/);
+  assert.match(p, /same real-world property/);
+  assert.match(p, /grouping\/key drift/);
   assert.ok(!/yoga|therapy|apex|harvard/i.test(p), "prompt must stay case-agnostic");
+});
+
+test("ask: aggregation distinguishes summed amounts from elapsed wall-clock time", () => {
+  const p = buildAskPrompt("q", ["x — 1 entry:"]);
+  assert.match(p, /total across named activities\/items/);
+  assert.match(p, /add their recorded durations, costs, or/);
+  assert.match(p, /elapsed calendar time/);
 });
 
 test("ask: rule 6 keeps non-user-account entries out of aggregates", () => {

@@ -429,6 +429,129 @@ test("runtime: scoped cold lexical fallback recovers a fact missing from Claims"
   assert.ok(lines.some((line) => line.includes("song Evolution")));
 });
 
+test("runtime: cold Episode evidence gives each relevant source a quota", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [{ role: "user", content: "The Hawaii family trip lasted ten days." }],
+    { created_by: "human:charles", source_ref: "s:hawaii", createdAt: "2023-05-21" },
+  );
+  archiveConversationEpisode(
+    graph,
+    [{ role: "user", content: "The New York City solo trip lasted five days." }],
+    { created_by: "human:charles", source_ref: "s:new-york", createdAt: "2023-05-20" },
+  );
+  capture(
+    graph,
+    { dimensionKey: "familyTrips", value: "Completed a family trip to Hawaii" },
+    { ...ctx, source_refs: ["s:hawaii"] },
+  );
+  capture(
+    graph,
+    { dimensionKey: "soloTrips", value: "Completed a solo trip to New York City" },
+    { ...ctx, source_refs: ["s:new-york"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "How many days did I travel in Hawaii and New York City?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:hawaii", "s:new-york"],
+      maxEpisodeEvidenceLines: 2,
+    },
+  );
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /ten days/);
+  assert.match(evidence, /five days/);
+});
+
+test("runtime: Claim lanes recover adjacent detail without adding Message nodes", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [
+      { role: "user", content: "Max needs flea medication every two weeks." },
+      { role: "assistant", content: "Ask the dog walker whether medication is included." },
+      {
+        role: "user",
+        content: "Which collar would suit a Golden Retriever like Max?",
+      },
+      { role: "assistant", content: "A durable nylon collar would work well." },
+      { role: "user", content: "I chose a nylon collar and engraved name tag for Max." },
+    ],
+    { created_by: "human:charles", source_ref: "s:max", createdAt: "2023-05-22" },
+  );
+  capture(
+    graph,
+    { dimensionKey: "dogMedication", value: "Max needs flea medication every two weeks" },
+    { ...ctx, source_refs: ["s:max"] },
+  );
+  capture(
+    graph,
+    { dimensionKey: "dogCollarChoice", value: "Chose a nylon collar for Max" },
+    { ...ctx, source_refs: ["s:max"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(graph, "What breed is my dog?", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+    scopeSessionIds: ["s:max"],
+    maxEpisodeEvidenceLines: 6,
+  });
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /Golden Retriever/);
+  assert.equal(graph.queryNodes({ type: "core:message" }).length, 0);
+});
+
+test("runtime: long Episode evidence uses complete semantic units under the fixed budget", async () => {
+  const graph = new MemoryGraph();
+  const longAnswer = [
+    "# The Lost Temple of the Djinn",
+    "The party crosses the desert and enters the buried temple.",
+    ...Array.from({ length: 20 }, (_, index) => `Background paragraph ${index + 1} describes an ancient chamber and its traps.`),
+    "* Mummies (4):",
+    "  + Armor Class: 11",
+    "  + Hit Points: 45",
+    "* Construct Guardians (2):",
+    "  + Armor Class: 17",
+  ].join("\n\n");
+  archiveConversationEpisode(
+    graph,
+    [{ role: "assistant", content: longAnswer }],
+    { created_by: "human:charles", source_ref: "s:temple", createdAt: "2023-05-21" },
+  );
+  capture(
+    graph,
+    {
+      dimensionKey: "dndOneShot",
+      value: "The Lost Temple includes mummies and construct guardians",
+      saidBy: "assistant",
+    },
+    { ...ctx, source_refs: ["s:temple"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "How many mummies will the party face in the Lost Temple?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:temple"],
+      maxEpisodeEvidenceLines: 6,
+      maxEpisodeExcerptChars: 220,
+    },
+  );
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence"));
+  assert.ok(evidence.length <= 6);
+  assert.ok(evidence.every((line) => !line.includes("…")), "must not use arbitrary character slices");
+  assert.ok(evidence.every((line) => line.length <= 420), "metadata plus each semantic unit stays bounded");
+});
+
 test("runtime: core:about expands a direct Claim to a bounded related Slot", async () => {
   const graph = new MemoryGraph();
   const trip = graph.addNode({

@@ -17,16 +17,17 @@ const reportPath = join(here, "..", "..", "docs", "notes", `failure-attribution-
 const audit = JSON.parse(readFileSync(inputPath, "utf8"));
 
 const reviewed = {
-  // Claim missing, materially wrong, or too lossy for the answer.
-  dd2973ad: ["ingestion_loss", "temporal_normalization", "相邻两天的相对时间被换算成互不相邻的绝对日期，破坏了‘预约前一天’关系。"],
-  edced276: ["ingestion_loss", "exact_payload", "原文中的夏威夷 10 天没有进入 Claim；Episode 回退也没有命中该证据回合。"],
-  "89527b6b": ["ingestion_loss", "exact_payload", "Plesiosaur 的蓝色被摘要掉，证据片段又恰好在颜色之前截断。"],
-  "18dcd5a5": ["ingestion_loss", "exact_payload", "原文的 Mummies (4) 被抽成笼统事件，数量没有保留。"],
-  "5809eb10": ["ingestion_loss", "exact_payload", "原文的开工年份 2014 没有进入 Claim。"],
-  eaca4986: ["ingestion_loss", "exact_payload", "第二首歌的副歌和弦序列被概括掉。"],
-  "75499fd8": ["ingestion_loss", "entity_attribute", "Max 的 Golden Retriever 犬种没有被抽取。"],
-  gpt4_1e4a8aec: ["ingestion_loss", "exact_payload", "种下 12 株番茄苗这一动作与数量没有被完整保留。"],
-  "73d42213": ["ingestion_loss", "event_endpoint", "两小时路程被保留，但周一 7:00 出发这一计算端点没有进入 Claim。"],
+  // The raw fact and Claim -> Episode path both exist. The original reader
+  // chose the wrong turn/section inside that Episode.
+  dd2973ad: ["episode_evidence_failure", "multi_episode_turn", "原文与 Claim→Episode 路径都存在；旧算法没有同时选中预约与前一晚 2:00 入睡的两个证据回合。"],
+  edced276: ["episode_evidence_failure", "multi_episode_turn", "夏威夷 10 天与纽约 5 天都在原始 Episode 中；旧算法让泛化旅行段落挤掉了 10 天证据。"],
+  "89527b6b": ["episode_evidence_failure", "fixed_window_truncation", "Plesiosaur 的蓝色仍在 Episode；固定字符窗口恰好截断在颜色之前。"],
+  "18dcd5a5": ["episode_evidence_failure", "markdown_section", "Mummies (4) 完整保存在长 Markdown 回答中；旧算法没有选中对应列表小节。"],
+  "5809eb10": ["episode_evidence_failure", "long_turn_selection", "开工年份 2014 完整保存在 Episode；旧算法被同一长回合中的标题与摘要占满。"],
+  eaca4986: ["episode_evidence_failure", "section_selection", "第二首歌的完整副歌和弦仍在 Episode；旧算法只恢复了前面的歌曲片段。"],
+  "75499fd8": ["episode_evidence_failure", "adjacent_detail", "Golden Retriever 位于与 collar Claim 相邻的用户回合；旧算法只返回了用药和选定项。"],
+  gpt4_1e4a8aec: ["episode_evidence_failure", "temporal_episode_priority", "种下 12 株番茄苗的原句仍在 Episode；旧算法没有把‘两周前’对齐到正确 Episode 与回合。"],
+  "73d42213": ["episode_evidence_failure", "multi_episode_turn", "7:00 出发与两小时路程分别保存在两个 Episode；旧算法未同时恢复两个计算端点。"],
 
   // A sufficient Claim exists, but the produced MemoryCapsule omitted it.
   a3838d2b: ["retrieval_miss", "set_completeness", "Walk for Wildlife 已入库，但跨多个近义 Slot 聚合时没有召回。"],
@@ -112,13 +113,13 @@ const output = {
 writeFileSync(outputPath, `${JSON.stringify(output, null, 2)}\n`);
 
 const labels = {
-  ingestion_loss: "摄入损失",
+  episode_evidence_failure: "Episode 证据选择失败",
   retrieval_miss: "召回遗漏",
   scope_pollution: "作用域污染",
   answer_failure: "回答阶段失败",
   benchmark_or_judge_issue: "题目/裁判问题",
 };
-const order = ["ingestion_loss", "retrieval_miss", "scope_pollution", "answer_failure", "benchmark_or_judge_issue"];
+const order = ["episode_evidence_failure", "retrieval_miss", "scope_pollution", "answer_failure", "benchmark_or_judge_issue"];
 const lines = [
   "# v7 错题阶段归因",
   "",
@@ -128,11 +129,11 @@ const lines = [
   "| --- | ---: | ---: |",
   ...order.map((cause) => `| ${labels[cause]} | ${counts[cause]} | ${(counts[cause] / failures.length * 100).toFixed(1)}% |`),
   "",
-  "这说明 90.4% 之后的主要矛盾已经不全在摄入：真正明确的摄入损失是 9 题，明确召回遗漏是 6 题；25 题的所需证据已经交给回答模型，错误发生在计数、时间、状态、指代、拒答或 provenance 使用阶段。另有 6 题存在标准答案或 judge 问题，不应反向污染架构设计。",
+  "这 9 题不是摄入损失：原文仍在 Episode，Claim→Episode 路径也存在，失败发生在 Episode 内部的 turn/section 选择。另有 6 题是跨 Slot 的召回遗漏；25 题的所需证据已经交给回答模型，错误发生在计数、时间、状态、指代、拒答或 provenance 使用阶段。还有 6 题存在标准答案或 judge 问题，不应反向污染架构设计。",
   "",
   "## 对主线二的直接结论",
   "",
-  "摄入层优先修复“不可压缩载荷”：数字、日期、颜色、专名、枚举、代码/和弦序列、实体属性必须以结构字段或 EvidenceSpan 保真，不能只留自然语言摘要。相对时间换算还必须保留原表达和锚点，避免把本来相邻的事件换算坏。",
+  "暂不修改摄入，也不增加 EvidenceSpan 节点。现有 Episode 已承担无损原件职责，Claim 继续作为可检索、可冲突判断的语义索引。先修复 Episode 读取：按 Episode 分配证据位置，再按 turn 与 Markdown/列表/代码/歌曲 section 选择完整语义单元。",
   "",
   "召回层优先修复集合完整性和多 Claim 计算依赖：先召回候选 Slot，再做同义 Slot 扩张，并为 count/max/sum/difference/order 等问题生成有界的 completeness plan。账户/项目 scope 必须在检索前硬过滤，不能靠回答模型忽略 foreign-account 结果。",
   "",

@@ -365,7 +365,20 @@ const EVIDENCE_STOP_WORDS = new Set([
 function evidenceTerms(text: string): Set<string> {
   const terms = new Set<string>();
   for (const token of text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []) {
-    if (token.length >= 3 && !EVIDENCE_STOP_WORDS.has(token)) terms.add(token);
+    if (token.length < 3 || EVIDENCE_STOP_WORDS.has(token)) continue;
+    terms.add(token);
+    // Tiny, deterministic English morphology for local Episode matching.
+    // This is intentionally not a general stemmer: it only bridges common
+    // retrieval variants such as garden/gardening, travel/traveling and
+    // mummy/mummies without changing the stored text.
+    if (/^[a-z]+$/.test(token)) {
+      if (token.length > 5 && token.endsWith("ies")) terms.add(`${token.slice(0, -3)}y`);
+      else if (token.length > 5 && token.endsWith("ing")) terms.add(token.slice(0, -3));
+      else if (token.length > 4 && token.endsWith("ed")) terms.add(token.slice(0, -2));
+      else if (token.length > 4 && token.endsWith("s") && !token.endsWith("ss")) {
+        terms.add(token.slice(0, -1));
+      }
+    }
   }
   // Chinese and other no-whitespace text needs a second route. Prefixing the
   // feature prevents accidental equality with ordinary word tokens.
@@ -385,32 +398,71 @@ function preferredEvidenceRole(query: string): "user" | "assistant" | undefined 
   if (/\b(?:you|assistant)\b.{0,28}\b(?:said|told|mentioned|recommended|suggested|wrote|gave)\b/i.test(query)) {
     return "assistant";
   }
-  if (/\b(?:i|my|me|mine)\b/i.test(query)) return "user";
+  // "I'm looking back" / "remind me" is retrieval framing, not evidence
+  // authorship. Only explicit possession or a predicate applied to "I"
+  // identifies a user-authored fact.
+  if (/\b(?:my|mine)\b|\b(?:did|do|have|had|was|were|when|where|what|how)\s+i\b/i.test(query)) {
+    return "user";
+  }
   return undefined;
 }
 
-function focusedEpisodeExcerpt(
-  content: string,
-  focusTerms: ReadonlySet<string>,
-  maxChars: number,
-): string {
+/**
+ * Split a long turn at semantic boundaries instead of slicing an arbitrary
+ * character window. Short turns remain intact. Long Markdown answers retain
+ * complete paragraphs / sections; oversized sections degrade to complete
+ * list items or sentences, never a fragment that can cut off the payload.
+ */
+function episodeEvidenceUnits(content: string, maxChars: number): string[] {
   const text = content.trim();
-  if (text.length <= maxChars) return text;
-  const overlap = Math.min(240, Math.floor(maxChars / 4));
-  const step = Math.max(1, maxChars - overlap);
-  let bestStart = 0;
-  let bestScore = -1;
-  for (let start = 0; start < text.length; start += step) {
-    const slice = text.slice(start, Math.min(text.length, start + maxChars));
-    const score = overlapCount(focusTerms, evidenceTerms(slice));
-    if (score > bestScore) {
-      bestScore = score;
-      bestStart = start;
+  if (!text) return [];
+  if (text.length <= maxChars) return [text];
+
+  const blocks = text.split(/\r?\n\s*\r?\n/).map((block) => block.trim()).filter(Boolean);
+  const units: string[] = [];
+  let pendingHeading: string | undefined;
+  const headingOnly = /^(?:#{1,6}\s+.+|\*\*[^\n*]+\*\*:|[-*+]\s+.+:|(?:verse|chorus|bridge|outro)\s*:)$/i;
+  const listLine = /^(?:[-*+]\s+|\d+[.)]\s+)/;
+
+  const pushNatural = (raw: string) => {
+    const value = raw.trim();
+    if (!value) return;
+    if (value.length <= maxChars) {
+      units.push(value);
+      return;
     }
-    if (start + maxChars >= text.length) break;
+    const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (lines.length > 1) {
+      let sectionHeading: string | undefined;
+      for (const line of lines) {
+        if (headingOnly.test(line)) {
+          sectionHeading = line;
+          continue;
+        }
+        const candidate = sectionHeading && (listLine.test(line) || line.length <= maxChars)
+          ? `${sectionHeading}\n${line}`
+          : line;
+        if (candidate.length <= maxChars) units.push(candidate);
+      }
+      return;
+    }
+    for (const sentence of value.split(/(?<=[.!?])\s+(?=[A-Z0-9"'(])/)) {
+      const candidate = sentence.trim();
+      if (candidate && candidate.length <= maxChars) units.push(candidate);
+    }
+  };
+
+  for (const block of blocks) {
+    if (headingOnly.test(block)) {
+      pendingHeading = block;
+      continue;
+    }
+    const value = pendingHeading ? `${pendingHeading}\n${block}` : block;
+    pendingHeading = undefined;
+    pushNatural(value);
   }
-  const slice = text.slice(bestStart, Math.min(text.length, bestStart + maxChars)).trim();
-  return `${bestStart > 0 ? "…" : ""}${slice}${bestStart + maxChars < text.length ? "…" : ""}`;
+  if (pendingHeading) pushNatural(pendingHeading);
+  return units;
 }
 
 interface EpisodeSourceAnchor {
@@ -428,9 +480,29 @@ interface EpisodeEvidence {
   episode: EpisodeRecord;
   turn: EpisodeTurn;
   turnIndex: number;
+  unitIndex: number;
   score: number;
-  focusTerms: Set<string>;
   outOfScope: boolean;
+}
+
+interface RankedEpisodeUnit extends EpisodeEvidence {
+  terms: Set<string>;
+}
+
+function localLexicalScore(
+  needles: ReadonlySet<string>,
+  unitTerms: ReadonlySet<string>,
+  termWeights?: ReadonlyMap<string, number>,
+): number {
+  let weightedMatches = 0;
+  for (const term of needles) {
+    if (unitTerms.has(term)) weightedMatches += termWeights?.get(term) ?? 1;
+  }
+  if (weightedMatches === 0) return 0;
+  // Episode-local inverse frequency stops a repeated topic word ("temple",
+  // "construction") from drowning the rarer payload-bearing phrase. The
+  // density term favors a precise list item over a generic long paragraph.
+  return weightedMatches + (weightedMatches * 2) / Math.max(1, Math.sqrt(unitTerms.size));
 }
 
 /**
@@ -514,92 +586,167 @@ function coldEpisodeEvidence(
   }
 
   const perSource: EpisodeEvidence[][] = [];
-  const maxSources = Math.max(1, Math.min(4, maxLines));
+  const maxSources = Math.max(1, Math.min(5, maxLines));
   for (const anchor of ordered.slice(0, maxSources)) {
     const episode = graph.getEpisode(anchor.sourceRef);
     if (!episode) continue;
-    const claimTerms = new Set(anchor.claims.flatMap((claim) => [...claim.terms]));
-    const focusTerms = new Set([...queryTerms, ...claimTerms]);
-    const rankedTurns = episode.turns
-      .map((turn, turnIndex) => {
-        const turnTerms = evidenceTerms(turn.content);
-        const queryMatches = overlapCount(queryTerms, turnTerms);
-        let claimFit = 0;
-        for (const claim of anchor.claims) {
-          const roleBonus = claim.role === turn.role ? 0.75 : 0;
-          const rankBonus = Number.isFinite(claim.rank) ? 1 / (claim.rank + 1) : 0;
-          claimFit = Math.max(
-            claimFit,
-            overlapCount(claim.terms, turnTerms) + roleBonus + rankBonus,
-          );
-        }
-        return {
-          episode,
-          turn,
-          turnIndex,
-          // Exact question vocabulary decides the turn first. Claim fit is a
-          // tie-breaker and the sole route only when the question paraphrases
-          // the source so strongly that lexical overlap is zero.
-          score: queryMatches > 0
-            ? queryMatches * 100 + (preferredRole === turn.role ? 50 : 0) + Math.min(claimFit, 49)
-            : claimFit + (preferredRole === turn.role ? 0.5 : 0),
-          focusTerms,
-          outOfScope: Boolean(scopeSet?.size && !scopeSet.has(anchor.sourceRef)),
-        } satisfies EpisodeEvidence;
-      })
-      .filter((candidate) => candidate.turn.content.trim().length > 0 && candidate.score > 0)
-      .sort((a, b) => b.score - a.score || a.turnIndex - b.turnIndex);
-    if (rankedTurns.length === 0) continue;
-
-    const chosen = [rankedTurns[0]!];
-    const secondRelevant = rankedTurns.find((candidate) => candidate.turnIndex !== chosen[0]!.turnIndex);
-    if (secondRelevant && secondRelevant.score >= Math.max(1, chosen[0]!.score * 0.35)) {
-      chosen.push(secondRelevant);
-    } else {
-      // A neighboring opposite-role turn often contains the question half of
-      // a recommendation/answer. It is bounded to one companion, not a dump.
-      const seed = chosen[0]!;
-      const neighborIndexes = [seed.turnIndex - 1, seed.turnIndex + 1];
-      const neighborIndex = neighborIndexes.find((index) => {
-        const turn = episode.turns[index];
-        return turn && turn.content.trim().length > 0 && turn.role !== seed.turn.role;
-      });
-      if (neighborIndex !== undefined) {
-        chosen.push({
-          episode,
-          turn: episode.turns[neighborIndex]!,
-          turnIndex: neighborIndex,
-          score: Math.max(0.5, seed.score * 0.25),
-          focusTerms,
-          outOfScope: seed.outOfScope,
-        });
+    const units = episode.turns
+      .flatMap((turn, turnIndex) =>
+        episodeEvidenceUnits(turn.content, maxChars).map((content, unitIndex) => {
+          const unitTerms = evidenceTerms(content);
+          return {
+            episode,
+            turn: { ...turn, content },
+            turnIndex,
+            unitIndex,
+            score: 0,
+            terms: unitTerms,
+            outOfScope: Boolean(scopeSet?.size && !scopeSet.has(anchor.sourceRef)),
+          } satisfies RankedEpisodeUnit;
+        }),
+      )
+      .filter((candidate) => candidate.turn.content.trim().length > 0);
+    if (units.length === 0) continue;
+    const documentFrequency = new Map<string, number>();
+    for (const unit of units) {
+      for (const term of unit.terms) {
+        documentFrequency.set(term, (documentFrequency.get(term) ?? 0) + 1);
       }
     }
-    chosen.sort((a, b) => a.turnIndex - b.turnIndex);
-    perSource.push(chosen);
+    const termWeights = new Map(
+      [...documentFrequency].map(([term, frequency]) => [
+        term,
+        Math.log(1 + (units.length + 1) / (frequency + 1)),
+      ]),
+    );
+
+    // Do not collapse all anchor Claims into one max score. Each Claim is a
+    // separate route back into the Episode and gets to nominate evidence of
+    // its own. This preserves details adjacent to a concise Claim (breed near
+    // a collar choice, a count inside a long encounter, etc.) instead of
+    // letting the broadest Claim monopolize every local result.
+    const roleCompatibleClaims = preferredRole && anchor.claims.some((claim) => claim.role === preferredRole)
+      ? anchor.claims.filter((claim) => claim.role === preferredRole)
+      : anchor.claims;
+    const bestClaimRank = Math.min(...roleCompatibleClaims.map((claim) => claim.rank));
+    const nearbyClaims = roleCompatibleClaims.filter((claim) => claim.rank <= bestClaimRank + 2);
+    const claimsByQueryFit = nearbyClaims
+      .map((claim) => ({ claim, queryFit: overlapCount(queryTerms, claim.terms) }))
+      .sort((a, b) => b.queryFit - a.queryFit || a.claim.rank - b.claim.rank);
+    const queryMatchingClaims = claimsByQueryFit.filter((entry) => entry.queryFit > 0);
+    const bestQueryFit = queryMatchingClaims[0]?.queryFit ?? 0;
+    const focusedClaims = bestQueryFit > 0
+      ? queryMatchingClaims.filter((entry) => entry.queryFit >= Math.max(1, Math.ceil(bestQueryFit * 0.6)))
+      : claimsByQueryFit;
+    const nominatedClaims = focusedClaims
+      .slice(0, 3)
+      .map((entry) => entry.claim);
+
+    const lanes: RankedEpisodeUnit[][] = nominatedClaims.map((claim) => {
+      const rankWeight = Number.isFinite(claim.rank) ? 1 / Math.sqrt(claim.rank + 1) : 0.25;
+      return units
+        .map((unit) => {
+          const queryFit = localLexicalScore(queryTerms, unit.terms, termWeights);
+          const claimFit = localLexicalScore(claim.terms, unit.terms, termWeights);
+          const speakerFit = claim.role === unit.turn.role ? 6 : 0;
+          const preferredSpeakerFit = preferredRole === unit.turn.role ? 2 : 0;
+          return {
+            ...unit,
+            // The question chooses among evidence nominated by this Claim;
+            // Claim vocabulary bridges paraphrases; speaker is a tie-breaker.
+            score:
+              queryFit * 8 +
+              claimFit * (3 + rankWeight) +
+              speakerFit +
+              preferredSpeakerFit,
+          };
+        })
+        .filter((candidate) => candidate.score > 0)
+        .sort(
+          (a, b) =>
+            Number(b.turn.role === claim.role) - Number(a.turn.role === claim.role) ||
+            b.score - a.score ||
+            a.turnIndex - b.turnIndex ||
+            a.unitIndex - b.unitIndex,
+        );
+    });
+
+    // If this Episode was found only by the scoped cold fallback, the query
+    // itself is its nomination lane. It is also a safe fallback for a Claim
+    // whose vocabulary has no surviving overlap with any semantic unit.
+    if (lanes.length === 0 || lanes.every((lane) => lane.length === 0)) {
+      lanes.push(
+        units
+          .map((unit) => ({
+            ...unit,
+            score:
+              localLexicalScore(queryTerms, unit.terms, termWeights) * 8 +
+              (preferredRole === unit.turn.role ? 2 : 0),
+          }))
+          .filter((candidate) => candidate.score > 0)
+          .sort(
+            (a, b) =>
+              b.score - a.score ||
+              a.turnIndex - b.turnIndex ||
+              a.unitIndex - b.unitIndex,
+          ),
+      );
+    }
+
+    // Round-robin the Claim lanes as well as the Episode lanes. First-pass
+    // evidence covers distinct semantic anchors; later passes recover nearby
+    // detail without increasing the configured line or character budget.
+    const rankedUnits: EpisodeEvidence[] = [];
+    const emitted = new Set<string>();
+    const cursors = lanes.map(() => 0);
+    while (rankedUnits.length < units.length) {
+      let added = false;
+      for (let laneIndex = 0; laneIndex < lanes.length; laneIndex++) {
+        const lane = lanes[laneIndex]!;
+        let candidate: RankedEpisodeUnit | undefined;
+        while (cursors[laneIndex]! < lane.length) {
+          const next = lane[cursors[laneIndex]!]!;
+          cursors[laneIndex]! += 1;
+          const key = `${next.turnIndex}:${next.unitIndex}`;
+          if (emitted.has(key)) continue;
+          emitted.add(key);
+          candidate = next;
+          break;
+        }
+        if (!candidate) continue;
+        const { terms: _terms, ...evidence } = candidate;
+        rankedUnits.push(evidence);
+        added = true;
+      }
+      if (!added) break;
+    }
+    if (rankedUnits.length > 0) perSource.push(rankedUnits);
   }
 
-  // Round-robin prevents one long source from consuming every evidence slot;
-  // multi-session questions retain coverage across several Episodes.
+  // Episode quota comes before global competition: every high-ranked source
+  // gets one semantic unit before any source gets a second. This prevents one
+  // verbose assistant response from starving another relevant Episode.
   const selected: EpisodeEvidence[] = [];
+  const selectedContent = new Set<string>();
+  const maxTotalChars = maxLines * maxChars; // never exceeds the old worst-case budget
+  let selectedChars = 0;
   for (let round = 0; selected.length < maxLines; round++) {
     let added = false;
     for (const source of perSource) {
       const candidate = source[round];
       if (!candidate) continue;
+      const normalized = candidate.turn.content.toLowerCase().replace(/\s+/g, " ");
+      if (selectedContent.has(normalized)) continue;
+      if (selectedChars + candidate.turn.content.length > maxTotalChars) continue;
       selected.push(candidate);
+      selectedContent.add(normalized);
+      selectedChars += candidate.turn.content.length;
       added = true;
       if (selected.length >= maxLines) break;
     }
     if (!added) break;
   }
-  return selected.map((candidate) => ({
-    ...candidate,
-    turn: {
-      ...candidate.turn,
-      content: focusedEpisodeExcerpt(candidate.turn.content, candidate.focusTerms, maxChars),
-    },
-  }));
+  return selected;
 }
 
 /** Strictly bounded one-hop expansion through a shared core:about target. */

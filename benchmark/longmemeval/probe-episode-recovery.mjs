@@ -234,7 +234,7 @@ for (const [index, question] of questions.entries()) {
     questionId: question.question_id,
     question: question.question,
     expectedAnswer: question.answer,
-    recovered: payloadRecovered(selected, probes[question.question_id]),
+    flatBaselineRecovered: payloadRecovered(selected, probes[question.question_id]),
     actualRecovered,
     actualEvidenceChars: actualEvidenceText.length,
     actualContextChars: actualContext.lines.join("\n").length,
@@ -252,7 +252,7 @@ for (const [index, question] of questions.entries()) {
 }
 
 const summary = {
-  recovered: rows.filter((row) => row.recovered).length,
+  flatBaselineRecovered: rows.filter((row) => row.flatBaselineRecovered).length,
   actualRecovered: rows.filter((row) => row.actualRecovered).length,
   total: rows.length,
   maxUnits,

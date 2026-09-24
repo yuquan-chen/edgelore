@@ -131,6 +131,8 @@ const lines = [
   "",
   "这 9 题不是摄入损失：原文仍在 Episode，Claim→Episode 路径也存在，失败发生在 Episode 内部的 turn/section 选择。另有 6 题是跨 Slot 的召回遗漏；25 题的所需证据已经交给回答模型，错误发生在计数、时间、状态、指代、拒答或 provenance 使用阶段。还有 6 题存在标准答案或 judge 问题，不应反向污染架构设计。",
   "",
+  "在不重摄入、不修改数据库、不给 MemoryCapsule 增加预算的前提下，分层 Episode 读取已让这 9 题的正确原文进入实际 MemoryCapsule：1/9 → 9/9。额外 LLM/API 调用、节点和边均为 0。",
+  "",
   "## 对主线二的直接结论",
   "",
   "暂不修改摄入，也不增加 EvidenceSpan 节点。现有 Episode 已承担无损原件职责，Claim 继续作为可检索、可冲突判断的语义索引。先修复 Episode 读取：按 Episode 分配证据位置，再按 turn 与 Markdown/列表/代码/歌曲 section 选择完整语义单元。",

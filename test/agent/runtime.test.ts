@@ -548,8 +548,65 @@ test("runtime: long Episode evidence uses complete semantic units under the fixe
   );
   const evidence = lines.filter((line) => line.startsWith("conversationEvidence"));
   assert.ok(evidence.length <= 6);
+  assert.ok(evidence.some((line) => line.includes("Mummies (4)")));
   assert.ok(evidence.every((line) => !line.includes("…")), "must not use arbitrary character slices");
   assert.ok(evidence.every((line) => line.length <= 420), "metadata plus each semantic unit stays bounded");
+});
+
+test("runtime: relative time prioritizes reported events in the matching Episode", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [
+      { role: "user", content: "I attended a gardening workshop and learned crop rotation." },
+      { role: "user", content: "I use a gardening app to monitor soil moisture." },
+    ],
+    { created_by: "human:charles", source_ref: "s:garden-old", createdAt: "2023-04-15" },
+  );
+  archiveConversationEpisode(
+    graph,
+    [
+      {
+        role: "user",
+        content: "I'm looking for advice about tomato plants. By the way, I just planted 12 new tomato saplings today and I'm excited to see them grow.",
+      },
+      { role: "user", content: "I'm not sure how often I should water my tomato plants during this dry spell?" },
+      { role: "user", content: "Can neem oil control aphids on my tomato plants?" },
+      { role: "user", content: "I might use mulch to conserve water." },
+      { role: "user", content: "Should I build a trellis for the cucumber plants?" },
+    ],
+    { created_by: "human:charles", source_ref: "s:garden-target", createdAt: "2023-04-21" },
+  );
+  capture(
+    graph,
+    { dimensionKey: "gardeningWorkshop", value: "Attended a gardening workshop" },
+    { ...ctx, source_refs: ["s:garden-old"], createdAt: "2023-04-15" },
+  );
+  capture(
+    graph,
+    { dimensionKey: "gardenMulching", value: "Gardening plan: considering mulch for water conservation" },
+    { ...ctx, source_refs: ["s:garden-target"], createdAt: "2023-04-21" },
+  );
+  capture(
+    graph,
+    { dimensionKey: "gardenPestControl", value: "Gardening pest control with neem oil for tomato plant aphids" },
+    { ...ctx, source_refs: ["s:garden-target"], createdAt: "2023-04-21" },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "What tomato gardening activity did I do two weeks ago?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:garden-old", "s:garden-target"],
+      dateTo: "2023-05-05",
+      maxEpisodeEvidenceLines: 6,
+    },
+  );
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /planted 12 new tomato saplings/);
 });
 
 test("runtime: core:about expands a direct Claim to a bounded related Slot", async () => {

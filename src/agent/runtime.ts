@@ -26,6 +26,7 @@ import type { KnownDimension } from "./prompt.js";
 import { slotLabel } from "./slots.js";
 import type { LlmDriver } from "./llm-driver.js";
 import type { EmbeddingDriver } from "./embedding-driver.js";
+import { scanEventCandidates } from "./triggers.js";
 import {
   bigrams,
   retrieveRelevant,
@@ -407,6 +408,63 @@ function preferredEvidenceRole(query: string): "user" | "assistant" | undefined 
   return undefined;
 }
 
+const NUMBER_WORD = "(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|hundred|thousand)";
+const NUMERIC_PAYLOAD_RE = new RegExp(`(?:\\d|\\b${NUMBER_WORD}\\b)`, "i");
+const NUMERIC_QUESTION_RE = /\b(?:how many|how much|number of|count of)\b/i;
+
+function numericPayloadFit(
+  query: string,
+  content: string,
+  queryTerms: ReadonlySet<string>,
+  unitTerms: ReadonlySet<string>,
+): number {
+  if (!NUMERIC_QUESTION_RE.test(query) || !NUMERIC_PAYLOAD_RE.test(content)) return 0;
+  if (overlapCount(queryTerms, unitTerms) === 0) return 0;
+  const firstLine = content.split(/\r?\n/, 1)[0] ?? content;
+  return NUMERIC_PAYLOAD_RE.test(firstLine) && overlapCount(queryTerms, evidenceTerms(firstLine)) > 0
+    ? 2
+    : 1;
+}
+
+const RELATIVE_AMOUNT = new Map<string, number>([
+  ["one", 1], ["two", 2], ["three", 3], ["four", 4], ["five", 5], ["six", 6],
+  ["seven", 7], ["eight", 8], ["nine", 9], ["ten", 10], ["eleven", 11], ["twelve", 12],
+]);
+
+function relativeEpisodeTarget(
+  query: string,
+  referenceDay: string | undefined,
+): { timestamp: number; toleranceDays: number } | undefined {
+  if (!referenceDay) return undefined;
+  const match = new RegExp(`\\b(\\d+|${[...RELATIVE_AMOUNT.keys()].join("|")})\\s+(day|week|month|year)s?\\s+ago\\b`, "i")
+    .exec(query);
+  if (!match) return undefined;
+  const amount = /^\d+$/.test(match[1]!)
+    ? Number(match[1])
+    : RELATIVE_AMOUNT.get(match[1]!.toLowerCase());
+  if (!amount || amount < 1) return undefined;
+  const target = new Date(`${referenceDay.slice(0, 10)}T00:00:00.000Z`);
+  if (!Number.isFinite(target.getTime())) return undefined;
+  const unit = match[2]!.toLowerCase();
+  if (unit === "day") target.setUTCDate(target.getUTCDate() - amount);
+  else if (unit === "week") target.setUTCDate(target.getUTCDate() - amount * 7);
+  else if (unit === "month") target.setUTCMonth(target.getUTCMonth() - amount);
+  else target.setUTCFullYear(target.getUTCFullYear() - amount);
+  return {
+    timestamp: target.getTime(),
+    toleranceDays: unit === "day" ? 1 : unit === "week" ? 2 : unit === "month" ? 4 : 15,
+  };
+}
+
+function reportedEventFit(content: string, role: EpisodeTurn["role"]): number {
+  if (role !== "user") return 0;
+  return scanEventCandidates(`[user] ${content}`).some(
+    (candidate) => !/[?？]\s*$/.test(candidate.sentence),
+  )
+    ? 1
+    : 0;
+}
+
 /**
  * Split a long turn at semantic boundaries instead of slicing an arbitrary
  * character window. Short turns remain intact. Long Markdown answers retain
@@ -518,10 +576,12 @@ function coldEpisodeEvidence(
   scopeSet: ReadonlySet<string> | undefined,
   maxLines: number,
   maxChars: number,
+  referenceDay?: string,
 ): EpisodeEvidence[] {
   if (maxLines <= 0) return [];
   const queryTerms = evidenceTerms(query);
   const preferredRole = preferredEvidenceRole(query);
+  const temporalTarget = relativeEpisodeTarget(query, referenceDay);
   const anchors = new Map<string, EpisodeSourceAnchor>();
   hits.forEach((hit, rank) => {
     const statement = graph.getNode(hit.statementId) as StatementNode | undefined;
@@ -585,7 +645,7 @@ function coldEpisodeEvidence(
     if (inScope.length > 0) ordered = inScope;
   }
 
-  const perSource: EpisodeEvidence[][] = [];
+  const perSource: Array<{ evidence: EpisodeEvidence[]; quotaWeight: number }> = [];
   const maxSources = Math.max(1, Math.min(5, maxLines));
   for (const anchor of ordered.slice(0, maxSources)) {
     const episode = graph.getEpisode(anchor.sourceRef);
@@ -648,6 +708,10 @@ function coldEpisodeEvidence(
         .map((unit) => {
           const queryFit = localLexicalScore(queryTerms, unit.terms, termWeights);
           const claimFit = localLexicalScore(claim.terms, unit.terms, termWeights);
+          const numericFit = numericPayloadFit(query, unit.turn.content, queryTerms, unit.terms);
+          const eventFit = temporalTarget
+            ? reportedEventFit(unit.turn.content, unit.turn.role)
+            : 0;
           const speakerFit = claim.role === unit.turn.role ? 6 : 0;
           const preferredSpeakerFit = preferredRole === unit.turn.role ? 2 : 0;
           return {
@@ -656,6 +720,8 @@ function coldEpisodeEvidence(
             // Claim vocabulary bridges paraphrases; speaker is a tie-breaker.
             score:
               queryFit * 8 +
+              numericFit * 30 +
+              eventFit * 60 +
               claimFit * (3 + rankWeight) +
               speakerFit +
               preferredSpeakerFit,
@@ -681,6 +747,8 @@ function coldEpisodeEvidence(
             ...unit,
             score:
               localLexicalScore(queryTerms, unit.terms, termWeights) * 8 +
+              numericPayloadFit(query, unit.turn.content, queryTerms, unit.terms) * 30 +
+              (temporalTarget ? reportedEventFit(unit.turn.content, unit.turn.role) : 0) * 60 +
               (preferredRole === unit.turn.role ? 2 : 0),
           }))
           .filter((candidate) => candidate.score > 0)
@@ -720,7 +788,16 @@ function coldEpisodeEvidence(
       }
       if (!added) break;
     }
-    if (rankedUnits.length > 0) perSource.push(rankedUnits);
+    if (rankedUnits.length > 0) {
+      const episodeTime = new Date(`${episode.created_at.slice(0, 10)}T00:00:00.000Z`).getTime();
+      const distanceDays = temporalTarget && Number.isFinite(episodeTime)
+        ? Math.abs(episodeTime - temporalTarget.timestamp) / 86_400_000
+        : Number.POSITIVE_INFINITY;
+      perSource.push({
+        evidence: rankedUnits,
+        quotaWeight: distanceDays <= (temporalTarget?.toleranceDays ?? -1) ? 2 : 1,
+      });
+    }
   }
 
   // Episode quota comes before global competition: every high-ranked source
@@ -730,18 +807,44 @@ function coldEpisodeEvidence(
   const selectedContent = new Set<string>();
   const maxTotalChars = maxLines * maxChars; // never exceeds the old worst-case budget
   let selectedChars = 0;
+  const select = (candidate: EpisodeEvidence | undefined): boolean => {
+    if (!candidate || selected.length >= maxLines) return false;
+    const normalized = candidate.turn.content.toLowerCase().replace(/\s+/g, " ");
+    if (selectedContent.has(normalized)) return false;
+    if (selectedChars + candidate.turn.content.length > maxTotalChars) return false;
+    selected.push(candidate);
+    selectedContent.add(normalized);
+    selectedChars += candidate.turn.content.length;
+    return true;
+  };
+
+  if (temporalTarget) {
+    // Every candidate Episode gets one position. The remainder goes first to
+    // Episodes matching the resolved relative date, because an exact temporal
+    // reference is stronger than equal round-robin allocation.
+    for (const source of perSource) select(source.evidence[0]);
+    const prioritized = [
+      ...perSource.filter((source) => source.quotaWeight > 1),
+      ...perSource.filter((source) => source.quotaWeight === 1),
+    ];
+    for (const source of prioritized) {
+      for (const candidate of source.evidence.slice(1)) {
+        if (selected.length >= maxLines) break;
+        select(candidate);
+      }
+      if (selected.length >= maxLines) break;
+    }
+    return selected;
+  }
+
   for (let round = 0; selected.length < maxLines; round++) {
     let added = false;
     for (const source of perSource) {
-      const candidate = source[round];
-      if (!candidate) continue;
-      const normalized = candidate.turn.content.toLowerCase().replace(/\s+/g, " ");
-      if (selectedContent.has(normalized)) continue;
-      if (selectedChars + candidate.turn.content.length > maxTotalChars) continue;
-      selected.push(candidate);
-      selectedContent.add(normalized);
-      selectedChars += candidate.turn.content.length;
-      added = true;
+      for (let offset = 0; offset < source.quotaWeight; offset++) {
+        const candidate = source.evidence[round * source.quotaWeight + offset];
+        if (select(candidate)) added = true;
+        if (selected.length >= maxLines) break;
+      }
       if (selected.length >= maxLines) break;
     }
     if (!added) break;
@@ -932,6 +1035,7 @@ export async function retrievalContext(
     scopeSet,
     maxEvidenceLines,
     config.maxEpisodeExcerptChars ?? 1_600,
+    config.dateTo,
   );
   const evidenceContent = new Set<string>();
   for (const evidence of coldEvidence) {

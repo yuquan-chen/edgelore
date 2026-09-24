@@ -57,7 +57,12 @@ if (!JUDGE_MODEL) {
   console.error("no judge model: set EDGELORE_JUDGE_MODEL (or EDGELORE_MODEL) in .env.local");
   process.exit(1);
 }
-const judge = requireChat(cfg, { model: JUDGE_MODEL, maxTokens: 10, maxRetries: 2 });
+const judge = requireChat(cfg, {
+  model: JUDGE_MODEL,
+  maxTokens: 10,
+  maxRetries: 2,
+  extraBody: { thinking: { type: "disabled" } },
+});
 
 // --- official templates (verbatim from evaluate_qa.py) ------------------------
 

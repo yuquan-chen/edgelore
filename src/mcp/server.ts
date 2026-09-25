@@ -1,9 +1,10 @@
 // edgelore · M4 — MCP server: the standard-protocol mouth of the memory system.
 //
-// Exposes the full capability chain as eight MCP tools so any MCP host
+// Exposes the full capability chain as nine MCP tools so any MCP host
 // (Claude Code, Codex, Cursor, ...) can use persistent memory out of the box:
 //
 //   memory_remember     full pipeline: gate -> extract -> capture (+ embed)
+//   memory_append_episode immutable cold-source append
 //   memory_search       hybrid retrieval with graph expansion
 //   memory_conflicts    the docket
 //   memory_resolve      human adjudication (resolvedBy = server identity)
@@ -23,8 +24,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import type { SqliteGraph } from "../store/sqlite.js";
 import type { LlmDriver } from "../agent/llm-driver.js";
-import { expandHit, retrieveRelevant } from "../agent/retrieval.js";
 import { processTurn, type RetrievalConfig } from "../agent/runtime.js";
+import { recall } from "../agent/recall.js";
+import { appendEpisode, type EvidenceTurn } from "../agent/evidence.js";
 import { capture, type CaptureContent } from "../agent/capture.js";
 import { autoResolveConstraintGuided, listConflicts, resolveConflict } from "../agent/conflicts.js";
 
@@ -79,9 +81,17 @@ export function buildMcpServer(graph: SqliteGraph, opts: McpServerOptions): McpS
         "Store a lasting memory from natural language. Runs the gate (worth storing?) " +
         "and extract (map to dimensions) pipeline, then persists. Use for decisions, " +
         "preferences, constraints, facts, lessons. Do NOT use for small talk.",
-      inputSchema: { text: z.string().min(1) },
+      inputSchema: {
+        text: z.string().min(1),
+        sourceRef: z.string().min(1).optional(),
+        scope: z.object({
+          owner_id: z.string().min(1).optional(),
+          project_id: z.string().min(1).optional(),
+          phase_id: z.string().min(1).optional(),
+        }).optional(),
+      },
     },
-    async ({ text }) => {
+    async ({ text, sourceRef, scope }) => {
       try {
         if (!opts.chatDriver) {
           return errorResult(
@@ -90,7 +100,21 @@ export function buildMcpServer(graph: SqliteGraph, opts: McpServerOptions): McpS
             ),
           );
         }
-        const payload = await processTurn(graph, text, opts.chatDriver, ctx, opts.retrieval ? { retrieval: opts.retrieval } : undefined);
+        const payload = await processTurn(
+          graph,
+          text,
+          opts.chatDriver,
+          { ...ctx, ...(sourceRef ? { source_refs: [sourceRef] } : {}), ...(scope ? { scope } : {}) },
+          opts.retrieval
+            ? {
+                retrieval: {
+                  ...opts.retrieval,
+                  ...(scope ? { scope } : {}),
+                  ...(sourceRef ? { scopeSessionIds: [sourceRef] } : {}),
+                },
+              }
+            : undefined,
+        );
         return toolResult(payload);
       } catch (err) {
         return errorResult(err);
@@ -103,26 +127,67 @@ export function buildMcpServer(graph: SqliteGraph, opts: McpServerOptions): McpS
     {
       title: "Search memories",
       description:
-        "Hybrid retrieval (semantic + keyword) over stored memories. Returns hits with their " +
-        "dimension, value, state, conflict counterparts, and constraint verdicts. Search BEFORE " +
-        "answering questions that may depend on previously stored facts.",
+        "Recall a bounded Memory Capsule using the full graph and Episode evidence path. " +
+        "Returns Claims, Slot state/conflicts, provenance, and relevant verbatim evidence. " +
+        "Does not generate an answer; use this context in your own reasoning.",
       inputSchema: {
         query: z.string().min(1),
         k: z.number().int().positive().optional(),
         mode: z.enum(["hybrid", "vector", "lexical"]).optional(),
+        scope: z.object({
+          owner_id: z.string().min(1).optional(),
+          project_id: z.string().min(1).optional(),
+          phase_id: z.string().min(1).optional(),
+          sessionIds: z.array(z.string().min(1)).optional(),
+        }).optional(),
       },
     },
-    async ({ query, k, mode }) => {
+    async ({ query, k, mode, scope }) => {
       try {
-        const retrieval = opts.retrieval;
-        const hits = await retrieveRelevant(graph, {
-          query,
-          k,
-          mode,
-          embedder: retrieval?.embedder,
-          vectors: retrieval?.vectors,
+        const capsule = await recall(graph, query, {
+          ...(scope ? { scope } : {}),
+          retrieval: {
+            ...opts.retrieval,
+            ...(k ? { k } : {}),
+            ...(mode ? { mode } : {}),
+          },
         });
-        return toolResult({ hits: hits.map((h) => ({ ...h, expansion: expandHit(graph, h) })) });
+        return toolResult(capsule);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "memory_append_episode",
+    {
+      title: "Append source Episode",
+      description:
+        "Persist an immutable conversation/source Episode as cold evidence, without creating " +
+        "message nodes or extracting claims. Repeating the same id and turns is idempotent; " +
+        "the same id with different turns is rejected. Always provide owner/project/phase scope " +
+        "when the source belongs to a scoped memory space.",
+      inputSchema: {
+        id: z.string().min(1),
+        turns: z.array(z.object({ role: z.string().min(1), content: z.string() })).min(1),
+        createdAt: z.string().datetime().optional(),
+        scope: z.object({
+          owner_id: z.string().min(1).optional(),
+          project_id: z.string().min(1).optional(),
+          phase_id: z.string().min(1).optional(),
+        }).optional(),
+      },
+    },
+    async ({ id, turns, createdAt, scope }) => {
+      try {
+        return toolResult(appendEpisode(graph, {
+          id,
+          turns: turns as EvidenceTurn[],
+          createdBy: opts.createdBy,
+          ...(createdAt ? { createdAt } : {}),
+          ...(scope ? { scope } : {}),
+        }));
       } catch (err) {
         return errorResult(err);
       }
@@ -207,11 +272,21 @@ export function buildMcpServer(graph: SqliteGraph, opts: McpServerOptions): McpS
           unit: z.string().optional(),
           description: z.string().optional(),
         }),
+        sourceRef: z.string().min(1).optional(),
+        scope: z.object({
+          owner_id: z.string().min(1).optional(),
+          project_id: z.string().min(1).optional(),
+          phase_id: z.string().min(1).optional(),
+        }).optional(),
       },
     },
-    async ({ content }) => {
+    async ({ content, sourceRef, scope }) => {
       try {
-        return toolResult(capture(graph, content as CaptureContent, ctx));
+        return toolResult(capture(graph, content as CaptureContent, {
+          ...ctx,
+          ...(sourceRef ? { source_refs: [sourceRef] } : {}),
+          ...(scope ? { scope } : {}),
+        }));
       } catch (err) {
         return errorResult(err);
       }

@@ -25,19 +25,45 @@ export interface EvidenceContext {
   scope?: Scope;
 }
 
+/** Host-facing immutable source append contract. Repeating an identical id is
+ * idempotent; reusing it for different turns is rejected by the graph store. */
+export interface AppendEpisodeInput {
+  id: string;
+  turns: readonly EvidenceTurn[];
+  createdBy: string;
+  createdAt?: string;
+  scope?: Scope;
+  attributes?: Record<string, unknown>;
+}
+
+/** Append an immutable conversation/source Episode without creating hot graph
+ * nodes. Scope is persisted on the Episode and can be used to isolate recall. */
+export function appendEpisode(
+  graph: GraphStore,
+  input: AppendEpisodeInput,
+): EpisodeRecord {
+  return graph.putEpisode({
+    id: input.id,
+    turns: input.turns,
+    created_by: input.createdBy,
+    ...(input.createdAt ? { created_at: input.createdAt } : {}),
+    ...(input.scope ? { scope: input.scope } : {}),
+    attributes: input.attributes ?? { kind: "conversation", verbatim: true },
+  });
+}
+
 /** Store the lossless source once, outside the semantic node/edge graph. */
 export function archiveConversationEpisode(
   graph: GraphStore,
   turns: readonly EvidenceTurn[],
   ctx: EvidenceContext,
 ): EpisodeRecord {
-  return graph.putEpisode({
+  return appendEpisode(graph, {
     id: ctx.source_ref,
     turns,
-    created_by: ctx.created_by,
-    created_at: ctx.createdAt,
-    scope: ctx.scope,
-    attributes: { kind: "conversation", verbatim: true },
+    createdBy: ctx.created_by,
+    ...(ctx.createdAt ? { createdAt: ctx.createdAt } : {}),
+    ...(ctx.scope ? { scope: ctx.scope } : {}),
   });
 }
 

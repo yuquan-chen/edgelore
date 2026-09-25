@@ -197,8 +197,14 @@ export class MemoryGraph implements GraphStore {
     const turns = input.turns.map((turn) => ({ role: turn.role, content: turn.content }));
     const existing = this.episodes.get(input.id);
     if (existing) {
-      if (JSON.stringify(existing.turns) !== JSON.stringify(turns)) {
-        throw new ModelError(`episode ${input.id} is immutable and already has different content`);
+      if (
+        JSON.stringify(existing.turns) !== JSON.stringify(turns) ||
+        existing.created_by !== input.created_by ||
+        !scopesEqual(existing.scope, input.scope) ||
+        (input.created_at !== undefined && existing.created_at !== input.created_at) ||
+        (input.attributes !== undefined && JSON.stringify(existing.attributes) !== JSON.stringify(input.attributes))
+      ) {
+        throw new ModelError(`episode ${input.id} is immutable and already has different content or identity`);
       }
       return existing;
     }

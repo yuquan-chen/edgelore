@@ -1,6 +1,6 @@
 # EdgeLore 与宿主 Agent 的协作边界（Deferred Part）
 
-> 状态：设计结论已确认，暂不实现。后续作为独立 Part 接入 Claude、Codex 等宿主。
+> 状态：公共读写边界已开始落地；宿主 lifecycle hooks、异步摄入队列仍待实现。
 
 ## 定位
 
@@ -60,6 +60,10 @@ Episode，也不能阻断宿主当前回合。
 - `EpisodeRecord` 与 SQLite Episode 持久化已经存在。
 - retrieval 已有向量、词法、图扩展、状态/冲突上下文和冷 Episode 证据恢复。
 - MCP 已提供 remember、search、conflicts、resolve、autoresolve、capture、get、evaluate。
+- `appendEpisode()` 已成为宿主可调用的不可变原文追加接口；`recall()` 返回结构化
+  `MemoryCapsule`，MCP `memory_search` 复用这条完整召回链路。
+- `Scope` 可显式指定 `owner_id`、`project_id`、`phase_id`。指定后召回按精确 scope
+  隔离 Claims、关系扩展、约束和 Episode 证据；省略 scope 仍是单租户全库语义。
 - LongMemEval v7 的 476/500（95.2%）记录证明
   `Claim + graph + Episode evidence` 能形成有效上下文。
 
@@ -68,15 +72,16 @@ Episode，也不能阻断宿主当前回合。
 ## 尚未完成的宿主协作层
 
 1. MCP `memory_remember` 目前同步等待完整 `processTurn`，还不是
-   “append Episode immediately, process asynchronously”。
-2. MCP 写入上下文当前没有真实 `source_refs`，也没有 project/thread/turn 身份协议。
-3. MCP `memory_search` 直接调用 `retrieveRelevant + expandHit`；它尚未走
-   `retrievalContext`，所以 v7 的 Episode evidence recovery 还没有进入产品返回值。
+   “append Episode immediately, process asynchronously”；`memory_append_episode` 目前只负责
+   幂等、不可变地保存 Episode，不负责启动摄入。
+2. MCP 写入可传 `sourceRef` 和显式 `Scope`，但还没有 Claude/Codex 的 thread/turn 身份映射。
+3. MCP `memory_search` 已走 `recall()` → `retrievalContext`，返回结构化 Capsule 与
+   v7 Episode evidence recovery；显式 owner/project/phase scope 为硬隔离。
 4. 当前没有 SessionStart、UserPromptSubmit、PostToolUse、Stop、PreCompact、
    SessionEnd 等宿主 lifecycle adapters。
-5. 当前没有持久队列、pending Episode overlay、watermark、重试和幂等协议。
-6. 尚未定义正式的 `MemoryCapsule` 契约，以及 trusted Project Kernel 与
-   untrusted retrieved evidence 的权限分层。
+5. 当前没有持久队列、pending Episode overlay、watermark 和自动重试协议。
+6. `MemoryCapsule` 基础契约已定义；trusted Project Kernel 与 untrusted retrieved evidence
+   的宿主注入权限策略仍需在具体 adapter 中实现。
 
 ## 后续 Part 的最小目标
 

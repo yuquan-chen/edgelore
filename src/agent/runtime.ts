@@ -15,8 +15,8 @@
 //                 one-hop graph expansion — relevant context with conflict
 //                 posture and constraint verdicts attached
 
-import type { GraphStore, MemoryGraph } from "../model/store.js";
-import type { DimensionNode, EpisodeRecord, EpisodeTurn, FactNodeState, StatementNode } from "../model/types.js";
+import { scopesEqual, type GraphStore, type MemoryGraph } from "../model/store.js";
+import type { DimensionNode, EpisodeRecord, EpisodeTurn, FactNodeState, Scope, StatementNode } from "../model/types.js";
 import { capture, type CaptureContext, type CaptureResult } from "./capture.js";
 import { runGraphEnrichment } from "./graph-enrichment.js";
 import { commitGraphWritePlan } from "./graph-write.js";
@@ -113,7 +113,17 @@ export interface RetrievalConfig {
    * not content: group members are filtered by the same set so a retrieved
    * dimension never renders another tenant's statements. Unset = all. */
   scopeSessionIds?: readonly string[];
+  /** Exact identity boundary. Unlike source-id preference, this is a hard
+   * filter across every retrieval lane; missing axes mean the shared value
+   * for that axis. Supply {} explicitly to read only globally-scoped memory. */
+  scope?: Scope;
 }
+
+/** Read-only retrieval accepts no vector plumbing and then uses lexical search. */
+export type RetrievalReadConfig = Omit<Partial<RetrievalConfig>, "embedder" | "vectors"> & {
+  embedder?: EmbeddingDriver;
+  vectors?: VectorStore;
+};
 
 /**
  * Run one conversation turn through gate -> extract -> capture.
@@ -354,6 +364,50 @@ export function contextMemoriesOf(graph: GraphStore, limit = 50): string[] {
 export interface RetrievalContext {
   lines: string[];
   similarDimensions: KnownDimension[];
+  /** Claim nodes actually rendered into the bounded context. */
+  claims: RetrievedClaim[];
+  /** Retrieved Slot groups, including state and whether any conflict is open. */
+  slots: RetrievedSlot[];
+  /** Bounded verbatim evidence lines rendered into the context. */
+  evidence: RetrievedEvidence[];
+}
+
+export interface RetrievedClaim {
+  id: string;
+  slotId: string;
+  slotKey: string;
+  value: unknown;
+  unit?: string;
+  state: FactNodeState;
+  saidBy?: StatementNode["saidBy"];
+  createdAt: string;
+  createdBy: string;
+  sourceRefs: string[];
+  scope?: StatementNode["scope"];
+  via: string[];
+}
+
+export interface RetrievedSlot {
+  id: string;
+  key: string;
+  label: string;
+  state: FactNodeState;
+  cardinality?: DimensionNode["cardinality"];
+  scope?: DimensionNode["scope"];
+  conflict: boolean;
+  claimCount: number;
+  visibleClaimIds: string[];
+  omittedByBudget: boolean;
+}
+
+export interface RetrievedEvidence {
+  sourceId: string;
+  role: string;
+  createdAt: string;
+  turnIndex?: number;
+  text: string;
+  scope?: EpisodeRecord["scope"];
+  outOfScope: boolean;
 }
 
 const EVIDENCE_STOP_WORDS = new Set([
@@ -588,6 +642,7 @@ function coldEpisodeEvidence(
   maxLines: number,
   maxChars: number,
   referenceDay?: string,
+  exactScope?: Scope,
 ): EpisodeEvidence[] {
   if (maxLines <= 0) return [];
   const queryTerms = evidenceTerms(query);
@@ -598,7 +653,8 @@ function coldEpisodeEvidence(
     const statement = graph.getNode(hit.statementId) as StatementNode | undefined;
     if (!statement || statement.type !== "core:statement") return;
     for (const sourceRef of statement.source_refs ?? []) {
-      if (!graph.getEpisode(sourceRef)) continue;
+      const episode = graph.getEpisode(sourceRef);
+      if (!episode || (exactScope !== undefined && !scopesEqual(episode.scope, exactScope))) continue;
       const current = anchors.get(sourceRef) ?? {
         sourceRef,
         rank,
@@ -624,8 +680,11 @@ function coldEpisodeEvidence(
         .map((sourceRef) => graph.getEpisode(sourceRef))
         .filter((episode): episode is EpisodeRecord => Boolean(episode))
     : graph.getAllEpisodes();
+  const scopedEpisodeCandidates = exactScope === undefined
+    ? episodeCandidates
+    : episodeCandidates.filter((episode) => scopesEqual(episode.scope, exactScope));
   const minimumFallbackMatches = queryTerms.size <= 2 ? 1 : 2;
-  for (const episode of episodeCandidates) {
+  for (const episode of scopedEpisodeCandidates) {
     let queryMatches = 0;
     for (const turn of episode.turns) {
       queryMatches = Math.max(queryMatches, overlapCount(queryTerms, evidenceTerms(turn.content)));
@@ -660,7 +719,7 @@ function coldEpisodeEvidence(
   const maxSources = Math.max(1, Math.min(5, maxLines));
   for (const anchor of ordered.slice(0, maxSources)) {
     const episode = graph.getEpisode(anchor.sourceRef);
-    if (!episode) continue;
+    if (!episode || (exactScope !== undefined && !scopesEqual(episode.scope, exactScope))) continue;
     const units = episode.turns
       .flatMap((turn, turnIndex) =>
         episodeEvidenceUnits(turn.content, maxChars).map((content, unitIndex) => {
@@ -868,7 +927,7 @@ function aboutRelatedHits(
   graph: MemoryGraph,
   query: string,
   directHits: readonly RetrievalHit[],
-  config: RetrievalConfig,
+  config: RetrievalReadConfig,
 ): RetrievalHit[] {
   // The v7 retrieval ablation found sharply diminishing evidence gains after
   // two related Claims while context size kept growing. Keep the graph useful
@@ -880,6 +939,7 @@ function aboutRelatedHits(
   const targets = new Set<string>();
   for (const hit of directHits.slice(0, 6)) {
     for (const edge of graph.queryEdges({ type: "core:about", from: hit.statementId })) {
+      if (config.scope !== undefined && !scopesEqual(edge.scope, config.scope)) continue;
       targets.add(edge.to);
     }
   }
@@ -888,6 +948,7 @@ function aboutRelatedHits(
   const candidateIds = new Set<string>();
   for (const target of targets) {
     for (const edge of graph.queryEdges({ type: "core:about", to: target })) {
+      if (config.scope !== undefined && !scopesEqual(edge.scope, config.scope)) continue;
       if (!directIds.has(edge.from)) candidateIds.add(edge.from);
     }
   }
@@ -897,6 +958,7 @@ function aboutRelatedHits(
     .map((id) => graph.getNode(id))
     .filter((node): node is StatementNode => Boolean(node && node.type === "core:statement"))
     .filter((statement) => !directDims.has(statement.dimension_id))
+    .filter((statement) => config.scope === undefined || scopesEqual(statement.scope, config.scope))
     .filter((statement) => !config.states || config.states.includes(statement.state))
     .filter((statement) => {
       const day = statement.created_at.slice(0, 10).replace(/\//g, "-");
@@ -953,7 +1015,7 @@ function aboutRelatedHits(
 export async function retrievalContext(
   graph: MemoryGraph,
   query: string,
-  config: RetrievalConfig,
+  config: RetrievalReadConfig,
 ): Promise<RetrievalContext> {
   const semanticHitLimit = config.k ?? 8;
   const hits = await retrieveRelevant(graph, {
@@ -971,9 +1033,12 @@ export async function retrievalContext(
     dateFrom: config.dateFrom,
     dateTo: config.dateTo,
     sourceRefsAllow: config.scopeSessionIds,
+    scope: config.scope,
   });
   const dimById = new Map(
-    (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).map((d) => [d.id, d]),
+    (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[])
+      .filter((dimension) => config.scope === undefined || scopesEqual(dimension.scope, config.scope))
+      .map((d) => [d.id, d]),
   );
   const directStatementHits = hits
     .filter((hit) => hit.nodeType !== "message")
@@ -1024,7 +1089,8 @@ export async function retrievalContext(
   // provenance must stay visible (the stage2b -2 lesson).
   const scopeSet = config.scopeSessionIds ? new Set(config.scopeSessionIds) : undefined;
   const inScopeOf = (s: StatementNode) =>
-    !scopeSet || (s.source_refs ?? []).some((r) => scopeSet.has(r));
+    (config.scope === undefined || scopesEqual(s.scope, config.scope)) &&
+    (!scopeSet || (s.source_refs ?? []).some((r) => scopeSet.has(r)));
   const membersByDim = new Map<string, StatementNode[]>();
   for (const s of graph.queryNodes({ type: "core:statement" }) as StatementNode[]) {
     const list = membersByDim.get(s.dimension_id);
@@ -1039,8 +1105,12 @@ export async function retrievalContext(
   const maxLines = config.maxContextLines ?? 48;
   const activeConstraints = graph
     .getAllConstraints()
-    .filter((c) => c.activation_state === "active");
+    .filter((c) => c.activation_state === "active")
+    .filter((c) => config.scope === undefined || scopesEqual(c.scope, config.scope));
   const lines: string[] = [];
+  const capsuleClaims: RetrievedClaim[] = [];
+  const capsuleSlots: RetrievedSlot[] = [];
+  const capsuleEvidence: RetrievedEvidence[] = [];
   const maxEvidenceLines = Math.min(config.maxEpisodeEvidenceLines ?? 6, maxLines);
   const coldEvidence = coldEpisodeEvidence(
     graph,
@@ -1050,12 +1120,22 @@ export async function retrievalContext(
     maxEvidenceLines,
     config.maxEpisodeExcerptChars ?? 1_600,
     config.dateTo,
+    config.scope,
   );
   const evidenceContent = new Set<string>();
   for (const evidence of coldEvidence) {
     if (lines.length >= maxLines || lines.length >= maxEvidenceLines) break;
     const tag = evidence.outOfScope ? " (non-user-account)" : "";
     evidenceContent.add(evidence.turn.content);
+    capsuleEvidence.push({
+      sourceId: evidence.episode.id,
+      role: evidence.turn.role,
+      createdAt: evidence.episode.created_at,
+      turnIndex: evidence.turnIndex,
+      text: evidence.turn.content,
+      ...(evidence.episode.scope ? { scope: evidence.episode.scope } : {}),
+      outOfScope: evidence.outOfScope,
+    });
     lines.push(
       `conversationEvidence (verbatim ${evidence.turn.role} @${evidence.episode.created_at.slice(0, 10)}, source ${evidence.episode.id}, turn ${evidence.turnIndex})${tag}: ${JSON.stringify(evidence.turn.content)}`,
     );
@@ -1074,6 +1154,19 @@ export async function retrievalContext(
       scopeSet.size > 0 &&
       !(node.source_refs ?? []).some((sourceRef) => scopeSet.has(sourceRef));
     const tag = fallbackOut ? " (non-user-account)" : "";
+    const sourceRefs = node.source_refs ?? [];
+    const sourceEpisode = sourceRefs.map((sourceRef) => graph.getEpisode(sourceRef)).find(Boolean);
+    capsuleEvidence.push({
+      sourceId: sourceRefs[0] ?? node.id,
+      role: hit.role ?? "user",
+      createdAt: node.created_at,
+      ...(typeof node.attributes?.turn_index === "number"
+        ? { turnIndex: node.attributes.turn_index }
+        : {}),
+      text: value,
+      ...(node.scope ? { scope: node.scope } : sourceEpisode?.scope ? { scope: sourceEpisode.scope } : {}),
+      outOfScope: fallbackOut,
+    });
     lines.push(
       `conversationEvidence (verbatim ${hit.role ?? "user"} @${node.created_at.slice(0, 10)})${tag}: ${JSON.stringify(hit.value)}`,
     );
@@ -1082,8 +1175,15 @@ export async function retrievalContext(
   const hitDims = [...new Set(statementHits.map((h) => h.dimensionId))];
   for (const dimId of hitDims) {
     const allMembers = membersByDim.get(dimId) ?? [];
-    const scoped = scopeSet ? allMembers.filter(inScopeOf) : [];
-    const members = scoped.length > 0 ? scoped : allMembers;
+    const exactMembers = config.scope === undefined
+      ? allMembers
+      : allMembers.filter((member) => scopesEqual(member.scope, config.scope));
+    const scoped = scopeSet ? exactMembers.filter(inScopeOf) : [];
+    const members = config.scope !== undefined
+      ? (scopeSet ? scoped : exactMembers)
+      : scopeSet && scoped.length > 0
+        ? scoped
+        : allMembers;
     const dimension = dimById.get(dimId);
     const key = dimension
       ? slotLabel(graph, dimension)
@@ -1099,11 +1199,25 @@ export async function retrievalContext(
     const gapCount = overCap ? members.length - headN - tailN : 0;
     const shownLines = head.length + tail.length + (gapCount > 0 ? 1 : 0);
     const fallbackOut = scopeSet !== undefined && scoped.length === 0 && scopeSet.size > 0;
+    const slot: RetrievedSlot = {
+      id: dimId,
+      key: dimension?.key ?? key,
+      label: key,
+      state: dimension?.state ?? "accepted",
+      ...(dimension?.cardinality ? { cardinality: dimension.cardinality } : {}),
+      ...(dimension?.scope ? { scope: dimension.scope } : {}),
+      conflict: members.some((member) => member.state === "conflict") || dimension?.state === "conflict",
+      claimCount: members.length,
+      visibleClaimIds: [],
+      omittedByBudget: false,
+    };
+    capsuleSlots.push(slot);
     if (lines.length + shownLines + 1 > maxLines) {
       // Over budget: degrade to a one-line summary — the COUNT survives even
       // when the entries do not (counting questions read the header).
       const tag = fallbackOut ? " (non-user-account)" : "";
       lines.push(`${key}: ${members.length} entries (omitted — context budget)${tag}`);
+      slot.omittedByBudget = true;
       continue;
     }
     lines.push(`${key} — ${members.length} ${members.length === 1 ? "entry" : "entries"}:`);
@@ -1115,6 +1229,22 @@ export async function retrievalContext(
     const renderMember = (m: StatementNode) => {
       const speaker = m.saidBy === "assistant" ? " (assistant)" : "";
       const tag = fallbackOut ? " (non-user-account)" : "";
+      const hit = statementHits.find((candidate) => candidate.statementId === m.id);
+      capsuleClaims.push({
+        id: m.id,
+        slotId: dimId,
+        slotKey: slot.key,
+        value: m.value,
+        ...(m.unit ? { unit: m.unit } : {}),
+        state: m.state,
+        ...(m.saidBy ? { saidBy: m.saidBy } : {}),
+        createdAt: m.created_at,
+        createdBy: m.created_by,
+        sourceRefs: [...(m.source_refs ?? [])],
+        ...(m.scope ? { scope: m.scope } : {}),
+        via: hit?.via ?? ["slot-group"],
+      });
+      slot.visibleClaimIds.push(m.id);
       lines.push(
         `  = ${JSON.stringify(m.value)}${m.unit ? ` ${m.unit}` : ""} [${m.state} @${m.created_at.slice(0, 10)}]${speaker}${tag}`,
       );
@@ -1140,14 +1270,20 @@ export async function retrievalContext(
     const dim = dimById.get(hit.dimensionId);
     if (dim) similarDimensions.push(toKnownDimension(dim, units));
   }
-  return { lines, similarDimensions };
+  return {
+    lines,
+    similarDimensions,
+    claims: capsuleClaims,
+    slots: capsuleSlots,
+    evidence: capsuleEvidence,
+  };
 }
 
 /** Convenience wrapper: just the context lines. */
 export async function contextMemoriesViaRetrieval(
   graph: MemoryGraph,
   query: string,
-  config: RetrievalConfig,
+  config: RetrievalReadConfig,
 ): Promise<string[]> {
   return (await retrievalContext(graph, query, config)).lines;
 }

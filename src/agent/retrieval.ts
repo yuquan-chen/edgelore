@@ -24,9 +24,9 @@
 // ablation — we measure on our own eval sets.
 
 import { AgentError } from "./errors.js";
-import type { GraphStore, MemoryGraph } from "../model/store.js";
+import { scopesEqual, type GraphStore, type MemoryGraph } from "../model/store.js";
 import type { SqliteGraph } from "../store/sqlite.js";
-import type { DimensionNode, FactNodeState, GraphNode, StatementNode } from "../model/types.js";
+import type { DimensionNode, FactNodeState, GraphNode, Scope, StatementNode } from "../model/types.js";
 import type { EvaluationResult } from "../engine/evaluate.js";
 import type { EmbeddingDriver } from "./embedding-driver.js";
 import { conversationEvidenceText } from "./evidence.js";
@@ -135,6 +135,9 @@ export interface RetrievalInput {
    * says WHOSE memory to search (e.g. one user's session set), never WHICH
    * facts are right. Unset = search everything (single-tenant default). */
   sourceRefsAllow?: readonly string[];
+  /** Exact identity boundary. If present, candidates must have this exact
+   * persisted scope; unlike sourceRefsAllow this never falls back. */
+  scope?: Scope;
 }
 
 /**
@@ -165,6 +168,7 @@ export async function retrieveRelevant(graph: GraphStore, input: RetrievalInput)
   // not as a hard filter here — twin-session provenance (the same logical
   // conversation stored under different session ids) must stay reachable.
   const candidates = all.filter((node) => {
+    if (input.scope !== undefined && !scopesEqual(node.scope, input.scope)) return false;
     if (input.states && !input.states.includes(node.state)) return false;
     const day = node.created_at.slice(0, 10).replace(/\//g, "-");
     if (input.dateFrom && day < input.dateFrom) return false;

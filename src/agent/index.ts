@@ -17,6 +17,7 @@ export * from "./gate.js";
 export * from "./lang.js";
 export * from "./extract.js";
 export * from "./runtime.js";
+export * from "./recall.js";
 export * from "./openai-compat-driver.js";
 export * from "./embedding-driver.js";
 export * from "./decision.js";

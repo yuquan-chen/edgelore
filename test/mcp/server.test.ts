@@ -17,6 +17,8 @@ import { buildMcpServer } from "../../src/mcp/server.js";
 import { MockDriver } from "../../src/agent/llm-driver.js";
 import { MockEmbedder } from "../../src/agent/embedding-driver.js";
 import { InMemoryVectorStore } from "../../src/agent/retrieval.js";
+import { capture } from "../../src/agent/capture.js";
+import { archiveConversationEpisode } from "../../src/agent/evidence.js";
 import type { RetrievalConfig } from "../../src/agent/runtime.js";
 
 /** Harness: open a temp SQLite graph, build the server, connect an MCP client. */
@@ -24,14 +26,16 @@ async function harness(chatReplies?: string[]): Promise<{
   client: Client;
   graph: SqliteGraph;
   vectors: InMemoryVectorStore;
+  chat: MockDriver;
   cleanup: () => void;
 }> {
   const dir = mkdtempSync(join(tmpdir(), "edgelore-mcp-"));
   const graph = new SqliteGraph(join(dir, "t.db"));
   const vectors = new InMemoryVectorStore();
+  const chat = new MockDriver(chatReplies ?? []);
   const opts = {
     createdBy: "human:test",
-    chatDriver: new MockDriver(chatReplies ?? []),
+    chatDriver: chat,
     retrieval: { embedder: new MockEmbedder(8), vectors } as RetrievalConfig,
   };
   const server = buildMcpServer(graph, opts);
@@ -42,6 +46,7 @@ async function harness(chatReplies?: string[]): Promise<{
     client,
     graph,
     vectors,
+    chat,
     cleanup: () => {
       client.close();
       graph.close();
@@ -50,12 +55,13 @@ async function harness(chatReplies?: string[]): Promise<{
   };
 }
 
-test("mcp: all eight tools are discoverable", async () => {
+test("mcp: all nine tools are discoverable", async () => {
   const h = await harness();
   try {
     const { tools } = await h.client.listTools();
     const names = tools.map((t) => t.name).sort();
     assert.deepEqual(names, [
+      "memory_append_episode",
       "memory_autoresolve",
       "memory_capture",
       "memory_conflicts",
@@ -65,6 +71,30 @@ test("mcp: all eight tools are discoverable", async () => {
       "memory_resolve",
       "memory_search",
     ]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("mcp: memory_append_episode stores an immutable scoped source", async () => {
+  const h = await harness();
+  try {
+    const response = await h.client.callTool({
+      name: "memory_append_episode",
+      arguments: {
+        id: "conversation:scoped",
+        turns: [{ role: "user", content: "We decided to use the local SQLite store." }],
+        scope: { owner_id: "charles", project_id: "edgelore", phase_id: "adapter" },
+      },
+    });
+    assert.equal(response.isError, undefined);
+    const episode = h.graph.getEpisode("conversation:scoped");
+    assert.deepEqual(episode?.scope, {
+      owner_id: "charles",
+      project_id: "edgelore",
+      phase_id: "adapter",
+    });
+    assert.equal(h.graph.queryNodes({ type: "core:message" }).length, 0);
   } finally {
     h.cleanup();
   }
@@ -92,19 +122,67 @@ test("mcp: memory_remember runs the pipeline and indexes vectors", async () => {
   }
 });
 
-test("mcp: memory_search returns hits with graph expansion", async () => {
-  const h = await harness([
-    JSON.stringify({ store: true, candidates: ["预算 5000"] }),
-    JSON.stringify({
-      contents: [{ dimensionKey: "NEW:budget", value: 5000, cardinality: "single", unit: "CNY" }],
-    }),
-  ]);
+test("mcp: memory_search returns a Memory Capsule with evidence and makes no chat LLM call", async () => {
+  const h = await harness(["unused sentinel reply"]);
   try {
-    await h.client.callTool({ name: "memory_remember", arguments: { text: "项目预算 5000 元" } });
-    const r = await h.client.callTool({ name: "memory_search", arguments: { query: "预算 5000" } });
-    const payload = r.structuredContent as { hits: Array<{ dimensionKey: string; expansion: unknown }> };
-    assert.equal(payload.hits[0]?.dimensionKey, "budget");
-    assert.ok(payload.hits[0]?.expansion);
+    archiveConversationEpisode(
+      h.graph,
+      [{ role: "user", content: "My vehicle is a Ford F-150 pickup truck." }],
+      {
+        created_by: "human:test",
+        source_ref: "session:vehicle",
+        createdAt: "2026-09-24T10:00:00.000Z",
+        scope: { owner_id: "charles", project_id: "edgelore", phase_id: "host-integration" },
+      },
+    );
+    capture(
+      h.graph,
+      { dimensionKey: "vehicle", value: "Ford F-150 pickup truck", saidBy: "user" },
+      {
+        created_by: "human:test",
+        source_refs: ["session:vehicle"],
+        scope: { owner_id: "charles", project_id: "edgelore", phase_id: "host-integration" },
+      },
+    );
+    const r = await h.client.callTool({
+      name: "memory_search",
+      arguments: {
+        query: "what is my vehicle",
+        mode: "lexical",
+        scope: {
+          owner_id: "charles",
+          project_id: "edgelore",
+          phase_id: "host-integration",
+          sessionIds: ["session:vehicle"],
+        },
+      },
+    });
+    const payload = r.structuredContent as {
+      query: string;
+      scope: { owner_id: string; project_id: string; phase_id: string; sessionIds: string[] };
+      claims: Array<{ value: unknown; saidBy: string; state: string; sourceRefs: string[] }>;
+      slots: Array<{ label: string; state: string; conflict: boolean; visibleClaimIds: string[] }>;
+      evidence: Array<{ sourceId: string; role: string; text: string; outOfScope: boolean }>;
+      context: string[];
+    };
+    assert.equal(r.isError, undefined);
+    assert.equal(payload.query, "what is my vehicle");
+    assert.deepEqual(payload.scope.sessionIds, ["session:vehicle"]);
+    assert.equal(payload.scope.owner_id, "charles");
+    assert.equal(payload.claims[0]?.value, "Ford F-150 pickup truck");
+    assert.equal(payload.claims[0]?.saidBy, "user");
+    assert.equal(payload.claims[0]?.state, "accepted");
+    assert.deepEqual(payload.claims[0]?.sourceRefs, ["session:vehicle"]);
+    assert.equal(payload.slots[0]?.label, "vehicle");
+    assert.equal(payload.slots[0]?.state, "tentative");
+    assert.equal(payload.slots[0]?.conflict, false);
+    assert.ok(payload.slots[0]?.visibleClaimIds.length);
+    assert.equal(payload.evidence[0]?.sourceId, "session:vehicle");
+    assert.equal(payload.evidence[0]?.role, "user");
+    assert.match(payload.evidence[0]?.text ?? "", /Ford F-150/);
+    assert.equal(payload.evidence[0]?.outOfScope, false);
+    assert.ok(payload.context.some((line) => line.includes("Ford F-150")));
+    assert.equal(h.chat.remaining, 1, "recall/search must not consume a chat-model reply");
   } finally {
     h.cleanup();
   }

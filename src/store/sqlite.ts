@@ -20,10 +20,12 @@ import {
   type AddConstraintInput,
   type AddEdgeInput,
   type AddNodeInput,
+  type PutEpisodeInput,
 } from "../model/store.js";
 import type {
   Constraint,
   ConstraintState,
+  EpisodeRecord,
   FactNodeState,
   GraphEdge,
   GraphNode,
@@ -55,6 +57,11 @@ CREATE TABLE IF NOT EXISTS embeddings (
   node_id TEXT PRIMARY KEY,
   dim     INTEGER NOT NULL,
   vector  BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS episodes (
+  id         TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  data       TEXT NOT NULL
 );
 `;
 
@@ -101,6 +108,10 @@ export class SqliteGraph extends MemoryGraph {
       const c = JSON.parse(row.data) as Constraint;
       this.constraints.set(c.id, c);
     }
+    for (const row of this.db.prepare("SELECT data FROM episodes").all() as unknown as DataRow[]) {
+      const episode = JSON.parse(row.data) as EpisodeRecord;
+      this.episodes.set(episode.id, episode);
+    }
   }
 
   // -------------------------------------------------------- write-through
@@ -132,6 +143,14 @@ export class SqliteGraph extends MemoryGraph {
     return c;
   }
 
+  override putEpisode(input: PutEpisodeInput): EpisodeRecord {
+    const episode = super.putEpisode(input);
+    this.db
+      .prepare("INSERT OR REPLACE INTO episodes (id, created_at, data) VALUES (?, ?, ?)")
+      .run(episode.id, episode.created_at, JSON.stringify(episode));
+    return episode;
+  }
+
   override transitionNodeState(id: string, to: FactNodeState): GraphNode {
     const n = super.transitionNodeState(id, to);
     this.db
@@ -156,6 +175,29 @@ export class SqliteGraph extends MemoryGraph {
     const c = super.transitionConstraintState(id, to, opts);
     this.persistConstraint(c);
     return c;
+  }
+
+  override transaction<T>(fn: () => T): T {
+    const nodesBefore = structuredClone(this.nodes);
+    const edgesBefore = structuredClone(this.edges);
+    const constraintsBefore = structuredClone(this.constraints);
+    const episodesBefore = structuredClone(this.episodes);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = fn();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } finally {
+        this.nodes = nodesBefore;
+        this.edges = edgesBefore;
+        this.constraints = constraintsBefore;
+        this.episodes = episodesBefore;
+      }
+      throw error;
+    }
   }
 
   private persistConstraint(c: Constraint): void {

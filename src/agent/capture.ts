@@ -17,13 +17,26 @@ import type {
   StatementNode,
 } from "../model/types.js";
 import type { GraphStore } from "../model/store.js";
+import { scopesEqual } from "../model/store.js";
+import type { Scope } from "../model/types.js";
 import { AgentError } from "./errors.js";
+import {
+  SCOPE_OWNER_SUBJECT,
+  SLOT_PROPERTY_KEY_ATTRIBUTE,
+  SLOT_SUBJECT_REF_ATTRIBUTE,
+  slotSubjectRef,
+} from "./slots.js";
 
 /** ② Agent-operated content — the ONLY fields the Agent authors. This is the
  * JSON/API contract between the Agent Memory layer and storage. */
 export interface CaptureContent {
-  /** Stable dimension key, e.g. "edgelore_author". Finds or creates the dimension. */
+  /** Stable Property key, persisted in the legacy dimension key during the
+   * compatibility experiment. */
   dimensionKey: string;
+  /** Subject owning this Property value. Omit for the current scope owner.
+   * Graph ingestion resolves plan-local entity refs to durable node ids before
+   * capture; direct/product capture may pass a stable subject ref itself. */
+  subjectRef?: string;
   /** The memory value (any JSON-serializable type). */
   value: unknown;
   /** Only used when CREATING a new dimension. Defaults to "multi". */
@@ -51,6 +64,8 @@ export interface CaptureContext {
   created_by: string;
   /** Resolved source references (message / conversation ids). */
   source_refs: string[];
+  /** Identity boundary. Equal dimension keys in different scopes stay apart. */
+  scope?: Scope;
   /** When the fact was actually said — for importing historical data. Omit
    * for live captures (defaults to now). ISO-8601. */
   createdAt?: string;
@@ -72,6 +87,28 @@ export function valuesEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+function linkContradiction(
+  graph: GraphStore,
+  challengerId: string,
+  incumbentId: string,
+  ctx: CaptureContext,
+): void {
+  const exists = graph
+    .queryEdges({ type: "core:contradicts", from: challengerId, to: incumbentId })
+    .some((edge) => scopesEqual(edge.scope, ctx.scope));
+  if (exists) return;
+  graph.addEdge({
+    type: "core:contradicts",
+    from: challengerId,
+    to: incumbentId,
+    scope: ctx.scope,
+    created_by: ctx.created_by,
+    created_at: ctx.createdAt,
+    source_refs: ctx.source_refs,
+    attributes: { reason: "single-cardinality incompatible values" },
+  });
+}
+
 /**
  * Persist a memory the Agent Memory layer already understood.
  *
@@ -88,10 +125,21 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
     );
   }
   const saidByAssistant = content.saidBy === "assistant";
+  const subjectRef = content.subjectRef ?? SCOPE_OWNER_SUBJECT;
+  if (subjectRef.length === 0) {
+    throw new AgentError("CaptureContent.subjectRef must be non-empty when provided");
+  }
 
-  // 1. Resolve dimension (global scope in M3; scope is a future extension).
+  // 1. Resolve the physical Dimension as a semantic Slot. Slot identity is
+  // (subject, property, scope); legacy rows without subject metadata are the
+  // scope owner's Slot and remain readable without migration.
   const dimensions = graph.queryNodes({ type: "core:dimension" }) as DimensionNode[];
-  const existing = dimensions.find((d) => d.key === content.dimensionKey);
+  const existing = dimensions.find(
+    (d) =>
+      d.key === content.dimensionKey &&
+      slotSubjectRef(d) === subjectRef &&
+      scopesEqual(d.scope, ctx.scope),
+  );
   let dimension: GraphNode;
   let created = false;
   if (existing) {
@@ -101,9 +149,16 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
       type: "core:dimension",
       key: content.dimensionKey,
       cardinality: content.cardinality ?? "multi",
+      scope: ctx.scope,
+      project_id: ctx.scope?.project_id,
+      phase_id: ctx.scope?.phase_id,
       // description rides in open metadata (M0 §1.3: narrow state, wide
       // metadata) — it is what future extractors match phrases against.
-      attributes: content.description ? { description: content.description } : {},
+      attributes: {
+        ...(content.description ? { description: content.description } : {}),
+        [SLOT_PROPERTY_KEY_ATTRIBUTE]: content.dimensionKey,
+        [SLOT_SUBJECT_REF_ATTRIBUTE]: subjectRef,
+      },
       created_by: ctx.created_by,
       created_at: ctx.createdAt,
       source_refs: ctx.source_refs,
@@ -126,10 +181,11 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
     //      flipping values behind resolve's back would bypass the human.
     const rivalAccepted =
       cardinality === "single" &&
-      sameDim.some((s) => s.state === "accepted" && !valuesEqual(s.value, content.value));
+      sameDim.find((s) => s.state === "accepted" && !valuesEqual(s.value, content.value));
     let conflictFlagged = false;
     if (dup.state === "tentative" && !saidByAssistant) {
       if (rivalAccepted) {
+        linkContradiction(graph, dup.id, rivalAccepted.id, ctx);
         if (dimension.state !== "conflict") graph.transitionNodeState(dimension.id, "conflict");
         conflictFlagged = true;
       } else if (dimension.state !== "conflict") {
@@ -175,10 +231,15 @@ export function capture(graph: GraphStore, content: CaptureContent, ctx: Capture
     created_by: ctx.created_by,
     created_at: ctx.createdAt,
     source_refs: ctx.source_refs,
+    scope: ctx.scope,
   }) as StatementNode;
 
   // Only USER-side tentative states flag the dimension (see above).
   if (newState === "tentative" && !saidByAssistant) {
+    const incumbent = sameDim.find(
+      (s) => s.state === "accepted" && !valuesEqual(s.value, content.value),
+    );
+    if (incumbent) linkContradiction(graph, stmt.id, incumbent.id, ctx);
     graph.transitionNodeState(dimension.id, "conflict");
   }
 

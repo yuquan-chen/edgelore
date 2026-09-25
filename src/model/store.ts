@@ -32,6 +32,8 @@ import {
   SCHEMA_VERSION,
   type Constraint,
   type ConstraintState,
+  type EpisodeRecord,
+  type EpisodeTurn,
   type FactNodeState,
   type GraphEdge,
   type GraphNode,
@@ -105,6 +107,16 @@ export interface AddConstraintInput {
   tags?: string[];
 }
 
+export interface PutEpisodeInput {
+  id: string;
+  turns: readonly EpisodeTurn[];
+  created_by: string;
+  created_at?: string;
+  schema_version?: string;
+  scope?: Scope;
+  attributes?: Record<string, unknown>;
+}
+
 const now = () => new Date().toISOString();
 
 function assertValidCreatedBy(createdBy: string): void {
@@ -130,8 +142,28 @@ function assertValidId(id: string, label = "id"): void {
 export interface GraphQueryFilter {
   type?: NamespacedType;
   state?: FactNodeState;
+  key?: string;
+  owner_id?: string;
   project_id?: string;
   phase_id?: string;
+}
+
+export interface GraphEdgeQueryFilter {
+  type?: NamespacedType;
+  from?: string;
+  to?: string;
+  owner_id?: string;
+  project_id?: string;
+  phase_id?: string;
+}
+
+/** Exact scope equality. Missing scope means the shared/global scope. */
+export function scopesEqual(a?: Scope, b?: Scope): boolean {
+  return (
+    a?.owner_id === b?.owner_id &&
+    a?.project_id === b?.project_id &&
+    a?.phase_id === b?.phase_id
+  );
 }
 
 export interface GraphStore {
@@ -139,6 +171,13 @@ export interface GraphStore {
   getNode(id: string): GraphNode | undefined;
   queryNodes(filter: GraphQueryFilter): GraphNode[];
   transitionNodeState(id: string, to: FactNodeState): GraphNode;
+  addEdge(input: AddEdgeInput): GraphEdge;
+  queryEdges(filter: GraphEdgeQueryFilter): GraphEdge[];
+  putEpisode(input: PutEpisodeInput): EpisodeRecord;
+  getEpisode(id: string): EpisodeRecord | undefined;
+  getAllEpisodes(): EpisodeRecord[];
+  /** Execute a graph mutation atomically for both memory and durable stores. */
+  transaction<T>(fn: () => T): T;
 }
 
 export class MemoryGraph implements GraphStore {
@@ -148,6 +187,42 @@ export class MemoryGraph implements GraphStore {
   protected nodes = new Map<string, GraphNode>();
   protected edges = new Map<string, GraphEdge>();
   protected constraints = new Map<string, Constraint>();
+  protected episodes = new Map<string, EpisodeRecord>();
+
+  // ------------------------------------------------------------- episodes
+
+  putEpisode(input: PutEpisodeInput): EpisodeRecord {
+    assertValidCreatedBy(input.created_by);
+    if (!input.id.trim()) throw new ModelError("episode requires a non-empty id");
+    const turns = input.turns.map((turn) => ({ role: turn.role, content: turn.content }));
+    const existing = this.episodes.get(input.id);
+    if (existing) {
+      if (JSON.stringify(existing.turns) !== JSON.stringify(turns)) {
+        throw new ModelError(`episode ${input.id} is immutable and already has different content`);
+      }
+      return existing;
+    }
+    const episode: EpisodeRecord = {
+      id: input.id,
+      turns,
+      created_by: input.created_by,
+      created_at: input.created_at ?? now(),
+      schema_version: input.schema_version ?? SCHEMA_VERSION,
+      source_refs: [input.id],
+      scope: input.scope,
+      attributes: input.attributes ?? {},
+    };
+    this.episodes.set(episode.id, episode);
+    return episode;
+  }
+
+  getEpisode(id: string): EpisodeRecord | undefined {
+    return this.episodes.get(id);
+  }
+
+  getAllEpisodes(): EpisodeRecord[] {
+    return [...this.episodes.values()];
+  }
 
   // ---------------------------------------------------------------- nodes
 
@@ -201,7 +276,12 @@ export class MemoryGraph implements GraphStore {
         };
         break;
       default:
-        node = base;
+        node = {
+          ...base,
+          ...(input.key !== undefined ? { key: input.key } : {}),
+          ...(input.value !== undefined ? { value: input.value } : {}),
+          ...(input.unit !== undefined ? { unit: input.unit } : {}),
+        };
     }
 
     this.nodes.set(node.id, node);
@@ -257,6 +337,20 @@ export class MemoryGraph implements GraphStore {
 
   getEdge(id: string): GraphEdge | undefined {
     return this.edges.get(id);
+  }
+
+  queryEdges(filter: GraphEdgeQueryFilter): GraphEdge[] {
+    const out: GraphEdge[] = [];
+    for (const edge of this.edges.values()) {
+      if (filter.type && edge.type !== filter.type) continue;
+      if (filter.from && edge.from !== filter.from) continue;
+      if (filter.to && edge.to !== filter.to) continue;
+      if (filter.owner_id && edge.scope?.owner_id !== filter.owner_id) continue;
+      if (filter.project_id && edge.scope?.project_id !== filter.project_id) continue;
+      if (filter.phase_id && edge.scope?.phase_id !== filter.phase_id) continue;
+      out.push(edge);
+    }
+    return out;
   }
 
   // ---------------------------------------------------------- constraints
@@ -338,7 +432,10 @@ export class MemoryGraph implements GraphStore {
         for (const n of this.nodes.values()) {
           if (n.type === "core:statement") {
             const stmt = n as StatementNode;
-            if (stmt.dimension_id === dimId) {
+            // Constraints evaluate the graph's CURRENT accepted belief, not
+            // tentative suggestions or terminal history. Candidate-by-candidate
+            // arbitration builds an accepted hypothetical snapshot separately.
+            if (stmt.dimension_id === dimId && stmt.state === "accepted") {
               const v = stmt.value;
               if (typeof v === "number") values.push(v);
             }
@@ -389,11 +486,29 @@ export class MemoryGraph implements GraphStore {
     for (const n of this.nodes.values()) {
       if (filter.type && n.type !== filter.type) continue;
       if (filter.state && n.state !== filter.state) continue;
+      if (filter.key && n.key !== filter.key) continue;
+      if (filter.owner_id && n.scope?.owner_id !== filter.owner_id) continue;
       if (filter.project_id && n.scope?.project_id !== filter.project_id) continue;
       if (filter.phase_id && n.scope?.phase_id !== filter.phase_id) continue;
       out.push(n);
     }
     return out;
+  }
+
+  transaction<T>(fn: () => T): T {
+    const nodesBefore = structuredClone(this.nodes);
+    const edgesBefore = structuredClone(this.edges);
+    const constraintsBefore = structuredClone(this.constraints);
+    const episodesBefore = structuredClone(this.episodes);
+    try {
+      return fn();
+    } catch (error) {
+      this.nodes = nodesBefore;
+      this.edges = edgesBefore;
+      this.constraints = constraintsBefore;
+      this.episodes = episodesBefore;
+      throw error;
+    }
   }
 
   getAllNodes(): GraphNode[] {

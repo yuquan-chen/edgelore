@@ -36,6 +36,7 @@ function seed(g: SqliteGraph): { dimId: string; constraintId: string } {
       dimension_id: dim.id,
       value: v,
       unit: "CNY",
+      state: "accepted",
       created_by: "agent:x:1",
     });
   }
@@ -166,6 +167,7 @@ test("sqlite: evaluation still reflects live writes after reopen", () => {
         dimension_id: dimId,
         value: 12000,
         unit: "CNY",
+        state: "accepted",
         created_by: "agent:x:1",
       });
       assert.equal(g.evaluateConstraint(constraintId), "violated");

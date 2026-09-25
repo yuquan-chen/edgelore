@@ -110,6 +110,7 @@ function buildGraph(values: number[], withExpression: ExpressionNode | undefined
       dimension_id: dim.id,
       value: v,
       unit: "CNY",
+      state: "accepted",
       created_by: "agent:x:1",
     });
   }
@@ -158,4 +159,29 @@ test("store: constraint without expression is error", () => {
 test("store: unknown constraint id throws ModelError", () => {
   const g = buildGraph([100], { op: "<=", args: [{ op: "avg", args: [{ ref: "x1" }] }, 5] });
   assert.throws(() => g.evaluateConstraint("constraint:does-not-exist"), /constraint not found/);
+});
+
+test("store: constraints ignore tentative and terminal statements", () => {
+  const g = buildGraph([3000], {
+    op: "==",
+    args: [{ op: "sum", args: [{ ref: "x1" }] }, 3000],
+  });
+  const dim = g.queryNodes({ type: "core:dimension" })[0];
+  assert.ok(dim);
+  for (const [value, state] of [
+    [9000, "tentative"],
+    [8000, "superseded"],
+    [7000, "rejected"],
+  ] as const) {
+    g.addNode({
+      type: "core:statement",
+      dimension_id: dim.id,
+      value,
+      state,
+      created_by: "agent:x:1",
+    });
+  }
+  const constraint = g.getAllConstraints()[0];
+  assert.ok(constraint);
+  assert.equal(g.evaluateConstraint(constraint.id), "satisfied");
 });

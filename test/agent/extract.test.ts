@@ -302,6 +302,84 @@ test("batch: normalizeBatchContents accepts bare camelCase keys without NEW: (le
   assert.equal(contents[2]?.value, 5000);
 });
 
+test("batch: event decisions make every scanned candidate auditable", async () => {
+  const { normalizeBatchExtractionReply } = await import("../../src/agent/extract.js");
+  const result = normalizeBatchExtractionReply(
+    {
+      contents: [{ dimensionKey: "generalFact", value: "kept normally", saidBy: "user" }],
+      eventDecisions: [
+        {
+          eventId: "E1",
+          decision: "keep",
+          content: {
+            dimensionKey: "NEW:socialMediaChallenge",
+            value: "Participated in #PlankChallenge on 2023-03-15",
+            saidBy: "user",
+          },
+        },
+        { eventId: "E2", decision: "drop", reason: "duplicate: already in contents" },
+      ],
+    },
+    2,
+  );
+  assert.equal(result.eventKept, 1);
+  assert.equal(result.eventDropped, 1);
+  assert.equal(result.contents.length, 2);
+  assert.equal(result.contents[0]?.dimensionKey, "socialMediaChallenge");
+});
+
+test("batch: keep decisions accept equivalent inline fact fields", async () => {
+  const { normalizeBatchExtractionReply } = await import("../../src/agent/extract.js");
+  const result = normalizeBatchExtractionReply(
+    {
+      contents: [],
+      eventDecisions: [
+        {
+          eventId: "E1",
+          decision: "keep",
+          dimensionKey: "cameraGear",
+          value: "Purchased a 70-200mm zoom lens",
+          saidBy: "user",
+        },
+      ],
+    },
+    1,
+  );
+  assert.equal(result.eventKept, 1);
+  assert.equal(result.contents[0]?.dimensionKey, "cameraGear");
+  assert.match(String(result.contents[0]?.value), /70-200mm/);
+});
+
+test("batch: explicitly-new provider keys are repaired into lowerCamelCase", async () => {
+  const { normalizeBatchContents } = await import("../../src/agent/extract.js");
+  const result = normalizeBatchContents([
+    { dimensionKey: "NEW:50mmLens", value: "50mm prime" },
+    { dimensionKey: "NEW:new70_200mmLens", value: "70-200mm zoom" },
+    { dimensionKey: "NEW:5kRunResult", value: "27:12 personal best" },
+  ]);
+  assert.equal(result.skipped, 0);
+  assert.deepEqual(
+    result.contents.map((content) => content.dimensionKey),
+    ["fact50mmLens", "new70200mmLens", "fact5kRunResult"],
+  );
+});
+
+test("batch: missing or content-free event decisions fail loud", async () => {
+  const { normalizeBatchExtractionReply } = await import("../../src/agent/extract.js");
+  assert.throws(
+    () => normalizeBatchExtractionReply({ contents: [], eventDecisions: [] }, 1),
+    /missing: E1/,
+  );
+  assert.throws(
+    () =>
+      normalizeBatchExtractionReply(
+        { contents: [], eventDecisions: [{ eventId: "E1", decision: "keep" }] },
+        1,
+      ),
+    /must carry one valid content object/,
+  );
+});
+
 test("batch: malformed entries are SKIPPED, never fatal (one bad field != lost session)", () => {
   const { contents, skipped } = normalizeBatchContents([
     { dimensionKey: "good", value: 1, unit: "" }, // empty unit -> omitted, entry kept

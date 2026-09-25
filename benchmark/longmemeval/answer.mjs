@@ -15,6 +15,7 @@
 // shifts pre-08:00 timestamps a day back on UTC+8 machines).
 //
 // Usage:
+//   node benchmark/longmemeval/answer.mjs --db data/runs/<run>/memory.db --tag <name>
 //   node benchmark/longmemeval/answer.mjs --sample 100 --seed 20260919 --tag s1
 //   node benchmark/longmemeval/answer.mjs --ids data/stage1-ids.txt --tag s1
 //   node benchmark/longmemeval/answer.mjs --limit 50              (sequential head)
@@ -24,7 +25,7 @@
 // resumes from the tagged JSONL); without it the legacy filenames are used.
 
 import { readFileSync, existsSync, appendFileSync, writeFileSync } from "node:fs";
-import { join, dirname, isAbsolute } from "node:path";
+import { join, dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { boot, requireChat } from "../lib/boot.mjs";
 import {
@@ -50,6 +51,7 @@ const k = argVal("--k") ? Number(argVal("--k")) : Number(process.env.EDGELORE_RE
 const seed = Number(argVal("--seed") ?? 20260919);
 const idsArg = argVal("--ids");
 const tag = argVal("--tag");
+const dbPath = resolve(argVal("--db") ?? join(dataDir, "memory.db"));
 const dryRun = args.includes("--dry-run");
 const limitIdx = args.indexOf("--limit");
 const maxQ = limitIdx !== -1 ? Number(args[limitIdx + 1]) : Infinity;
@@ -137,6 +139,7 @@ const meta = {
   model: cfg.llm?.model ?? null,
   base_url: cfg.llm?.baseUrl ?? null,
   embedding_model: cfg.embedding?.model ?? null,
+  database: dbPath,
   dataset_size: dataset.length,
   selected_ids: questions.map((q) => q.question_id),
   started_at: new Date().toISOString(),
@@ -160,7 +163,11 @@ if (dryRun) {
 
 requireChat(cfg, { maxTokens: 16000 }); // fail fast with a readable message
 const driver = requireChat(cfg, { maxTokens: 16000 });
-const graph = new SqliteGraph(join(dataDir, "memory.db"));
+if (!existsSync(dbPath)) {
+  console.error(`memory database not found: ${dbPath}`);
+  process.exit(1);
+}
+const graph = new SqliteGraph(dbPath);
 // A9: env 旋钮（mode/k/rrfSmoothing/maxEntriesPerDimension/maxContextLines）接线——
 // k 显式由 --k / EDGELORE_RETRIEVAL_K 决定（上方），其余旋钮从 config 透传
 const retrieval = cfg.embedding
@@ -185,6 +192,7 @@ if (existsSync(hypPath)) {
   }
 }
 const todo = questions.filter((q) => !answered.has(q.question_id));
+console.log(`database: ${dbPath}`);
 console.log(`待回答: ${todo.length}/${questions.length} 题 | 模型: ${cfg.llm?.model} | mode=${mode}\n`);
 
 // --- tqdm-style progress bar -------------------------------------------------------

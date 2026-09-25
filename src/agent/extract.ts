@@ -208,6 +208,114 @@ export interface BatchNormalizeResult {
   skipped: number;
 }
 
+/** Fully normalized session-level extraction, including enforced decisions for
+ * deterministic event-scan candidates. */
+export interface BatchExtractionNormalizeResult extends BatchNormalizeResult {
+  eventKept: number;
+  eventDropped: number;
+}
+
+/**
+ * Validate the batch extraction reply as one auditable contract. General facts
+ * remain lenient, but every event-scan candidate must have exactly one explicit
+ * keep/drop decision. A kept event carries its own fact object, so it cannot be
+ * silently displaced by the general max-facts budget.
+ */
+export function normalizeBatchExtractionReply(
+  raw: unknown,
+  expectedEventCount: number,
+  knownKeys?: ReadonlySet<string>,
+): BatchExtractionNormalizeResult {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new AgentError("batch extraction reply must be a JSON object");
+  }
+  const reply = raw as Record<string, unknown>;
+  const general = normalizeBatchContents(Array.isArray(reply.contents) ? reply.contents : [], knownKeys);
+  if (expectedEventCount === 0) {
+    return { ...general, eventKept: 0, eventDropped: 0 };
+  }
+  if (!Array.isArray(reply.eventDecisions)) {
+    throw new AgentError("batch extraction reply must include eventDecisions");
+  }
+
+  const expected = new Set(
+    Array.from({ length: expectedEventCount }, (_, index) => `E${index + 1}`),
+  );
+  const seen = new Set<string>();
+  const eventContents: CaptureContent[] = [];
+  let eventKept = 0;
+  let eventDropped = 0;
+  for (const rawDecision of reply.eventDecisions) {
+    if (typeof rawDecision !== "object" || rawDecision === null || Array.isArray(rawDecision)) {
+      throw new AgentError("eventDecisions entries must be objects");
+    }
+    const decision = rawDecision as Record<string, unknown>;
+    const eventId = decision.eventId;
+    if (typeof eventId !== "string" || !expected.has(eventId)) {
+      throw new AgentError(`eventDecisions contains an unknown eventId: ${JSON.stringify(eventId)}`);
+    }
+    if (seen.has(eventId)) {
+      throw new AgentError(`eventDecisions contains duplicate decision for ${eventId}`);
+    }
+    seen.add(eventId);
+    if (decision.decision === "keep") {
+      // Providers occasionally flatten the fact fields onto the keep decision
+      // or call the nested object `entry`/`memory`. These shapes are
+      // semantically identical, so normalize them without weakening the fact
+      // validation itself.
+      const inlineContent =
+        decision.dimensionKey !== undefined
+          ? Object.fromEntries(
+              Object.entries(decision).filter(
+                ([key]) => key !== "eventId" && key !== "decision" && key !== "reason",
+              ),
+            )
+          : undefined;
+      const contentCandidate = decision.content ?? decision.entry ?? decision.memory ?? inlineContent;
+      const normalized = normalizeBatchContents([contentCandidate], knownKeys);
+      if (normalized.contents.length !== 1 || normalized.skipped !== 0) {
+        const preview = JSON.stringify(contentCandidate)?.slice(0, 500) ?? "undefined";
+        throw new AgentError(
+          `${eventId} keep decision must carry one valid content object; received: ${preview}`,
+        );
+      }
+      eventContents.push(normalized.contents[0]);
+      eventKept += 1;
+    } else if (decision.decision === "drop") {
+      if (typeof decision.reason !== "string" || decision.reason.trim().length === 0) {
+        throw new AgentError(`${eventId} drop decision must include a reason`);
+      }
+      eventDropped += 1;
+    } else {
+      throw new AgentError(`${eventId} decision must be keep or drop`);
+    }
+  }
+  const missing = [...expected].filter((eventId) => !seen.has(eventId));
+  if (missing.length > 0) {
+    throw new AgentError(`eventDecisions missing: ${missing.join(", ")}`);
+  }
+
+  const merged: CaptureContent[] = [];
+  const identities = new Set<string>();
+  for (const content of [...eventContents, ...general.contents]) {
+    const identity = JSON.stringify([
+      content.dimensionKey,
+      content.value,
+      content.unit ?? null,
+      content.saidBy ?? null,
+    ]);
+    if (identities.has(identity)) continue;
+    identities.add(identity);
+    merged.push(content);
+  }
+  return {
+    contents: merged,
+    skipped: general.skipped,
+    eventKept,
+    eventDropped,
+  };
+}
+
 /**
  * Narrow a BATCH extraction reply's contents (the session-level bulk-import
  * path used by the benchmark harnesses). Deliberately more lenient than
@@ -251,8 +359,9 @@ export function normalizeBatchContents(
     // Models sometimes lowercase the protocol prefix ("new:key") — accept
     // any case, strip it, then enforce camelCase on the key itself.
     if (/^new:/i.test(dimensionKey)) {
-      const key = dimensionKey.slice(dimensionKey.indexOf(":") + 1);
-      if (!LOWER_CAMEL_CASE.test(key)) {
+      const rawKey = dimensionKey.slice(dimensionKey.indexOf(":") + 1);
+      const key = repairBatchDimensionKey(rawKey);
+      if (!key) {
         skipped += 1;
         continue;
       }
@@ -277,6 +386,23 @@ export function normalizeBatchContents(
     contents.push(content);
   }
   return { contents, skipped };
+}
+
+/**
+ * Repair common provider drift for explicitly-new keys in the bulk importer.
+ * The stored key still obeys lowerCamelCase; the strict product extractor is
+ * intentionally unaffected. Numeric-leading concepts receive a neutral
+ * `fact` prefix, while separators are folded into camelCase.
+ */
+function repairBatchDimensionKey(raw: string): string | undefined {
+  if (LOWER_CAMEL_CASE.test(raw)) return raw;
+  let repaired = raw
+    .trim()
+    .replace(/[^A-Za-z0-9]+([A-Za-z0-9])/g, (_match, next: string) => next.toUpperCase())
+    .replace(/[^A-Za-z0-9]/g, "");
+  if (/^[0-9]/.test(repaired)) repaired = `fact${repaired}`;
+  if (/^[A-Z]/.test(repaired)) repaired = repaired[0].toLowerCase() + repaired.slice(1);
+  return LOWER_CAMEL_CASE.test(repaired) ? repaired : undefined;
 }
 
 /**

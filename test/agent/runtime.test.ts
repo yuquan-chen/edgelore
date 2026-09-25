@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { MemoryGraph } from "../../src/model/store.js";
 import { MockDriver } from "../../src/agent/llm-driver.js";
 import { capture } from "../../src/agent/capture.js";
+import { archiveConversationEpisode, archiveConversationEvidence } from "../../src/agent/evidence.js";
 import { AgentError } from "../../src/agent/errors.js";
 import { MockEmbedder, type EmbeddingDriver } from "../../src/agent/embedding-driver.js";
 import { InMemoryVectorStore } from "../../src/agent/retrieval.js";
@@ -44,6 +45,74 @@ test("runtime: full turn captures into the graph with runtime-injected provenanc
   assert.equal(stmts.length, 1);
   assert.equal(stmts[0]?.value, 5000);
   assert.equal(stmts[0]?.created_by, "human:charles"); // from ctx, never the LLM
+});
+
+test("runtime: optional enrichment builds graph shape after fact extraction", async () => {
+  const graph = new MemoryGraph();
+  const driver = new MockDriver([
+    JSON.stringify({ store: true, candidates: ["Went to Hawaii with my family"] }),
+    JSON.stringify({
+      contents: [
+        {
+          dimensionKey: "NEW:familyTripHawaii",
+          value: "Went to Hawaii with my family",
+          saidBy: "user",
+        },
+      ],
+    }),
+    JSON.stringify({
+      factMappings: [
+        {
+          factRef: "fact:0",
+          subjectRef: "$scopeOwner",
+          dimensionKey: "familyTrips",
+          dimensionDescription: "Family travel experiences",
+          cardinality: "multi",
+        },
+      ],
+      entities: [
+        { ref: "trip", type: "travel:trip", key: "hawaii-family-trip", scope: "context" },
+        { ref: "hawaii", type: "geo:place", key: "hawaii", value: "Hawaii", scope: "global" },
+      ],
+      relations: [
+        { type: "core:about", from: "fact:0", to: "trip" },
+        { type: "travel:destination", from: "fact:0", to: "hawaii" },
+      ],
+    }),
+  ]);
+  const outcome = await processTurn(
+    graph,
+    "Went to Hawaii with my family",
+    driver,
+    { ...ctx, scope: { owner_id: "actor:alice" } },
+    { graphEnrichment: {} },
+  );
+  assert.equal(outcome.graph?.enriched, true);
+  assert.equal(outcome.graph?.createdEntities, 2);
+  assert.equal(outcome.graph?.createdEdges, 2);
+  assert.equal(graph.queryNodes({ type: "core:dimension" })[0]?.key, "familyTrips");
+  assert.equal(graph.queryNodes({ type: "travel:trip" }).length, 1);
+  assert.equal(graph.queryNodes({ type: "travel:trip" })[0]?.state, "accepted");
+});
+
+test("runtime: failed enrichment falls back without losing extracted facts", async () => {
+  const graph = new MemoryGraph();
+  const driver = new MockDriver([
+    JSON.stringify({ store: true, candidates: ["预算 5000"] }),
+    JSON.stringify({ contents: [{ dimensionKey: "NEW:budget", value: 5000 }] }),
+    JSON.stringify({ factMappings: [], entities: [], relations: [] }),
+  ]);
+  const outcome = await processTurn(
+    graph,
+    "预算 5000",
+    driver,
+    ctx,
+    { graphEnrichment: {} },
+  );
+  assert.equal(outcome.graph?.enriched, false);
+  assert.match(outcome.graph?.error ?? "", /omitted factRef/);
+  assert.equal(outcome.captures.length, 1);
+  assert.equal(graph.queryNodes({ type: "core:statement" }).length, 1);
 });
 
 test("runtime: conflicting turn surfaces conflict via capture", async () => {
@@ -254,6 +323,446 @@ test("runtime: assistant-authored statements are labelled in grouped context", a
   assert.ok(!/\(assistant\)/.test(userLine ?? ""));
 });
 
+test("runtime: verbatim evidence is rendered directly with speaker and date", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEvidence(
+    graph,
+    [{ role: "assistant", content: "The Lost Temple encounter contained exactly 4 mummies." }],
+    { created_by: "human:charles", source_ref: "session:temple", createdAt: "2023-04-18" },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(graph, "How many mummies were in the Lost Temple?", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+  });
+
+  assert.equal(lines.length, 1);
+  assert.match(lines[0] ?? "", /conversationEvidence \(verbatim assistant @2023-04-18\)/);
+  assert.match(lines[0] ?? "", /exactly 4 mummies/);
+});
+
+test("runtime: a Claim hit recovers focused verbatim evidence from its cold Episode", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [
+      { role: "user", content: "Which database would fit the analytics service?" },
+      {
+        role: "assistant",
+        content: "I recommend PostgreSQL 16 because the workload needs JSONB and reliable transactions.",
+      },
+      { role: "user", content: "Thanks, I will compare hosting prices later." },
+    ],
+    { created_by: "human:charles", source_ref: "session:database", createdAt: "2023-06-12" },
+  );
+  capture(
+    graph,
+    {
+      dimensionKey: "databaseRecommendation",
+      value: "PostgreSQL for the analytics service",
+      saidBy: "assistant",
+    },
+    { ...ctx, source_refs: ["session:database"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(graph, "Which database did the assistant recommend?", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+  });
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence"));
+  assert.ok(evidence.some((line) => line.includes("PostgreSQL 16")));
+  assert.ok(evidence.some((line) => line.includes("source session:database")));
+  assert.equal(graph.queryNodes({ type: "core:message" }).length, 0, "cold recovery must not create Message nodes");
+});
+
+test("runtime: cold Episode recovery respects account scope and does not mix fallback sources", async () => {
+  const graph = new MemoryGraph();
+  for (const [source, answer] of [["s:alice", "Alice chose PostgreSQL"], ["s:bob", "Bob chose MySQL"]] as const) {
+    archiveConversationEpisode(
+      graph,
+      [{ role: "assistant", content: answer }],
+      { created_by: "human:charles", source_ref: source, createdAt: "2023-06-12" },
+    );
+    capture(
+      graph,
+      { dimensionKey: "databaseChoice", value: answer, saidBy: "assistant" },
+      { ...ctx, source_refs: [source] },
+    );
+  }
+  const lines = await contextMemoriesViaRetrieval(graph, "database choice PostgreSQL MySQL", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+    scopeSessionIds: ["s:alice"],
+  });
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /Alice chose PostgreSQL/);
+  assert.ok(!evidence.includes("Bob chose MySQL"));
+});
+
+test("runtime: scoped cold lexical fallback recovers a fact missing from Claims", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [{ role: "assistant", content: "The song Evolution best demonstrates the band's growth on the Fifth Album." }],
+    { created_by: "human:charles", source_ref: "s:fifth-album", createdAt: "2023-05-20" },
+  );
+  // The extractor retained an unrelated memory but completely missed the
+  // requested assistant detail. There is deliberately no Claim for Evolution.
+  capture(
+    graph,
+    { dimensionKey: "musicGenre", value: "indie folk" },
+    { ...ctx, source_refs: ["s:fifth-album"] },
+  );
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "Which Fifth Album song best demonstrated the band's growth?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:fifth-album"],
+    },
+  );
+  assert.ok(lines.some((line) => line.includes("song Evolution")));
+});
+
+test("runtime: cold Episode evidence gives each relevant source a quota", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [{ role: "user", content: "The Hawaii family trip lasted ten days." }],
+    { created_by: "human:charles", source_ref: "s:hawaii", createdAt: "2023-05-21" },
+  );
+  archiveConversationEpisode(
+    graph,
+    [{ role: "user", content: "The New York City solo trip lasted five days." }],
+    { created_by: "human:charles", source_ref: "s:new-york", createdAt: "2023-05-20" },
+  );
+  capture(
+    graph,
+    { dimensionKey: "familyTrips", value: "Completed a family trip to Hawaii" },
+    { ...ctx, source_refs: ["s:hawaii"] },
+  );
+  capture(
+    graph,
+    { dimensionKey: "soloTrips", value: "Completed a solo trip to New York City" },
+    { ...ctx, source_refs: ["s:new-york"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "How many days did I travel in Hawaii and New York City?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:hawaii", "s:new-york"],
+      maxEpisodeEvidenceLines: 2,
+    },
+  );
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /ten days/);
+  assert.match(evidence, /five days/);
+});
+
+test("runtime: Claim lanes recover adjacent detail without adding Message nodes", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [
+      { role: "user", content: "Max needs flea medication every two weeks." },
+      { role: "assistant", content: "Ask the dog walker whether medication is included." },
+      {
+        role: "user",
+        content: "Which collar would suit a Golden Retriever like Max?",
+      },
+      { role: "assistant", content: "A durable nylon collar would work well." },
+      { role: "user", content: "I chose a nylon collar and engraved name tag for Max." },
+    ],
+    { created_by: "human:charles", source_ref: "s:max", createdAt: "2023-05-22" },
+  );
+  capture(
+    graph,
+    { dimensionKey: "dogMedication", value: "Max needs flea medication every two weeks" },
+    { ...ctx, source_refs: ["s:max"] },
+  );
+  capture(
+    graph,
+    { dimensionKey: "dogCollarChoice", value: "Chose a nylon collar for Max" },
+    { ...ctx, source_refs: ["s:max"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(graph, "What breed is my dog?", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+    scopeSessionIds: ["s:max"],
+    maxEpisodeEvidenceLines: 6,
+  });
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /Golden Retriever/);
+  assert.equal(graph.queryNodes({ type: "core:message" }).length, 0);
+});
+
+test("runtime: long Episode evidence uses complete semantic units under the fixed budget", async () => {
+  const graph = new MemoryGraph();
+  const longAnswer = [
+    "# The Lost Temple of the Djinn",
+    "The party crosses the desert and enters the buried temple.",
+    ...Array.from({ length: 20 }, (_, index) => `Background paragraph ${index + 1} describes an ancient chamber and its traps.`),
+    "* Mummies (4):",
+    "  + Armor Class: 11",
+    "  + Hit Points: 45",
+    "* Construct Guardians (2):",
+    "  + Armor Class: 17",
+  ].join("\n\n");
+  archiveConversationEpisode(
+    graph,
+    [{ role: "assistant", content: longAnswer }],
+    { created_by: "human:charles", source_ref: "s:temple", createdAt: "2023-05-21" },
+  );
+  capture(
+    graph,
+    {
+      dimensionKey: "dndOneShot",
+      value: "The Lost Temple includes mummies and construct guardians",
+      saidBy: "assistant",
+    },
+    { ...ctx, source_refs: ["s:temple"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "How many mummies will the party face in the Lost Temple?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:temple"],
+      maxEpisodeEvidenceLines: 6,
+      maxEpisodeExcerptChars: 220,
+    },
+  );
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence"));
+  assert.ok(evidence.length <= 6);
+  assert.ok(evidence.some((line) => line.includes("Mummies (4)")));
+  assert.ok(evidence.every((line) => !line.includes("…")), "must not use arbitrary character slices");
+  assert.ok(evidence.every((line) => line.length <= 420), "metadata plus each semantic unit stays bounded");
+});
+
+test("runtime: ordinal questions recover the matching item from an assistant list", async () => {
+  const graph = new MemoryGraph();
+  const list = Array.from(
+    { length: 40 },
+    (_, index) => `${index + 1}. ${index === 26 ? "Sound effects (ambient, diegetic, non-diegetic)" : `Parameter ${index + 1}`}`,
+  ).join("\n");
+  archiveConversationEpisode(
+    graph,
+    [
+      { role: "user", content: "Give me 100 prompt parameters that influence your output." },
+      { role: "assistant", content: `Here is the requested list:\n${list}` },
+    ],
+    { created_by: "human:charles", source_ref: "s:parameters", createdAt: "2023-05-25" },
+  );
+  capture(
+    graph,
+    {
+      dimensionKey: "promptParameters",
+      value: "Requested and received a list of 100 prompt parameters",
+    },
+    { ...ctx, source_refs: ["s:parameters"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "You provided a list of 100 prompt parameters. What was the 27th parameter?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:parameters"],
+      maxEpisodeEvidenceLines: 3,
+    },
+  );
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /27\. Sound effects/);
+});
+
+test("runtime: exact assistant payload outranks the user request that produced it", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [
+      {
+        role: "user",
+        content: "Review the submission To Adapt or Not to Adapt? Real-Time Adaptation for Semantic Segmentation.",
+      },
+      {
+        role: "assistant",
+        content: "The experimental results report an average improvement in framerate of approximately 20% when using the Hardware-Aware Modular Training (HAMT) agent.",
+      },
+    ],
+    { created_by: "human:charles", source_ref: "s:hamt", createdAt: "2023-05-25" },
+  );
+  capture(
+    graph,
+    {
+      dimensionKey: "paperReviewTask",
+      value: "Reviewed the Real-Time Adaptation for Semantic Segmentation submission",
+    },
+    { ...ctx, source_refs: ["s:hamt"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "What was the average improvement in framerate when using the HAMT agent?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:hamt"],
+      maxEpisodeEvidenceLines: 2,
+    },
+  );
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /approximately 20%/);
+});
+
+test("runtime: relative time prioritizes reported events in the matching Episode", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [
+      { role: "user", content: "I attended a gardening workshop and learned crop rotation." },
+      { role: "user", content: "I use a gardening app to monitor soil moisture." },
+    ],
+    { created_by: "human:charles", source_ref: "s:garden-old", createdAt: "2023-04-15" },
+  );
+  archiveConversationEpisode(
+    graph,
+    [
+      {
+        role: "user",
+        content: "I'm looking for advice about tomato plants. By the way, I just planted 12 new tomato saplings today and I'm excited to see them grow.",
+      },
+      { role: "user", content: "I'm not sure how often I should water my tomato plants during this dry spell?" },
+      { role: "user", content: "Can neem oil control aphids on my tomato plants?" },
+      { role: "user", content: "I might use mulch to conserve water." },
+      { role: "user", content: "Should I build a trellis for the cucumber plants?" },
+    ],
+    { created_by: "human:charles", source_ref: "s:garden-target", createdAt: "2023-04-21" },
+  );
+  capture(
+    graph,
+    { dimensionKey: "gardeningWorkshop", value: "Attended a gardening workshop" },
+    { ...ctx, source_refs: ["s:garden-old"], createdAt: "2023-04-15" },
+  );
+  capture(
+    graph,
+    { dimensionKey: "gardenMulching", value: "Gardening plan: considering mulch for water conservation" },
+    { ...ctx, source_refs: ["s:garden-target"], createdAt: "2023-04-21" },
+  );
+  capture(
+    graph,
+    { dimensionKey: "gardenPestControl", value: "Gardening pest control with neem oil for tomato plant aphids" },
+    { ...ctx, source_refs: ["s:garden-target"], createdAt: "2023-04-21" },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "What tomato gardening activity did I do two weeks ago?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:garden-old", "s:garden-target"],
+      dateTo: "2023-05-05",
+      maxEpisodeEvidenceLines: 6,
+    },
+  );
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /planted 12 new tomato saplings/);
+});
+
+test("runtime: core:about expands a direct Claim to a bounded related Slot", async () => {
+  const graph = new MemoryGraph();
+  const trip = graph.addNode({
+    type: "travel:trip",
+    key: "hawaii-trip",
+    value: "Hawaii family trip",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const summaryResult = capture(
+    graph,
+    { dimensionKey: "familyTrips", value: "Family trip to Hawaii" },
+    ctx,
+  );
+  const activityResult = capture(
+    graph,
+    { dimensionKey: "tripActivities", value: "Snorkeling at Hanauma Bay" },
+    ctx,
+  );
+  const summary = graph.getNode(summaryResult.statementId!);
+  const activity = graph.getNode(activityResult.statementId!);
+  assert.ok(summary);
+  assert.ok(activity);
+  graph.addEdge({ type: "core:about", from: summary.id, to: trip.id, created_by: "human:charles" });
+  graph.addEdge({ type: "core:about", from: activity.id, to: trip.id, created_by: "human:charles" });
+
+  const lines = await contextMemoriesViaRetrieval(graph, "Tell me about the Hawaii family trip", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+    k: 1,
+    maxGraphExpansionHits: 1,
+  });
+  const joined = lines.join("\n");
+  assert.match(joined, /familyTrips/);
+  assert.match(joined, /tripActivities/);
+  assert.match(joined, /Snorkeling at Hanauma Bay/);
+});
+
+test("runtime: core:about defaults to two related Claims", async () => {
+  const graph = new MemoryGraph();
+  const trip = graph.addNode({
+    type: "travel:trip",
+    key: "hawaii-trip-default-bound",
+    value: "Hawaii family trip",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const facts = [
+    ["familyTripSummary", "Family trip to Hawaii"],
+    ["tripSnorkeling", "Hawaii snorkeling"],
+    ["tripHiking", "Hawaii hiking"],
+    ["tripDinner", "Hawaii dinner"],
+  ];
+  for (const [dimensionKey, value] of facts) {
+    const result = capture(graph, { dimensionKey, value }, ctx);
+    const statement = graph.getNode(result.statementId!);
+    assert.ok(statement);
+    graph.addEdge({
+      type: "core:about",
+      from: statement.id,
+      to: trip.id,
+      created_by: "human:charles",
+    });
+  }
+
+  const lines = await contextMemoriesViaRetrieval(graph, "Hawaii family trip", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+    k: 1,
+  });
+  const relatedHeaders = lines.filter((line) => /^trip(?:Snorkeling|Hiking|Dinner) —/.test(line));
+  assert.equal(relatedHeaders.length, 2);
+});
+
 // --- 相关维度选择（批量抽取的 O(维度数) prompt 爆炸修复） -----------------------
 
 test("runtime: relevantDimensionsOf ranks matching dims first and bounds the list", () => {
@@ -318,6 +827,27 @@ test("runtime: fallback (no in-scope members) tags lines as non-user-account", a
   });
   assert.match(lines[0] ?? "", /standMixerGift — 1 entry:/);
   assert.match(lines[1] ?? "", /\(non-user-account\)/);
+});
+
+test("runtime: over-budget fallback summaries keep the non-user-account tag", async () => {
+  const graph = new MemoryGraph();
+  for (let i = 0; i < 3; i++) {
+    capture(
+      graph,
+      { dimensionKey: "foreignSubscriptions", value: `subscription-${i}` },
+      { ...ctx, source_refs: ["s:foreign"] },
+    );
+  }
+  const lines = await contextMemoriesViaRetrieval(graph, "foreign subscriptions", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    scopeSessionIds: ["s:current"],
+    maxContextLines: 1,
+  });
+  assert.match(
+    lines[0] ?? "",
+    /foreignSubscriptions: 3 entries \(omitted — context budget\) \(non-user-account\)/,
+  );
 });
 
 test("runtime: in-scope members render without the non-user-account tag", async () => {

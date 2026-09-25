@@ -23,6 +23,11 @@
 export interface EventCandidate {
   /** The verbatim sentence (trimmed). */
   sentence: string;
+  /** A small same-turn window around the trigger. Some memories put the
+   * temporal anchor in one sentence and the decisive payload immediately
+   * after it, so the extractor must see both without duplicating a whole
+   * long turn. */
+  context: string;
   /** The closed-class signal that fired: a time expression, or an aside marker. */
   timeExpr: string;
 }
@@ -61,6 +66,9 @@ const TIME_EXPRESSIONS: readonly RegExp[] = [
   /\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b/i,
   // relative words
   /\b(?:today|yesterday|tonight|recent(?:ly)?|lately|earlier|just)\b/i,
+  // clock times and recurring weekday schedules
+  /\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b/i,
+  /\b(?:mondays|tuesdays|wednesdays|thursdays|fridays|saturdays|sundays)\b/i,
   // temporal framing: "during my last trip", "during the move"
   /\bduring\b/i,
   /\blast\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month|year|weekend|night|summer|fall|winter|spring)\b/i,
@@ -118,12 +126,18 @@ export function scanEventCandidates(transcript: string): EventCandidate[] {
     if (ASSISTANT_LINE.test(line)) continue;
     const isUser = USER_LINE.test(line);
     const body = isUser ? line.replace(USER_LINE, "") : line;
-    for (const sentence of sentences(body)) {
+    const units = sentences(body);
+    for (let i = 0; i < units.length; i += 1) {
+      const sentence = units[i];
       if (!FIRST_PERSON.test(sentence)) continue;
       const timeExpr = TIME_EXPRESSIONS.map((r) => r.exec(sentence)?.[0] ?? "").find(Boolean);
       const aside = ASIDE_MARKERS.exec(sentence)?.[0];
       if (!timeExpr && !aside) continue;
-      out.push({ sentence, timeExpr: timeExpr ?? aside ?? "" });
+      // Include one sentence before and two after. This keeps discourse-linked
+      // payloads ("a week ago I went birding. I saw ... goldfinches") attached
+      // to their temporal anchor without copying the whole turn into the prompt.
+      const context = units.slice(Math.max(0, i - 1), Math.min(units.length, i + 3)).join(" ");
+      out.push({ sentence, context, timeExpr: timeExpr ?? aside ?? "" });
       if (out.length >= EVENT_CANDIDATE_CAP) return out;
     }
   }

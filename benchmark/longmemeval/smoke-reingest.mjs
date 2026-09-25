@@ -15,11 +15,12 @@ import {
   parseJsonReply,
   capture,
   buildBatchExtractionPrompt,
-  normalizeBatchContents,
+  normalizeBatchExtractionReply,
   scanEventCandidates,
   detectLang,
   dominantLang,
   filterByLanguage,
+  archiveConversationEvidence,
 } from "../../dist/src/index.js";
 import { boot, requireChat } from "../lib/boot.mjs";
 
@@ -43,12 +44,17 @@ const STOP = new Set(
   "the a an of to in on at for with and or is are was were i you my your it its this that these those be been have has had do does did not no yes as by from will would can could should".split(" "),
 );
 function textOf(db, s) {
+  if (s.type === "core:message") return String(s.value ?? "").toLowerCase();
   const d = db.getNode(s.dimension_id);
   return ((d?.key ?? "") + " " + JSON.stringify(s.value ?? "")).toLowerCase();
 }
 function statementsBySid(db) {
   const m = new Map();
-  for (const s of db.queryNodes({ type: "core:statement" })) {
+  const retrievable = [
+    ...db.queryNodes({ type: "core:statement" }),
+    ...db.queryNodes({ type: "core:message" }),
+  ];
+  for (const s of retrievable) {
     for (const r of s.source_refs ?? []) {
       if (!m.has(r)) m.set(r, []);
       m.get(r).push(s);
@@ -89,6 +95,21 @@ function push(kind, q) {
     return; // 每题只取第一个金会话
   }
 }
+function pushSession(kind, qid, sid) {
+  if (seenSids.has(sid)) return;
+  const q = dataset.find((item) => item.question_id === qid);
+  if (!q) return;
+  const idx = q.haystack_session_ids.indexOf(sid);
+  if (idx === -1) return;
+  targets.push({
+    kind,
+    qid,
+    sid,
+    date: (q.haystack_dates[idx] ?? "").slice(0, 10),
+    turns: q.haystack_sessions[idx] ?? [],
+  });
+  seenSids.add(sid);
+}
 const asst = dataset.filter((q) => q.question_type === "single-session-assistant" && !q.question_id.endsWith("_abs"));
 const asstScored = asst
   .map((q) => ({ q, rate: contentRate(oldDb, oldBySid, q.answer, q.answer_session_ids[0]) ?? -1 }))
@@ -104,8 +125,14 @@ dataset
   .filter((q) => q.question_type === "knowledge-update" && !q.question_id.endsWith("_abs"))
   .slice(0, 2)
   .forEach((q) => push("knowledge-update", q));
-oldDb.close();
-
+[
+  ["gpt4_68e94288", "answer_9793daa4_1"], // #PlankChallenge
+  ["6e984302", "answer_88841f27_2"], // sculpting tools
+  ["41698283", "answer_c7ddc051_2"], // 70-200mm lens
+  ["ccb36322", "answer_f1fbb330"], // Spotify
+  ["gpt4_cd90e484", "answer_aa930b56_2"], // goldfinches after birding
+  ["gpt4_2f8be40d", "answer_e7b0637e_3"], // attended Jen and Tom's wedding
+].forEach(([qid, sid]) => pushSession("event-regression", qid, sid));
 console.log(`抽样 ${targets.length} 个会话 -> ${dbPath}\n`);
 
 // --- 用新管线抽取入库（与 ingest.mjs 完全同款调用） -----------------------------
@@ -123,20 +150,46 @@ function knownDims() {
 let done = 0;
 let skippedTotal = 0;
 let langDroppedTotal = 0;
+let eventKeptTotal = 0;
+let eventDroppedTotal = 0;
 for (const t of targets) {
   const transcript = t.turns.map((turn) => `[${turn.role}] ${turn.content}`).join("\n");
   if (!transcript.trim()) continue;
+  archiveConversationEvidence(graph, t.turns, {
+    created_by: ctxBase.created_by,
+    source_ref: t.sid,
+    createdAt: t.date || undefined,
+  });
   try {
+    const eventCandidates = scanEventCandidates(transcript);
     const promptOpts = {
       transcript,
       knownDimensions: knownDims(),
       maxFacts: cfg.extraction.maxFactsPerSession,
       // 以下两项与 ingest.mjs 对齐（此前 smoke 缺 sessionDate，日期锚定没被质检到）
       sessionDate: t.date || undefined,
-      mustConsiderEvents: scanEventCandidates(transcript).map((c) => c.sentence),
+      mustConsiderEvents: eventCandidates,
     };
     let parsed = parseJsonReply(await driver.complete(buildBatchExtractionPrompt(promptOpts)));
-    let batch = normalizeBatchContents(parsed.contents ?? []);
+    let batch;
+    try {
+      batch = normalizeBatchExtractionReply(parsed, eventCandidates.length);
+    } catch (err) {
+      if (eventCandidates.length === 0) throw err;
+      parsed = parseJsonReply(
+        await driver.complete(
+          buildBatchExtractionPrompt({
+            ...promptOpts,
+            extraFragments: [
+              `NOTE: your previous reply violated the eventDecisions contract: ${err.message}`,
+              "Return exactly one valid keep/drop decision for every listed eventId.",
+              "A keep decision must contain its complete memory content object.",
+            ],
+          }),
+        ),
+      );
+      batch = normalizeBatchExtractionReply(parsed, eventCandidates.length);
+    }
     if (batch.contents.length === 0) {
       // 与 ingest.mjs 相同的空回复重试（质检要检验的正是这套完整逻辑）
       parsed = parseJsonReply(
@@ -151,7 +204,7 @@ for (const t of targets) {
           }),
         ),
       );
-      batch = normalizeBatchContents(parsed.contents ?? []);
+      batch = normalizeBatchExtractionReply(parsed, eventCandidates.length);
     }
     // 与 ingest.mjs 相同的语言钉死·代码层（E5）：质检要覆盖它
     const expectedLang = dominantLang(transcript);
@@ -172,11 +225,11 @@ for (const t of targets) {
             }),
           ),
         );
-        const retried = normalizeBatchContents(parsed.contents ?? []);
+        const retried = normalizeBatchExtractionReply(parsed, eventCandidates.length);
         lf = filterByLanguage(retried.contents, (c) => c.value, expectedLang);
-        batch = { contents: lf.keep, skipped: retried.skipped };
+        batch = { ...retried, contents: lf.keep };
       } else {
-        batch = { contents: lf.keep, skipped: batch.skipped };
+        batch = { ...batch, contents: lf.keep };
       }
       langDropped = lf.dropped.length;
       langDroppedTotal += langDropped;
@@ -185,6 +238,8 @@ for (const t of targets) {
       }
     }
     if (batch.skipped > 0) skippedTotal += batch.skipped;
+    eventKeptTotal += batch.eventKept;
+    eventDroppedTotal += batch.eventDropped;
     for (const c of batch.contents) {
       capture(graph, c, { ...ctxBase, source_refs: [t.sid], createdAt: t.date || undefined });
     }
@@ -201,6 +256,7 @@ console.log(`\n\n=== 质检结果（金标内容库内覆盖率：旧库 -> 新�
 const newBySid = statementsBySid(graph);
 const saidByStats = { assistant: 0, user: 0, absent: 0 };
 const allNew = graph.queryNodes({ type: "core:statement" });
+const evidenceNew = graph.queryNodes({ type: "core:message" });
 for (const s of allNew) saidByStats[s.saidBy ?? "absent"] += 1;
 
 let improved = 0;
@@ -229,5 +285,8 @@ for (const s of allNew) {
 console.log(`新库语言分布: zh=${langStats.zh} en=${langStats.en} es=${langStats.es} 歧义=${langStats.ambiguous}`);
 console.log(`新库 saidBy 分布: assistant=${saidByStats.assistant} user=${saidByStats.user} 无=${saidByStats.absent}`);
 console.log(`新库总语句: ${allNew.length} | 跳过的坏条目: ${skippedTotal}`);
+console.log(`新库逐字证据块: ${evidenceNew.length}`);
+console.log(`事件裁决: keep=${eventKeptTotal} drop=${eventDroppedTotal}`);
 graph.close();
+oldDb.close();
 console.log("\n临时库保留在 data/smoke-reingest.db（可手动检查），不碰 memory.db");

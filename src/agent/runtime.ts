@@ -16,17 +16,22 @@
 //                 posture and constraint verdicts attached
 
 import type { GraphStore, MemoryGraph } from "../model/store.js";
-import type { DimensionNode, FactNodeState, StatementNode } from "../model/types.js";
+import type { DimensionNode, EpisodeRecord, EpisodeTurn, FactNodeState, StatementNode } from "../model/types.js";
 import { capture, type CaptureContext, type CaptureResult } from "./capture.js";
+import { runGraphEnrichment } from "./graph-enrichment.js";
+import { commitGraphWritePlan } from "./graph-write.js";
 import { runGate } from "./gate.js";
 import { runExtract } from "./extract.js";
 import type { KnownDimension } from "./prompt.js";
+import { slotLabel } from "./slots.js";
 import type { LlmDriver } from "./llm-driver.js";
 import type { EmbeddingDriver } from "./embedding-driver.js";
+import { scanEventCandidates } from "./triggers.js";
 import {
   bigrams,
   retrieveRelevant,
   statementText,
+  type RetrievalHit,
   type RetrievalMode,
   type VectorStore,
 } from "./retrieval.js";
@@ -45,6 +50,15 @@ export interface TurnOutcome {
   /** Embedding failure after successful capture — the memory is stored but
    * the vector index is stale until re-embedded. */
   indexError?: string;
+  /** Present when graph enrichment was requested. Failure is non-fatal: the
+   * extracted facts still go through plain capture(). */
+  graph?: {
+    enriched: boolean;
+    createdEntities: number;
+    createdEdges: number;
+    warnings?: string[];
+    error?: string;
+  };
 }
 
 /** Options for {@link processTurn}. */
@@ -54,6 +68,16 @@ export interface ProcessTurnOptions {
   /** When configured, context selection switches from "latest 50" to
    * hybrid retrieval, and new statements are embedded after capture. */
   retrieval?: RetrievalConfig;
+  /** Optional third pass: organize immutable extracted facts into entities,
+   * events, and Statement-originating relations. */
+  graphEnrichment?: GraphEnrichmentConfig;
+}
+
+export interface GraphEnrichmentConfig {
+  /** Defaults to the gate/extract driver. May be a cheaper organizer model. */
+  driver?: LlmDriver;
+  /** Existing entity hints exposed to the organizer (default 40). */
+  maxEntityHints?: number;
 }
 
 /** Retrieval plumbing for the context recipes and the embedding write path. */
@@ -70,6 +94,14 @@ export interface RetrievalConfig {
   maxEntriesPerDimension?: number;
   /** Hard line budget for the assembled context (default 48). */
   maxContextLines?: number;
+  /** Exact source excerpts recovered from cold Episodes. They are scoped when
+   * a caller supplies source ids and are never embedded (default 6). */
+  maxEpisodeEvidenceLines?: number;
+  /** Per-excerpt character cap for cold Episode evidence (default 1,600). */
+  maxEpisodeExcerptChars?: number;
+  /** Additional Claims reached through one shared core:about target
+   * (default 2; 0 disables graph expansion). */
+  maxGraphExpansionHits?: number;
   /** Candidate state filter (default: ALL states — counting questions need
    * superseded/tentative visible; narrow deliberately, never by default). */
   states?: FactNodeState[];
@@ -139,7 +171,41 @@ export async function processTurn(
       indexed: 0,
     };
   }
-  const captures = extract.contents.map((content) => capture(graph, content, ctx));
+  let captures: CaptureResult[];
+  let graphOutcome: TurnOutcome["graph"];
+  if (opts?.graphEnrichment) {
+    try {
+      const plan = await runGraphEnrichment({
+        text,
+        contents: extract.contents,
+        knownDimensions: knownDims,
+        graph,
+        driver: opts.graphEnrichment.driver ?? driver,
+        scope: ctx.scope,
+        ...(opts.graphEnrichment.maxEntityHints !== undefined
+          ? { maxEntityHints: opts.graphEnrichment.maxEntityHints }
+          : {}),
+      });
+      const result = commitGraphWritePlan(graph, plan, ctx);
+      captures = result.captures;
+      graphOutcome = {
+        enriched: true,
+        createdEntities: result.createdEntityIds.length,
+        createdEdges: result.createdEdgeIds.length,
+        ...(plan.warnings.length > 0 ? { warnings: plan.warnings } : {}),
+      };
+    } catch (err) {
+      captures = extract.contents.map((content) => capture(graph, content, ctx));
+      graphOutcome = {
+        enriched: false,
+        createdEntities: 0,
+        createdEdges: 0,
+        error: (err as Error).message,
+      };
+    }
+  } else {
+    captures = extract.contents.map((content) => capture(graph, content, ctx));
+  }
 
   // Embedding write path: after capture, index each new statement AND each
   // new dimension (so similarDimensions can find it next time). Failures
@@ -172,7 +238,13 @@ export async function processTurn(
       indexError = (err as Error).message;
     }
   }
-  return { gate: { store: true }, captures, indexed, indexError };
+  return {
+    gate: { store: true },
+    captures,
+    indexed,
+    indexError,
+    ...(graphOutcome ? { graph: graphOutcome } : {}),
+  };
 }
 
 /**
@@ -269,7 +341,7 @@ function toKnownDimension(d: DimensionNode, units: Map<string, string>): KnownDi
 export function contextMemoriesOf(graph: GraphStore, limit = 50): string[] {
   const keys = new Map<string, string>();
   for (const d of graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]) {
-    keys.set(d.id, d.key);
+    keys.set(d.id, slotLabel(graph, d));
   }
   const lines = (graph.queryNodes({ type: "core:statement" }) as StatementNode[]).map((s) => {
     const speaker = s.saidBy === "assistant" ? " (assistant)" : "";
@@ -282,6 +354,581 @@ export function contextMemoriesOf(graph: GraphStore, limit = 50): string[] {
 export interface RetrievalContext {
   lines: string[];
   similarDimensions: KnownDimension[];
+}
+
+const EVIDENCE_STOP_WORDS = new Set([
+  "the", "and", "that", "this", "with", "from", "what", "when", "where", "which", "who",
+  "why", "how", "did", "does", "was", "were", "are", "for", "you", "your", "their", "they",
+  "have", "has", "had", "about", "into", "would", "could", "should", "can", "our", "use",
+  "used", "kind", "remind", "mentioned", "previous", "conversation", "thinking", "assistant", "user",
+]);
+
+function evidenceTerms(text: string): Set<string> {
+  const terms = new Set<string>();
+  for (const token of text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []) {
+    if (token.length < 3 || EVIDENCE_STOP_WORDS.has(token)) continue;
+    terms.add(token);
+    // Tiny, deterministic English morphology for local Episode matching.
+    // This is intentionally not a general stemmer: it only bridges common
+    // retrieval variants such as garden/gardening, travel/traveling and
+    // mummy/mummies without changing the stored text.
+    if (/^[a-z]+$/.test(token)) {
+      if (token.length > 5 && token.endsWith("ies")) terms.add(`${token.slice(0, -3)}y`);
+      else if (token.length > 5 && token.endsWith("ing")) terms.add(token.slice(0, -3));
+      else if (token.length > 4 && token.endsWith("ed")) terms.add(token.slice(0, -2));
+      else if (token.length > 4 && token.endsWith("s") && !token.endsWith("ss")) {
+        terms.add(token.slice(0, -1));
+      }
+    }
+  }
+  // Chinese and other no-whitespace text needs a second route. Prefixing the
+  // feature prevents accidental equality with ordinary word tokens.
+  if (/\p{Script=Han}/u.test(text)) {
+    for (const pair of bigrams(text)) terms.add(`bg:${pair}`);
+  }
+  return terms;
+}
+
+function overlapCount(needles: ReadonlySet<string>, corpusTerms: ReadonlySet<string>): number {
+  let count = 0;
+  for (const term of needles) if (corpusTerms.has(term)) count++;
+  return count;
+}
+
+function preferredEvidenceRole(query: string): "user" | "assistant" | undefined {
+  if (/\b(?:you|assistant)\b.{0,28}\b(?:said|told|mentioned|recommended|suggested|wrote|gave|provided|produced|created|explained|listed)\b/i.test(query)) {
+    return "assistant";
+  }
+  // "I'm looking back" / "remind me" is retrieval framing, not evidence
+  // authorship. Only explicit possession or a predicate applied to "I"
+  // identifies a user-authored fact.
+  if (/\b(?:my|mine)\b|\b(?:did|do|have|had|was|were|when|where|what|how)\s+i\b/i.test(query)) {
+    return "user";
+  }
+  return undefined;
+}
+
+const NUMBER_WORD = "(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|hundred|thousand)";
+const NUMERIC_PAYLOAD_RE = new RegExp(`(?:\\d|\\b${NUMBER_WORD}\\b)`, "i");
+const NUMERIC_QUESTION_RE = /\b(?:how many|how much|number of|count of)\b/i;
+const ORDINAL_QUESTION_RE = /\b(\d+)(?:st|nd|rd|th)\b/i;
+
+function ordinalPayloadFit(query: string, content: string): number {
+  const ordinal = ORDINAL_QUESTION_RE.exec(query)?.[1];
+  if (!ordinal) return 0;
+  return new RegExp(`(?:^|\\n)\\s*(?:[-*+]\\s*)?${ordinal}[.)](?:\\s|$)`, "m").test(content)
+    ? 3
+    : 0;
+}
+
+function numericPayloadFit(
+  query: string,
+  content: string,
+  queryTerms: ReadonlySet<string>,
+  unitTerms: ReadonlySet<string>,
+): number {
+  const ordinalFit = ordinalPayloadFit(query, content);
+  if (ordinalFit > 0) return ordinalFit;
+  if (!NUMERIC_QUESTION_RE.test(query) || !NUMERIC_PAYLOAD_RE.test(content)) return 0;
+  if (overlapCount(queryTerms, unitTerms) === 0) return 0;
+  const firstLine = content.split(/\r?\n/, 1)[0] ?? content;
+  return NUMERIC_PAYLOAD_RE.test(firstLine) && overlapCount(queryTerms, evidenceTerms(firstLine)) > 0
+    ? 2
+    : 1;
+}
+
+const RELATIVE_AMOUNT = new Map<string, number>([
+  ["one", 1], ["two", 2], ["three", 3], ["four", 4], ["five", 5], ["six", 6],
+  ["seven", 7], ["eight", 8], ["nine", 9], ["ten", 10], ["eleven", 11], ["twelve", 12],
+]);
+
+function relativeEpisodeTarget(
+  query: string,
+  referenceDay: string | undefined,
+): { timestamp: number; toleranceDays: number } | undefined {
+  if (!referenceDay) return undefined;
+  const match = new RegExp(`\\b(\\d+|${[...RELATIVE_AMOUNT.keys()].join("|")})\\s+(day|week|month|year)s?\\s+ago\\b`, "i")
+    .exec(query);
+  if (!match) return undefined;
+  const amount = /^\d+$/.test(match[1]!)
+    ? Number(match[1])
+    : RELATIVE_AMOUNT.get(match[1]!.toLowerCase());
+  if (!amount || amount < 1) return undefined;
+  const target = new Date(`${referenceDay.slice(0, 10)}T00:00:00.000Z`);
+  if (!Number.isFinite(target.getTime())) return undefined;
+  const unit = match[2]!.toLowerCase();
+  if (unit === "day") target.setUTCDate(target.getUTCDate() - amount);
+  else if (unit === "week") target.setUTCDate(target.getUTCDate() - amount * 7);
+  else if (unit === "month") target.setUTCMonth(target.getUTCMonth() - amount);
+  else target.setUTCFullYear(target.getUTCFullYear() - amount);
+  return {
+    timestamp: target.getTime(),
+    toleranceDays: unit === "day" ? 1 : unit === "week" ? 2 : unit === "month" ? 4 : 15,
+  };
+}
+
+function reportedEventFit(content: string, role: EpisodeTurn["role"]): number {
+  if (role !== "user") return 0;
+  return scanEventCandidates(`[user] ${content}`).some(
+    (candidate) => !/[?？]\s*$/.test(candidate.sentence),
+  )
+    ? 1
+    : 0;
+}
+
+/**
+ * Split a long turn at semantic boundaries instead of slicing an arbitrary
+ * character window. Short turns remain intact. Long Markdown answers retain
+ * complete paragraphs / sections; oversized sections degrade to complete
+ * list items or sentences, never a fragment that can cut off the payload.
+ */
+function episodeEvidenceUnits(content: string, maxChars: number): string[] {
+  const text = content.trim();
+  if (!text) return [];
+  if (text.length <= maxChars) return [text];
+
+  const blocks = text.split(/\r?\n\s*\r?\n/).map((block) => block.trim()).filter(Boolean);
+  const units: string[] = [];
+  let pendingHeading: string | undefined;
+  const headingOnly = /^(?:#{1,6}\s+.+|\*\*[^\n*]+\*\*:|[-*+]\s+.+:|(?:verse|chorus|bridge|outro)\s*:)$/i;
+  const listLine = /^(?:[-*+]\s+|\d+[.)]\s+)/;
+
+  const pushNatural = (raw: string) => {
+    const value = raw.trim();
+    if (!value) return;
+    if (value.length <= maxChars) {
+      units.push(value);
+      return;
+    }
+    const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (lines.length > 1) {
+      let sectionHeading: string | undefined;
+      for (const line of lines) {
+        if (headingOnly.test(line)) {
+          sectionHeading = line;
+          continue;
+        }
+        const candidate = sectionHeading && (listLine.test(line) || line.length <= maxChars)
+          ? `${sectionHeading}\n${line}`
+          : line;
+        if (candidate.length <= maxChars) units.push(candidate);
+      }
+      return;
+    }
+    for (const sentence of value.split(/(?<=[.!?])\s+(?=[A-Z0-9"'(])/)) {
+      const candidate = sentence.trim();
+      if (candidate && candidate.length <= maxChars) units.push(candidate);
+    }
+  };
+
+  for (const block of blocks) {
+    if (headingOnly.test(block)) {
+      pendingHeading = block;
+      continue;
+    }
+    const value = pendingHeading ? `${pendingHeading}\n${block}` : block;
+    pendingHeading = undefined;
+    pushNatural(value);
+  }
+  if (pendingHeading) pushNatural(pendingHeading);
+  return units;
+}
+
+interface EpisodeSourceAnchor {
+  sourceRef: string;
+  rank: number;
+  queryMatches: number;
+  claims: Array<{
+    terms: Set<string>;
+    role?: string;
+    rank: number;
+  }>;
+}
+
+interface EpisodeEvidence {
+  episode: EpisodeRecord;
+  turn: EpisodeTurn;
+  turnIndex: number;
+  unitIndex: number;
+  score: number;
+  outOfScope: boolean;
+}
+
+interface RankedEpisodeUnit extends EpisodeEvidence {
+  terms: Set<string>;
+}
+
+function localLexicalScore(
+  needles: ReadonlySet<string>,
+  unitTerms: ReadonlySet<string>,
+  termWeights?: ReadonlyMap<string, number>,
+): number {
+  let weightedMatches = 0;
+  for (const term of needles) {
+    if (unitTerms.has(term)) weightedMatches += termWeights?.get(term) ?? 1;
+  }
+  if (weightedMatches === 0) return 0;
+  // Episode-local inverse frequency stops a repeated topic word ("temple",
+  // "construction") from drowning the rarer payload-bearing phrase. The
+  // density term favors a precise list item over a generic long paragraph.
+  return weightedMatches + (weightedMatches * 2) / Math.max(1, Math.sqrt(unitTerms.size));
+}
+
+/**
+ * Claims are the hot index; Episodes are the cold, lossless source. Follow
+ * provenance after a Claim hit, then use a scoped lexical fallback over cold
+ * Episodes for themes the extractor missed entirely. No Message nodes or
+ * per-turn vectors are created.
+ */
+function coldEpisodeEvidence(
+  graph: MemoryGraph,
+  query: string,
+  hits: readonly RetrievalHit[],
+  scopeSet: ReadonlySet<string> | undefined,
+  maxLines: number,
+  maxChars: number,
+  referenceDay?: string,
+): EpisodeEvidence[] {
+  if (maxLines <= 0) return [];
+  const queryTerms = evidenceTerms(query);
+  const preferredRole = preferredEvidenceRole(query);
+  const temporalTarget = relativeEpisodeTarget(query, referenceDay);
+  const anchors = new Map<string, EpisodeSourceAnchor>();
+  hits.forEach((hit, rank) => {
+    const statement = graph.getNode(hit.statementId) as StatementNode | undefined;
+    if (!statement || statement.type !== "core:statement") return;
+    for (const sourceRef of statement.source_refs ?? []) {
+      if (!graph.getEpisode(sourceRef)) continue;
+      const current = anchors.get(sourceRef) ?? {
+        sourceRef,
+        rank,
+        queryMatches: 0,
+        claims: [],
+      };
+      current.rank = Math.min(current.rank, rank);
+      current.claims.push({
+        terms: evidenceTerms(statementText(graph, statement)),
+        role: statement.saidBy,
+        rank,
+      });
+      anchors.set(sourceRef, current);
+    }
+  });
+
+  // A Claim cannot lead back to a fact that was never extracted. Search only
+  // the caller's Episode scope (or the single-tenant library when unscoped)
+  // as a sparse, cold fallback. Requiring two meaningful query terms keeps
+  // generic questions from turning this into a transcript dump.
+  const episodeCandidates = scopeSet && scopeSet.size > 0
+    ? [...scopeSet]
+        .map((sourceRef) => graph.getEpisode(sourceRef))
+        .filter((episode): episode is EpisodeRecord => Boolean(episode))
+    : graph.getAllEpisodes();
+  const minimumFallbackMatches = queryTerms.size <= 2 ? 1 : 2;
+  for (const episode of episodeCandidates) {
+    let queryMatches = 0;
+    for (const turn of episode.turns) {
+      queryMatches = Math.max(queryMatches, overlapCount(queryTerms, evidenceTerms(turn.content)));
+    }
+    const existing = anchors.get(episode.id);
+    if (existing) {
+      existing.queryMatches = queryMatches;
+    } else if (queryMatches >= minimumFallbackMatches) {
+      anchors.set(episode.id, {
+        sourceRef: episode.id,
+        rank: Number.POSITIVE_INFINITY,
+        queryMatches,
+        claims: [],
+      });
+    }
+  }
+  if (anchors.size === 0) return [];
+
+  let ordered = [...anchors.values()].sort((a, b) => {
+    const aScore = a.queryMatches * 10 + (a.claims.length > 0 ? 2 : 0);
+    const bScore = b.queryMatches * 10 + (b.claims.length > 0 ? 2 : 0);
+    return bScore - aScore || a.rank - b.rank;
+  });
+  if (scopeSet && scopeSet.size > 0) {
+    const inScope = ordered.filter((anchor) => scopeSet.has(anchor.sourceRef));
+    // Match grouped Claim behavior: cross-account evidence is a fallback,
+    // never mixed into an account that already has source evidence.
+    if (inScope.length > 0) ordered = inScope;
+  }
+
+  const perSource: Array<{ evidence: EpisodeEvidence[]; quotaWeight: number }> = [];
+  const maxSources = Math.max(1, Math.min(5, maxLines));
+  for (const anchor of ordered.slice(0, maxSources)) {
+    const episode = graph.getEpisode(anchor.sourceRef);
+    if (!episode) continue;
+    const units = episode.turns
+      .flatMap((turn, turnIndex) =>
+        episodeEvidenceUnits(turn.content, maxChars).map((content, unitIndex) => {
+          const unitTerms = evidenceTerms(content);
+          return {
+            episode,
+            turn: { ...turn, content },
+            turnIndex,
+            unitIndex,
+            score: 0,
+            terms: unitTerms,
+            outOfScope: Boolean(scopeSet?.size && !scopeSet.has(anchor.sourceRef)),
+          } satisfies RankedEpisodeUnit;
+        }),
+      )
+      .filter((candidate) => candidate.turn.content.trim().length > 0);
+    if (units.length === 0) continue;
+    const documentFrequency = new Map<string, number>();
+    for (const unit of units) {
+      for (const term of unit.terms) {
+        documentFrequency.set(term, (documentFrequency.get(term) ?? 0) + 1);
+      }
+    }
+    const termWeights = new Map(
+      [...documentFrequency].map(([term, frequency]) => [
+        term,
+        Math.log(1 + (units.length + 1) / (frequency + 1)),
+      ]),
+    );
+
+    // Do not collapse all anchor Claims into one max score. Each Claim is a
+    // separate route back into the Episode and gets to nominate evidence of
+    // its own. This preserves details adjacent to a concise Claim (breed near
+    // a collar choice, a count inside a long encounter, etc.) instead of
+    // letting the broadest Claim monopolize every local result.
+    const roleCompatibleClaims = preferredRole && anchor.claims.some((claim) => claim.role === preferredRole)
+      ? anchor.claims.filter((claim) => claim.role === preferredRole)
+      : anchor.claims;
+    const bestClaimRank = Math.min(...roleCompatibleClaims.map((claim) => claim.rank));
+    const nearbyClaims = roleCompatibleClaims.filter((claim) => claim.rank <= bestClaimRank + 2);
+    const claimsByQueryFit = nearbyClaims
+      .map((claim) => ({ claim, queryFit: overlapCount(queryTerms, claim.terms) }))
+      .sort((a, b) => b.queryFit - a.queryFit || a.claim.rank - b.claim.rank);
+    const queryMatchingClaims = claimsByQueryFit.filter((entry) => entry.queryFit > 0);
+    const bestQueryFit = queryMatchingClaims[0]?.queryFit ?? 0;
+    const focusedClaims = bestQueryFit > 0
+      ? queryMatchingClaims.filter((entry) => entry.queryFit >= Math.max(1, Math.ceil(bestQueryFit * 0.6)))
+      : claimsByQueryFit;
+    const nominatedClaims = focusedClaims
+      .slice(0, 3)
+      .map((entry) => entry.claim);
+
+    const lanes: RankedEpisodeUnit[][] = nominatedClaims.map((claim) => {
+      const rankWeight = Number.isFinite(claim.rank) ? 1 / Math.sqrt(claim.rank + 1) : 0.25;
+      return units
+        .map((unit) => {
+          const queryFit = localLexicalScore(queryTerms, unit.terms, termWeights);
+          const claimFit = localLexicalScore(claim.terms, unit.terms, termWeights);
+          const numericFit = numericPayloadFit(query, unit.turn.content, queryTerms, unit.terms);
+          const eventFit = temporalTarget
+            ? reportedEventFit(unit.turn.content, unit.turn.role)
+            : 0;
+          const speakerFit = claim.role === unit.turn.role ? 6 : 0;
+          const preferredSpeakerFit = preferredRole === unit.turn.role ? 2 : 0;
+          return {
+            ...unit,
+            // The question chooses among evidence nominated by this Claim;
+            // Claim vocabulary bridges paraphrases; speaker is a tie-breaker.
+            score:
+              queryFit * 8 +
+              numericFit * 30 +
+              eventFit * 60 +
+              claimFit * (3 + rankWeight) +
+              speakerFit +
+              preferredSpeakerFit,
+          };
+        })
+        .filter((candidate) => candidate.score > 0)
+        .sort(
+          (a, b) =>
+            b.score - a.score ||
+            Number(b.turn.role === claim.role) - Number(a.turn.role === claim.role) ||
+            a.turnIndex - b.turnIndex ||
+            a.unitIndex - b.unitIndex,
+        );
+    });
+
+    // If this Episode was found only by the scoped cold fallback, the query
+    // itself is its nomination lane. It is also a safe fallback for a Claim
+    // whose vocabulary has no surviving overlap with any semantic unit.
+    if (lanes.length === 0 || lanes.every((lane) => lane.length === 0)) {
+      lanes.push(
+        units
+          .map((unit) => ({
+            ...unit,
+            score:
+              localLexicalScore(queryTerms, unit.terms, termWeights) * 8 +
+              numericPayloadFit(query, unit.turn.content, queryTerms, unit.terms) * 30 +
+              (temporalTarget ? reportedEventFit(unit.turn.content, unit.turn.role) : 0) * 60 +
+              (preferredRole === unit.turn.role ? 2 : 0),
+          }))
+          .filter((candidate) => candidate.score > 0)
+          .sort(
+            (a, b) =>
+              b.score - a.score ||
+              a.turnIndex - b.turnIndex ||
+              a.unitIndex - b.unitIndex,
+          ),
+      );
+    }
+
+    // Round-robin the Claim lanes as well as the Episode lanes. First-pass
+    // evidence covers distinct semantic anchors; later passes recover nearby
+    // detail without increasing the configured line or character budget.
+    const rankedUnits: EpisodeEvidence[] = [];
+    const emitted = new Set<string>();
+    const cursors = lanes.map(() => 0);
+    while (rankedUnits.length < units.length) {
+      let added = false;
+      for (let laneIndex = 0; laneIndex < lanes.length; laneIndex++) {
+        const lane = lanes[laneIndex]!;
+        let candidate: RankedEpisodeUnit | undefined;
+        while (cursors[laneIndex]! < lane.length) {
+          const next = lane[cursors[laneIndex]!]!;
+          cursors[laneIndex]! += 1;
+          const key = `${next.turnIndex}:${next.unitIndex}`;
+          if (emitted.has(key)) continue;
+          emitted.add(key);
+          candidate = next;
+          break;
+        }
+        if (!candidate) continue;
+        const { terms: _terms, ...evidence } = candidate;
+        rankedUnits.push(evidence);
+        added = true;
+      }
+      if (!added) break;
+    }
+    if (rankedUnits.length > 0) {
+      const episodeTime = new Date(`${episode.created_at.slice(0, 10)}T00:00:00.000Z`).getTime();
+      const distanceDays = temporalTarget && Number.isFinite(episodeTime)
+        ? Math.abs(episodeTime - temporalTarget.timestamp) / 86_400_000
+        : Number.POSITIVE_INFINITY;
+      perSource.push({
+        evidence: rankedUnits,
+        quotaWeight: distanceDays <= (temporalTarget?.toleranceDays ?? -1) ? 2 : 1,
+      });
+    }
+  }
+
+  // Episode quota comes before global competition: every high-ranked source
+  // gets one semantic unit before any source gets a second. This prevents one
+  // verbose assistant response from starving another relevant Episode.
+  const selected: EpisodeEvidence[] = [];
+  const selectedContent = new Set<string>();
+  const maxTotalChars = maxLines * maxChars; // never exceeds the old worst-case budget
+  let selectedChars = 0;
+  const select = (candidate: EpisodeEvidence | undefined): boolean => {
+    if (!candidate || selected.length >= maxLines) return false;
+    const normalized = candidate.turn.content.toLowerCase().replace(/\s+/g, " ");
+    if (selectedContent.has(normalized)) return false;
+    if (selectedChars + candidate.turn.content.length > maxTotalChars) return false;
+    selected.push(candidate);
+    selectedContent.add(normalized);
+    selectedChars += candidate.turn.content.length;
+    return true;
+  };
+
+  if (temporalTarget) {
+    // Every candidate Episode gets one position. The remainder goes first to
+    // Episodes matching the resolved relative date, because an exact temporal
+    // reference is stronger than equal round-robin allocation.
+    for (const source of perSource) select(source.evidence[0]);
+    const prioritized = [
+      ...perSource.filter((source) => source.quotaWeight > 1),
+      ...perSource.filter((source) => source.quotaWeight === 1),
+    ];
+    for (const source of prioritized) {
+      for (const candidate of source.evidence.slice(1)) {
+        if (selected.length >= maxLines) break;
+        select(candidate);
+      }
+      if (selected.length >= maxLines) break;
+    }
+    return selected;
+  }
+
+  for (let round = 0; selected.length < maxLines; round++) {
+    let added = false;
+    for (const source of perSource) {
+      for (let offset = 0; offset < source.quotaWeight; offset++) {
+        const candidate = source.evidence[round * source.quotaWeight + offset];
+        if (select(candidate)) added = true;
+        if (selected.length >= maxLines) break;
+      }
+      if (selected.length >= maxLines) break;
+    }
+    if (!added) break;
+  }
+  return selected;
+}
+
+/** Strictly bounded one-hop expansion through a shared core:about target. */
+function aboutRelatedHits(
+  graph: MemoryGraph,
+  query: string,
+  directHits: readonly RetrievalHit[],
+  config: RetrievalConfig,
+): RetrievalHit[] {
+  // The v7 retrieval ablation found sharply diminishing evidence gains after
+  // two related Claims while context size kept growing. Keep the graph useful
+  // without turning every entity neighborhood into prompt payload.
+  const limit = config.maxGraphExpansionHits ?? 2;
+  if (limit <= 0 || directHits.length === 0) return [];
+  const directIds = new Set(directHits.map((hit) => hit.statementId));
+  const directDims = new Set(directHits.map((hit) => hit.dimensionId));
+  const targets = new Set<string>();
+  for (const hit of directHits.slice(0, 6)) {
+    for (const edge of graph.queryEdges({ type: "core:about", from: hit.statementId })) {
+      targets.add(edge.to);
+    }
+  }
+  if (targets.size === 0) return [];
+
+  const candidateIds = new Set<string>();
+  for (const target of targets) {
+    for (const edge of graph.queryEdges({ type: "core:about", to: target })) {
+      if (!directIds.has(edge.from)) candidateIds.add(edge.from);
+    }
+  }
+  const queryTerms = evidenceTerms(query);
+  const scopeSet = config.scopeSessionIds ? new Set(config.scopeSessionIds) : undefined;
+  const candidates = [...candidateIds]
+    .map((id) => graph.getNode(id))
+    .filter((node): node is StatementNode => Boolean(node && node.type === "core:statement"))
+    .filter((statement) => !directDims.has(statement.dimension_id))
+    .filter((statement) => !config.states || config.states.includes(statement.state))
+    .filter((statement) => {
+      const day = statement.created_at.slice(0, 10).replace(/\//g, "-");
+      return (!config.dateFrom || day >= config.dateFrom) && (!config.dateTo || day <= config.dateTo);
+    })
+    .map((statement) => ({
+      statement,
+      lexical: overlapCount(queryTerms, evidenceTerms(statementText(graph, statement))),
+      inScope: !scopeSet || statement.source_refs.some((ref) => scopeSet.has(ref)),
+    }));
+  const inScope = candidates.filter((candidate) => candidate.inScope);
+  const pool = scopeSet && inScope.length > 0 ? inScope : candidates;
+  return pool
+    .sort((a, b) =>
+      Number(b.inScope) - Number(a.inScope) ||
+      b.lexical - a.lexical ||
+      b.statement.created_at.localeCompare(a.statement.created_at),
+    )
+    .slice(0, limit)
+    .map(({ statement, lexical }) => {
+      const dimension = graph.getNode(statement.dimension_id) as DimensionNode | undefined;
+      return {
+        nodeType: "statement" as const,
+        statementId: statement.id,
+        dimensionId: statement.dimension_id,
+        dimensionKey: dimension?.key ?? "?",
+        value: statement.value,
+        state: statement.state,
+        score: lexical,
+        via: ["graph:about"],
+      };
+    });
 }
 
 /**
@@ -308,9 +955,14 @@ export async function retrievalContext(
   query: string,
   config: RetrievalConfig,
 ): Promise<RetrievalContext> {
+  const semanticHitLimit = config.k ?? 8;
   const hits = await retrieveRelevant(graph, {
     query,
-    k: config.k,
+    // Statements and verbatim evidence are complementary lanes. Search a
+    // wider pool so message chunks cannot consume every semantic-dimension
+    // slot, and exact payloads buried in a long source response remain
+    // available for provenance-aware promotion below.
+    k: Math.max(semanticHitLimit * 4, 32),
     mode: config.mode,
     embedder: config.embedder,
     vectors: config.vectors,
@@ -323,6 +975,47 @@ export async function retrievalContext(
   const dimById = new Map(
     (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).map((d) => [d.id, d]),
   );
+  const directStatementHits = hits
+    .filter((hit) => hit.nodeType !== "message")
+    .slice(0, semanticHitLimit);
+  const statementHits = [
+    ...directStatementHits,
+    ...aboutRelatedHits(graph, query, directStatementHits, config),
+  ];
+  const sourcePriority = new Map<string, number>();
+  directStatementHits.forEach((hit, statementRank) => {
+    for (const sourceRef of graph.getNode(hit.statementId)?.source_refs ?? []) {
+      if (!sourcePriority.has(sourceRef)) sourcePriority.set(sourceRef, statementRank);
+    }
+  });
+  const rankedMessages = hits
+    .filter((hit) => hit.nodeType === "message")
+    .map((hit, rank) => ({ hit, rank }))
+    .map((entry) => ({
+      ...entry,
+      sourceRank: Math.min(
+        ...(graph.getNode(entry.hit.statementId)?.source_refs ?? []).map(
+          (ref) => sourcePriority.get(ref) ?? Number.POSITIVE_INFINITY,
+        ),
+        Number.POSITIVE_INFINITY,
+      ),
+    }));
+  // Take a small bundle from each of the best semantic sources. This follows
+  // provenance from a concise statement back to the exact response that
+  // produced it, while preventing one long conversation from monopolizing
+  // every evidence slot.
+  const messageHits: typeof hits = [];
+  const sourceRanks = [...new Set(rankedMessages.map((entry) => entry.sourceRank))].sort(
+    (a, b) => a - b,
+  );
+  for (const sourceRank of sourceRanks) {
+    const group = rankedMessages
+      .filter((entry) => entry.sourceRank === sourceRank)
+      .sort((a, b) => a.rank - b.rank)
+      .slice(0, 3);
+    messageHits.push(...group.map(({ hit }) => hit));
+    if (messageHits.length >= 6) break;
+  }
 
   // Group statements by dimension once (per-dimension completeness is the
   // point of grouped rendering); chronological inside each group. Scope
@@ -348,12 +1041,53 @@ export async function retrievalContext(
     .getAllConstraints()
     .filter((c) => c.activation_state === "active");
   const lines: string[] = [];
-  const hitDims = [...new Set(hits.map((h) => h.dimensionId))];
+  const maxEvidenceLines = Math.min(config.maxEpisodeEvidenceLines ?? 6, maxLines);
+  const coldEvidence = coldEpisodeEvidence(
+    graph,
+    query,
+    directStatementHits,
+    scopeSet,
+    maxEvidenceLines,
+    config.maxEpisodeExcerptChars ?? 1_600,
+    config.dateTo,
+  );
+  const evidenceContent = new Set<string>();
+  for (const evidence of coldEvidence) {
+    if (lines.length >= maxLines || lines.length >= maxEvidenceLines) break;
+    const tag = evidence.outOfScope ? " (non-user-account)" : "";
+    evidenceContent.add(evidence.turn.content);
+    lines.push(
+      `conversationEvidence (verbatim ${evidence.turn.role} @${evidence.episode.created_at.slice(0, 10)}, source ${evidence.episode.id}, turn ${evidence.turnIndex})${tag}: ${JSON.stringify(evidence.turn.content)}`,
+    );
+  }
+  // Verbatim evidence is rendered directly, not grouped into mutable fact
+  // dimensions. Cap it so exact payloads are available without letting long
+  // source messages crowd all semantic memories out of the context window.
+  for (const hit of messageHits.slice(0, Math.max(0, maxEvidenceLines - lines.length))) {
+    if (lines.length >= maxLines || lines.length >= maxEvidenceLines) break;
+    const node = graph.getNode(hit.statementId);
+    if (!node) continue;
+    const value = String(hit.value ?? "");
+    if (evidenceContent.has(value)) continue;
+    const fallbackOut =
+      scopeSet !== undefined &&
+      scopeSet.size > 0 &&
+      !(node.source_refs ?? []).some((sourceRef) => scopeSet.has(sourceRef));
+    const tag = fallbackOut ? " (non-user-account)" : "";
+    lines.push(
+      `conversationEvidence (verbatim ${hit.role ?? "user"} @${node.created_at.slice(0, 10)})${tag}: ${JSON.stringify(hit.value)}`,
+    );
+  }
+
+  const hitDims = [...new Set(statementHits.map((h) => h.dimensionId))];
   for (const dimId of hitDims) {
     const allMembers = membersByDim.get(dimId) ?? [];
     const scoped = scopeSet ? allMembers.filter(inScopeOf) : [];
     const members = scoped.length > 0 ? scoped : allMembers;
-    const key = dimById.get(dimId)?.key ?? hits.find((h) => h.dimensionId === dimId)?.dimensionKey ?? "?";
+    const dimension = dimById.get(dimId);
+    const key = dimension
+      ? slotLabel(graph, dimension)
+      : statementHits.find((h) => h.dimensionId === dimId)?.dimensionKey ?? "?";
     // Double-ended selection: oldest half + newest half. Oldest-only rendering
     // systematically hid the LATEST value of fast-growing dimensions (the
     // exact entries knowledge-update questions need).
@@ -364,10 +1098,12 @@ export async function retrievalContext(
     const tail = overCap ? members.slice(members.length - tailN) : [];
     const gapCount = overCap ? members.length - headN - tailN : 0;
     const shownLines = head.length + tail.length + (gapCount > 0 ? 1 : 0);
+    const fallbackOut = scopeSet !== undefined && scoped.length === 0 && scopeSet.size > 0;
     if (lines.length + shownLines + 1 > maxLines) {
       // Over budget: degrade to a one-line summary — the COUNT survives even
       // when the entries do not (counting questions read the header).
-      lines.push(`${key}: ${members.length} entries (omitted — context budget)`);
+      const tag = fallbackOut ? " (non-user-account)" : "";
+      lines.push(`${key}: ${members.length} entries (omitted — context budget)${tag}`);
       continue;
     }
     lines.push(`${key} — ${members.length} ${members.length === 1 ? "entry" : "entries"}:`);
@@ -376,7 +1112,6 @@ export async function retrievalContext(
     // tagged so the answering layer can keep them out of aggregates. Mixed
     // dimensions never reach here — when scoped members exist, only they are
     // rendered (untagged: they ARE the account).
-    const fallbackOut = scopeSet !== undefined && scoped.length === 0 && scopeSet.size > 0;
     const renderMember = (m: StatementNode) => {
       const speaker = m.saidBy === "assistant" ? " (assistant)" : "";
       const tag = fallbackOut ? " (non-user-account)" : "";
@@ -399,7 +1134,7 @@ export async function retrievalContext(
   const units = borrowUnits(graph);
   const seen = new Set<string>();
   const similarDimensions: KnownDimension[] = [];
-  for (const hit of hits) {
+  for (const hit of directStatementHits) {
     if (seen.has(hit.dimensionId)) continue;
     seen.add(hit.dimensionId);
     const dim = dimById.get(hit.dimensionId);

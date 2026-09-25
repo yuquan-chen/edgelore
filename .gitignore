@@ -11,3 +11,17 @@ benchmark/longmemeval/data/mem0-qdrant/
 # 本地工作底稿，不进仓库
 HANDOFF*.md
 docs/notes/archive/HANDOFF*.md
+
+# Local research notebooks and superseded design/benchmark records.
+# Keep them on the workstation, but do not ship them as maintained docs.
+docs/competitor-analysis.md
+docs/external-review-briefing.md
+docs/shared-memory-schema-draft.md
+docs/notes/archive/
+docs/notes/autopsy/
+docs/notes/research/
+docs/notes/failure-attribution-v7-episode-graph-read-20260923.md
+docs/notes/graph-ingestion-smoke.md
+docs/notes/lifecycle-design-draft.md
+docs/notes/memory-type-taxonomy.md
+docs/notes/optimization-roadmap.md

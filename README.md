@@ -21,19 +21,26 @@ The core design separates *computing* a value, *checking* a constraint, and
 
 ## Status
 
-**M0–M4 are implemented and tested (178 tests, all green)** — plus the Agent
+**M0–M4 are implemented and tested (280 tests, all green)** — plus the Agent
 Memory layer (gate → extract → capture), hybrid retrieval, conflict
 adjudication, and an MCP server.
 
-**Benchmark**: LongMemEval-ORACLE (fixed 100-question subset,
-deepseek-v4-flash as both extractor and judge) — **71.0%**, up from 38.0%
-across three forensics-verified iterations. Full state:
-[`HANDOFF-v2.md`](HANDOFF-v2.md) · forensics & roadmap:
-[`docs/notes/`](docs/notes/).
+**Best recorded benchmark**: LongMemEval-ORACLE v7 — **476/500 (95.2%)**.
+The run uses a lossless Episode source log, Claim/Slot semantic indexing,
+bounded graph expansion, and evidence recovery under a fixed context budget.
+Its remaining failures are attributed in
+[`docs/notes/failure-attribution-v7-episode-recovery-500-20260925.md`](docs/notes/failure-attribution-v7-episode-recovery-500-20260925.md).
 
 See [`docs/`](docs/) for the specs:
 
 - [`docs/shared-memory-m0-spec.md`](docs/shared-memory-m0-spec.md) — data model & state machine (frozen, M0)
+- [`docs/shared-memory-m1-spec.md`](docs/shared-memory-m1-spec.md) — constraint expression engine
+- [`docs/shared-memory-m2-spec.md`](docs/shared-memory-m2-spec.md) — SQLite persistence and CLI
+- [`docs/shared-memory-m3-spec.md`](docs/shared-memory-m3-spec.md) — capture primitive
+- [`docs/agent-memory-design.md`](docs/agent-memory-design.md) — Agent memory pipeline
+- [`docs/notes/retrieval.md`](docs/notes/retrieval.md) — retrieval mechanics
+- [`docs/notes/conflicts.md`](docs/notes/conflicts.md) — conflict lifecycle and adjudication
+- [`docs/notes/host-runtime-collaboration.md`](docs/notes/host-runtime-collaboration.md) — host Agent integration boundary
 - [`schema.json`](schema.json) — JSON Schema contract (kept in sync with `src/model/types.ts`)
 
 ### Implemented
@@ -59,14 +66,14 @@ See [`docs/`](docs/) for the specs:
 
 ### Up next
 
-- Extraction preservation (quantities/time anchors), `event_time` field,
-  dimension alias merge — see
-  [`docs/notes/optimization-roadmap.md`](docs/notes/optimization-roadmap.md)
-- Full 500-question benchmark run
+- Expose the validated retrieval path through a stable `recall` / Memory
+  Capsule boundary for host Agents.
+- Continue bounded, evidence-backed improvements to ingestion, recall,
+  conflict handling, and storage cost without benchmark-specific logic.
 
 ### Tests
 
-- 178 unit + contract tests (`npm test`) — model, state machines, SQLite
+- 280 unit + contract tests (`npm test`) — model, state machines, SQLite
   parity, pipeline, retrieval, ask layer, conflicts, MCP, config hub.
 
 ## Develop

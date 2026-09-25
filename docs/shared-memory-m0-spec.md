@@ -1,6 +1,6 @@
 # M0 · 数据模型与状态机（mini-spec v0.1）
 
-> 配套：《多 Agent 共享记忆：模型与关键决策 v0.1》+ `shared-memory-schema-draft.md`
+> 配套：`schema.json`（可执行契约）+ `src/model/types.ts`（TypeScript 类型）
 > 范围：只定 M0（数据模型与状态机）。约束求值（M1）、检查三分离（M2）等不在本文件落地。
 > 状态：可评审草稿。本文件是 M0 小循环的第①步（mini-spec），跑完 M1 后再回头汇成总规格。
 

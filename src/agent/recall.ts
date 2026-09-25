@@ -10,7 +10,7 @@ import type {
   RetrievedEvidence,
   RetrievedSlot,
 } from "./runtime.js";
-import { retrievalContext } from "./runtime.js";
+import { retrievalContext, retrievalLimitForQuery } from "./runtime.js";
 import type { Scope } from "../model/types.js";
 
 /** Source identity boundary currently supported by the retrieval runtime. */
@@ -49,13 +49,15 @@ export async function recall(
 ): Promise<MemoryCapsule> {
   const sessionIds = options.scope?.sessionIds ?? options.retrieval?.scopeSessionIds;
   const { sessionIds: _sessionIds, ...identityScope } = options.scope ?? {};
-  const hasIdentityScope = options.scope !== undefined &&
+  const hasIdentityScope =
+    options.scope !== undefined &&
     (Object.keys(identityScope).length === 0 ||
       identityScope.owner_id !== undefined ||
       identityScope.project_id !== undefined ||
       identityScope.phase_id !== undefined);
   const result = await retrievalContext(graph, query, {
     ...options.retrieval,
+    k: retrievalLimitForQuery(query, options.retrieval?.k ?? 8),
     mode: options.retrieval?.mode ?? "hybrid",
     ...(hasIdentityScope ? { scope: identityScope } : {}),
     ...(sessionIds ? { scopeSessionIds: sessionIds } : {}),

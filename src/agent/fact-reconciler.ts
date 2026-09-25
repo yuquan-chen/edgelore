@@ -51,6 +51,14 @@ export interface ApplyFactRelationOptions {
   note?: string;
 }
 
+export interface ApplyAgentFactRelationOptions {
+  /** Audit principal for the autonomous decision. */
+  resolvedBy: string;
+  /** Minimum model confidence after provenance checks. Defaults to 0.85. */
+  minConfidence?: number;
+  note?: string;
+}
+
 export interface ApplyFactRelationResult {
   relation: FactRelationKind;
   edgeId?: string;
@@ -162,6 +170,73 @@ export function applyFactRelationProposal(
     );
   }
   const createdBy = options.approvedBy ?? "agent:edgelore:reconciler";
+  return materializeFactRelationProposal(graph, proposal, subject, object, createdBy, options.note);
+}
+
+/**
+ * Apply a high-confidence Agent supersession through a narrow provenance gate.
+ *
+ * This is deliberately separate from human approval. The Agent may only make
+ * the already-newer tentative value current when both Statements belong to
+ * the same single-value Slot and came through the same authority and speaker
+ * channel. Anything less certain stays in the human conflict docket.
+ */
+export function applyAgentFactRelationProposal(
+  graph: GraphStore,
+  proposal: FactRelationProposal,
+  options: ApplyAgentFactRelationOptions,
+): ApplyFactRelationResult {
+  const subject = requireStatement(graph, proposal.subjectId);
+  const object = requireStatement(graph, proposal.objectId);
+  validateApplicableProposal(graph, proposal, subject, object);
+  if (!options.resolvedBy.startsWith("agent:")) {
+    throw new AgentError("Agent resolution requires resolvedBy agent:<name>:<id>");
+  }
+  const minConfidence = options.minConfidence ?? 0.85;
+  if (!Number.isFinite(minConfidence) || minConfidence < 0 || minConfidence > 1) {
+    throw new AgentError("Agent resolution minConfidence must be between 0 and 1");
+  }
+  if (proposal.basis !== "agent" || proposal.relation !== "supersedes") {
+    throw new AgentError("Agent resolution may only apply Agent supersedes proposals");
+  }
+  if (proposal.confidence < minConfidence) {
+    throw new AgentError(
+      `Agent supersession confidence ${proposal.confidence} is below ${minConfidence}`,
+    );
+  }
+  const dimension = requireDimension(graph, subject.dimension_id);
+  if (
+    subject.dimension_id !== object.dimension_id ||
+    dimension.cardinality !== "single" ||
+    subject.state !== "tentative" ||
+    object.state !== "accepted" ||
+    subject.created_by !== object.created_by ||
+    subject.saidBy === undefined ||
+    subject.saidBy !== object.saidBy ||
+    subject.created_at <= object.created_at
+  ) {
+    throw new AgentError(
+      "Agent supersession requires a newer tentative Claim in the same single Slot, from the same authority and speaker channel",
+    );
+  }
+  return materializeFactRelationProposal(
+    graph,
+    proposal,
+    subject,
+    object,
+    options.resolvedBy,
+    options.note,
+  );
+}
+
+function materializeFactRelationProposal(
+  graph: GraphStore,
+  proposal: FactRelationProposal,
+  subject: StatementNode,
+  object: StatementNode,
+  createdBy: string,
+  note?: string,
+): ApplyFactRelationResult {
   return graph.transaction(() => {
     const edgeType = relationEdgeType(proposal.relation);
     let edge = findRelation(graph, edgeType, subject.id, object.id);
@@ -178,7 +253,7 @@ export function applyFactRelationProposal(
           basis: proposal.basis,
           confidence: proposal.confidence,
           reason: proposal.reason,
-          note: options.note ?? "",
+          note: note ?? "",
         },
       });
     }
@@ -354,20 +429,29 @@ function buildFactReconciliationPrompt(
     preFlaggedContradiction = false,
   ) => ({
     statementId: statement.id,
+    dimensionId: dimension.id,
     dimensionKey: dimension.key,
+    cardinality: dimension.cardinality,
     value: statement.value,
     state: statement.state,
     saidBy: statement.saidBy,
     createdAt: statement.created_at,
+    createdBy: statement.created_by,
+    sourceRefs: statement.source_refs,
+    scope: statement.scope,
     sharedAbout,
     preFlaggedContradiction,
   });
   return [
     "You are a Fact Reconciler. Compare one new Statement with existing live Statements.",
     "Every relation is directional: New Statement -> Candidate. Never reverse that direction.",
+    "Judge memory truth relative to provenance, not from your own world knowledge. createdBy identifies the recording authority, saidBy identifies the speaker, sourceRefs identify source records, createdAt establishes order, and scope establishes the memory boundary.",
     "Classify meaning, not topic. Return exactly one relation per candidate:",
-    "duplicate = materially the same core claim, including when the Candidate contains details omitted by the New Statement; refines = the New Statement adds compatible detail to the Candidate; supersedes = the New Statement explicitly updates or corrects the Candidate; contradicts = they cannot both be true in the same context; independent = related topic but separate facts.",
-    "preFlaggedContradiction only means storage saw different values in a single-cardinality Dimension. It may be a true contradiction or an explicit temporal update; decide from the claim text.",
+    "duplicate = materially the same core claim, including when the Candidate contains details omitted by the New Statement; refines = the New Statement adds compatible detail to the Candidate; supersedes = provenance establishes that the New Statement is a later replacement for the Candidate; contradicts = they cannot both be true but provenance does not establish which one replaces the other; independent = related topic but separate facts.",
+    "For competing values with the exact same dimensionId in a single-cardinality Dimension and scope, classify supersedes when the New Statement is later and comes through the same recording authority and speaker trust channel. This rule is decisive: an explicit correction phrase and matching sourceRefs are NOT required. Different sourceRefs are normal episode identities, not different authorities.",
+    "For a Candidate, sharedAbout lists graph targets shared with the New Statement. A shared person, work, organization, place, or event supports that the two claims concern the same subject; different value entities do not make the subject different.",
+    "Use contradicts when authority, speaker, time, subject, or context is incompatible or insufficient to establish replacement. Never prefer a familiar real-world fact over a later claim merely because you believe it is true.",
+    "preFlaggedContradiction only means storage saw different values in a single-cardinality Dimension. Use the supplied provenance to decide whether it is a replacement or an unresolved contradiction.",
     "Do not decide which contradictory fact wins. Do not output provenance, state changes, or graph ids other than the supplied statementId.",
     `New Statement:\n${JSON.stringify(row(subject, subjectDimension, []))}`,
     `Candidates:\n${JSON.stringify(candidates.map((candidate) => row(candidate.statement, candidate.dimension, candidate.sharedAbout, candidate.preFlaggedContradiction)))}`,
@@ -392,14 +476,14 @@ function normalizeAgentDecisions(
   const proposals: FactRelationProposal[] = [];
   for (const rawDecision of decisions) {
     if (typeof rawDecision !== "object" || rawDecision === null || Array.isArray(rawDecision)) {
-      throw new AgentError("fact reconciler decision must be an object");
+      continue;
     }
     const decision = rawDecision as Record<string, unknown>;
     if (typeof decision.statementId !== "string" || !candidateIds.has(decision.statementId)) {
-      throw new AgentError(`fact reconciler decision has unknown statementId: ${String(decision.statementId)}`);
+      continue;
     }
     if (seen.has(decision.statementId)) {
-      throw new AgentError(`fact reconciler repeats statementId: ${decision.statementId}`);
+      continue;
     }
     if (!isFactRelationKind(decision.relation)) {
       throw new AgentError(`fact reconciler has invalid relation: ${String(decision.relation)}`);

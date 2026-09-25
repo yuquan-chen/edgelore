@@ -10,11 +10,22 @@ import assert from "node:assert/strict";
 import { MemoryGraph } from "../../src/model/store.js";
 import { MockDriver } from "../../src/agent/llm-driver.js";
 import { capture } from "../../src/agent/capture.js";
-import { archiveConversationEpisode, archiveConversationEvidence } from "../../src/agent/evidence.js";
+import {
+  archiveConversationEpisode,
+  archiveConversationEvidence,
+} from "../../src/agent/evidence.js";
 import { AgentError } from "../../src/agent/errors.js";
 import { MockEmbedder, type EmbeddingDriver } from "../../src/agent/embedding-driver.js";
 import { InMemoryVectorStore } from "../../src/agent/retrieval.js";
-import { contextMemoriesOf, contextMemoriesViaRetrieval, knownDimensionsOf, processTurn, relevantDimensionsOf } from "../../src/agent/runtime.js";
+import {
+  contextMemoriesOf,
+  contextMemoriesViaRetrieval,
+  knownDimensionsOf,
+  processTurn,
+  relevantDimensionsOf,
+  retrievalContext,
+  retrievalLimitForQuery,
+} from "../../src/agent/runtime.js";
 
 const ctx = { created_by: "human:charles", source_refs: ["t:1"] };
 
@@ -41,7 +52,10 @@ test("runtime: full turn captures into the graph with runtime-injected provenanc
   assert.equal(outcome.captures.length, 1);
   assert.equal(outcome.captures[0]?.created, true);
   assert.equal(outcome.captures[0]?.conflict, false);
-  const stmts = graph.queryNodes({ type: "core:statement" }) as Array<{ value: unknown; created_by: string }>;
+  const stmts = graph.queryNodes({ type: "core:statement" }) as Array<{
+    value: unknown;
+    created_by: string;
+  }>;
   assert.equal(stmts.length, 1);
   assert.equal(stmts[0]?.value, 5000);
   assert.equal(stmts[0]?.created_by, "human:charles"); // from ctx, never the LLM
@@ -102,13 +116,7 @@ test("runtime: failed enrichment falls back without losing extracted facts", asy
     JSON.stringify({ contents: [{ dimensionKey: "NEW:budget", value: 5000 }] }),
     JSON.stringify({ factMappings: [], entities: [], relations: [] }),
   ]);
-  const outcome = await processTurn(
-    graph,
-    "预算 5000",
-    driver,
-    ctx,
-    { graphEnrichment: {} },
-  );
+  const outcome = await processTurn(graph, "预算 5000", driver, ctx, { graphEnrichment: {} });
   assert.equal(outcome.graph?.enriched, false);
   assert.match(outcome.graph?.error ?? "", /omitted factRef/);
   assert.equal(outcome.captures.length, 1);
@@ -120,7 +128,9 @@ test("runtime: conflicting turn surfaces conflict via capture", async () => {
   const driver = new MockDriver([
     // turn 1: budget 5000
     JSON.stringify({ store: true, candidates: ["预算 5000"] }),
-    JSON.stringify({ contents: [{ dimensionKey: "NEW:budget", value: 5000, cardinality: "single" }] }),
+    JSON.stringify({
+      contents: [{ dimensionKey: "NEW:budget", value: 5000, cardinality: "single" }],
+    }),
     // turn 2: budget 8000 -> clash
     JSON.stringify({ store: true, candidates: ["预算 8000"] }),
     JSON.stringify({ contents: [{ dimensionKey: "NEW:budget", value: 8000 }] }),
@@ -131,6 +141,68 @@ test("runtime: conflicting turn surfaces conflict via capture", async () => {
   assert.equal(second.captures[0]?.conflict, true);
   const dim = graph.queryNodes({ type: "core:dimension" })[0] as { state: string };
   assert.equal(dim.state, "conflict");
+});
+
+test("runtime: conflict resolution is fully awaited before the turn completes", async () => {
+  const graph = new MemoryGraph();
+  const old = capture(
+    graph,
+    { dimensionKey: "budget", value: 5000, cardinality: "single", saidBy: "user" },
+    {
+      created_by: "human:charles",
+      source_refs: ["turn:old"],
+      createdAt: "2024-01-01T00:00:00.000Z",
+    },
+  );
+  const driver = new MockDriver([
+    JSON.stringify({ store: true, candidates: ["预算改成 8000"] }),
+    JSON.stringify({
+      contents: [{ dimensionKey: "budget", value: 8000, saidBy: "user" }],
+    }),
+  ]);
+  const resolver = new MockDriver([
+    JSON.stringify({
+      decisions: [
+        {
+          statementId: old.statementId,
+          relation: "supersedes",
+          confidence: 0.95,
+          reason: "later value from the same provenance channel",
+        },
+      ],
+    }),
+  ]);
+
+  const outcome = await processTurn(
+    graph,
+    "预算改成 8000",
+    driver,
+    {
+      created_by: "human:charles",
+      source_refs: ["turn:new"],
+      createdAt: "2024-02-01T00:00:00.000Z",
+    },
+    {
+      conflictResolution: {
+        driver: resolver,
+        resolvedBy: "agent:edgelore:reconciler",
+      },
+    },
+  );
+
+  assert.deepEqual(
+    {
+      attempted: outcome.resolution?.attempted,
+      resolved: outcome.resolution?.resolved,
+      escalated: outcome.resolution?.escalated,
+    },
+    { attempted: 1, resolved: 1, escalated: 0 },
+  );
+  assert.equal(resolver.remaining, 0);
+  assert.equal(graph.getNode(old.statementId as string)?.state, "superseded");
+  assert.equal(graph.getNode(old.dimensionId)?.state, "accepted");
+  assert.equal(outcome.captures[0]?.statementId === null, false);
+  assert.equal(graph.getNode(outcome.captures[0]?.statementId as string)?.state, "accepted");
 });
 
 test("runtime: identical turn deduplicates through capture", async () => {
@@ -183,6 +255,13 @@ test("runtime: contextMemoriesOf formats key=value[state] lines and caps by limi
   assert.match(capped[0] ?? "", /author/); // newest kept
 });
 
+test("runtime: aggregate queries widen retrieval locally without widening point lookups", () => {
+  assert.equal(retrievalLimitForQuery("How much did the helmet cost?", 8), 8);
+  assert.equal(retrievalLimitForQuery("What is the total spent on bike expenses?", 8), 30);
+  assert.equal(retrievalLimitForQuery("我一共参加过多少次旅行？", 8), 30);
+  assert.equal(retrievalLimitForQuery("List every project decision", 40), 40);
+});
+
 test("runtime: retrieval config embeds new statements after capture", async () => {
   const graph = new MemoryGraph();
   const vectors = new InMemoryVectorStore();
@@ -229,10 +308,18 @@ test("runtime: retrieval-based context carries conflict posture and constraint v
   const embedder = new MockEmbedder(8);
   const retrieval = { embedder, vectors };
   // Turn 1: budget 5000 (indexed).
-  const first = await processTurn(graph, "预算 5000", new MockDriver([
-    JSON.stringify({ store: true, candidates: ["预算 5000"] }),
-    JSON.stringify({ contents: [{ dimensionKey: "NEW:budget", value: 5000, cardinality: "single" }] }),
-  ]), ctx, { retrieval });
+  const first = await processTurn(
+    graph,
+    "预算 5000",
+    new MockDriver([
+      JSON.stringify({ store: true, candidates: ["预算 5000"] }),
+      JSON.stringify({
+        contents: [{ dimensionKey: "NEW:budget", value: 5000, cardinality: "single" }],
+      }),
+    ]),
+    ctx,
+    { retrieval },
+  );
   assert.equal(first.indexed, 1);
   // Active constraint on the budget dimension.
   const constraint = graph.addConstraint({
@@ -252,6 +339,42 @@ test("runtime: retrieval-based context carries conflict posture and constraint v
   assert.match(lines[2] ?? "", /rule ".+" -> (satisfied|violated|indeterminate|error)/);
 });
 
+test("runtime: unresolved conflict renders the latest user Claim before its incumbent", async () => {
+  const graph = new MemoryGraph();
+  const first = capture(
+    graph,
+    {
+      dimensionKey: "musicGenre",
+      value: "jazz",
+      cardinality: "single",
+      saidBy: "user",
+    },
+    { ...ctx, createdAt: "2024-01-29T00:00:00.000Z" },
+  );
+  const second = capture(
+    graph,
+    {
+      dimensionKey: "musicGenre",
+      value: "post-punk",
+      cardinality: "single",
+      saidBy: "user",
+    },
+    { ...ctx, createdAt: "2024-01-30T00:00:00.000Z" },
+  );
+  const result = await retrievalContext(graph, "Michael Mantler music genre", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+  });
+
+  const entries = result.lines.filter((line) => line.startsWith("  = "));
+  assert.match(entries[0] ?? "", /post-punk.*latest user statement; current for recall/);
+  assert.match(entries[1] ?? "", /jazz.*conflicting incumbent; unresolved history/);
+  assert.equal(result.slots[0]?.latestUserClaimId, second.statementId);
+  assert.equal(result.slots[0]?.visibleClaimIds[0], second.statementId);
+  assert.notEqual(first.statementId, second.statementId);
+});
+
 test("runtime: deduplicated capture embeds nothing new", async () => {
   const graph = new MemoryGraph();
   const vectors = new InMemoryVectorStore();
@@ -261,7 +384,9 @@ test("runtime: deduplicated capture embeds nothing new", async () => {
     JSON.stringify({ contents: [{ dimensionKey: "NEW:author", value: "charles" }] }),
   ];
   await processTurn(graph, "作者是 charles", new MockDriver(replies), ctx, { retrieval });
-  const second = await processTurn(graph, "作者是 charles", new MockDriver(replies), ctx, { retrieval });
+  const second = await processTurn(graph, "作者是 charles", new MockDriver(replies), ctx, {
+    retrieval,
+  });
   assert.equal(second.captures[0]?.deduplicated, true);
   assert.equal(second.indexed, 0); // nothing new to embed
   assert.equal(vectors.all().length, 2); // statement + dimension from first turn
@@ -306,6 +431,7 @@ test("runtime: over-budget dimension degrades to a count-bearing one-liner", asy
   assert.equal(headers.length + degraded.length, 2);
   assert.equal(degraded.length, 1);
   assert.match(degraded[0] ?? "", /: \d+ entries? \(omitted/); // the count survives
+  assert.ok(lines.length <= 4, "the hard MemoryCapsule line budget must remain hard");
 });
 
 test("runtime: assistant-authored statements are labelled in grouped context", async () => {
@@ -331,11 +457,15 @@ test("runtime: verbatim evidence is rendered directly with speaker and date", as
     { created_by: "human:charles", source_ref: "session:temple", createdAt: "2023-04-18" },
   );
 
-  const lines = await contextMemoriesViaRetrieval(graph, "How many mummies were in the Lost Temple?", {
-    embedder: new MockEmbedder(8),
-    vectors: new InMemoryVectorStore(),
-    mode: "lexical",
-  });
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "How many mummies were in the Lost Temple?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+    },
+  );
 
   assert.equal(lines.length, 1);
   assert.match(lines[0] ?? "", /conversationEvidence \(verbatim assistant @2023-04-18\)/);
@@ -350,7 +480,8 @@ test("runtime: a Claim hit recovers focused verbatim evidence from its cold Epis
       { role: "user", content: "Which database would fit the analytics service?" },
       {
         role: "assistant",
-        content: "I recommend PostgreSQL 16 because the workload needs JSONB and reliable transactions.",
+        content:
+          "I recommend PostgreSQL 16 because the workload needs JSONB and reliable transactions.",
       },
       { role: "user", content: "Thanks, I will compare hosting prices later." },
     ],
@@ -366,25 +497,36 @@ test("runtime: a Claim hit recovers focused verbatim evidence from its cold Epis
     { ...ctx, source_refs: ["session:database"] },
   );
 
-  const lines = await contextMemoriesViaRetrieval(graph, "Which database did the assistant recommend?", {
-    embedder: new MockEmbedder(8),
-    vectors: new InMemoryVectorStore(),
-    mode: "lexical",
-  });
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "Which database did the assistant recommend?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+    },
+  );
   const evidence = lines.filter((line) => line.startsWith("conversationEvidence"));
   assert.ok(evidence.some((line) => line.includes("PostgreSQL 16")));
   assert.ok(evidence.some((line) => line.includes("source session:database")));
-  assert.equal(graph.queryNodes({ type: "core:message" }).length, 0, "cold recovery must not create Message nodes");
+  assert.equal(
+    graph.queryNodes({ type: "core:message" }).length,
+    0,
+    "cold recovery must not create Message nodes",
+  );
 });
 
 test("runtime: cold Episode recovery respects account scope and does not mix fallback sources", async () => {
   const graph = new MemoryGraph();
-  for (const [source, answer] of [["s:alice", "Alice chose PostgreSQL"], ["s:bob", "Bob chose MySQL"]] as const) {
-    archiveConversationEpisode(
-      graph,
-      [{ role: "assistant", content: answer }],
-      { created_by: "human:charles", source_ref: source, createdAt: "2023-06-12" },
-    );
+  for (const [source, answer] of [
+    ["s:alice", "Alice chose PostgreSQL"],
+    ["s:bob", "Bob chose MySQL"],
+  ] as const) {
+    archiveConversationEpisode(graph, [{ role: "assistant", content: answer }], {
+      created_by: "human:charles",
+      source_ref: source,
+      createdAt: "2023-06-12",
+    });
     capture(
       graph,
       { dimensionKey: "databaseChoice", value: answer, saidBy: "assistant" },
@@ -406,7 +548,12 @@ test("runtime: scoped cold lexical fallback recovers a fact missing from Claims"
   const graph = new MemoryGraph();
   archiveConversationEpisode(
     graph,
-    [{ role: "assistant", content: "The song Evolution best demonstrates the band's growth on the Fifth Album." }],
+    [
+      {
+        role: "assistant",
+        content: "The song Evolution best demonstrates the band's growth on the Fifth Album.",
+      },
+    ],
     { created_by: "human:charles", source_ref: "s:fifth-album", createdAt: "2023-05-20" },
   );
   // The extractor retained an unrelated memory but completely missed the
@@ -512,18 +659,21 @@ test("runtime: long Episode evidence uses complete semantic units under the fixe
   const longAnswer = [
     "# The Lost Temple of the Djinn",
     "The party crosses the desert and enters the buried temple.",
-    ...Array.from({ length: 20 }, (_, index) => `Background paragraph ${index + 1} describes an ancient chamber and its traps.`),
+    ...Array.from(
+      { length: 20 },
+      (_, index) => `Background paragraph ${index + 1} describes an ancient chamber and its traps.`,
+    ),
     "* Mummies (4):",
     "  + Armor Class: 11",
     "  + Hit Points: 45",
     "* Construct Guardians (2):",
     "  + Armor Class: 17",
   ].join("\n\n");
-  archiveConversationEpisode(
-    graph,
-    [{ role: "assistant", content: longAnswer }],
-    { created_by: "human:charles", source_ref: "s:temple", createdAt: "2023-05-21" },
-  );
+  archiveConversationEpisode(graph, [{ role: "assistant", content: longAnswer }], {
+    created_by: "human:charles",
+    source_ref: "s:temple",
+    createdAt: "2023-05-21",
+  });
   capture(
     graph,
     {
@@ -549,15 +699,54 @@ test("runtime: long Episode evidence uses complete semantic units under the fixe
   const evidence = lines.filter((line) => line.startsWith("conversationEvidence"));
   assert.ok(evidence.length <= 6);
   assert.ok(evidence.some((line) => line.includes("Mummies (4)")));
-  assert.ok(evidence.every((line) => !line.includes("…")), "must not use arbitrary character slices");
-  assert.ok(evidence.every((line) => line.length <= 420), "metadata plus each semantic unit stays bounded");
+  assert.ok(
+    evidence.every((line) => !line.includes("…")),
+    "must not use arbitrary character slices",
+  );
+  assert.ok(
+    evidence.every((line) => line.length <= 420),
+    "metadata plus each semantic unit stays bounded",
+  );
+});
+
+test("runtime: monetary questions prefer prices over nearby non-currency numbers", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [
+      { role: "user", content: "I have ridden my bike for 347 miles this year." },
+      { role: "user", content: "I bought my Bell Zephyr bike helmet for $120 downtown." },
+    ],
+    { created_by: "human:charles", source_ref: "s:bike", createdAt: "2023-05-05" },
+  );
+  capture(
+    graph,
+    { dimensionKey: "bikeHistory", value: "Tracks bike mileage and equipment expenses" },
+    { ...ctx, source_refs: ["s:bike"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "How much total money have I spent on bike-related expenses?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:bike"],
+      maxEpisodeEvidenceLines: 1,
+    },
+  );
+  const evidence = lines.find((line) => line.startsWith("conversationEvidence"));
+  assert.match(evidence ?? "", /\$120/);
+  assert.ok(!evidence?.includes("347 miles"));
 });
 
 test("runtime: ordinal questions recover the matching item from an assistant list", async () => {
   const graph = new MemoryGraph();
   const list = Array.from(
     { length: 40 },
-    (_, index) => `${index + 1}. ${index === 26 ? "Sound effects (ambient, diegetic, non-diegetic)" : `Parameter ${index + 1}`}`,
+    (_, index) =>
+      `${index + 1}. ${index === 26 ? "Sound effects (ambient, diegetic, non-diegetic)" : `Parameter ${index + 1}`}`,
   ).join("\n");
   archiveConversationEpisode(
     graph,
@@ -598,11 +787,13 @@ test("runtime: exact assistant payload outranks the user request that produced i
     [
       {
         role: "user",
-        content: "Review the submission To Adapt or Not to Adapt? Real-Time Adaptation for Semantic Segmentation.",
+        content:
+          "Review the submission To Adapt or Not to Adapt? Real-Time Adaptation for Semantic Segmentation.",
       },
       {
         role: "assistant",
-        content: "The experimental results report an average improvement in framerate of approximately 20% when using the Hardware-Aware Modular Training (HAMT) agent.",
+        content:
+          "The experimental results report an average improvement in framerate of approximately 20% when using the Hardware-Aware Modular Training (HAMT) agent.",
       },
     ],
     { created_by: "human:charles", source_ref: "s:hamt", createdAt: "2023-05-25" },
@@ -646,9 +837,13 @@ test("runtime: relative time prioritizes reported events in the matching Episode
     [
       {
         role: "user",
-        content: "I'm looking for advice about tomato plants. By the way, I just planted 12 new tomato saplings today and I'm excited to see them grow.",
+        content:
+          "I'm looking for advice about tomato plants. By the way, I just planted 12 new tomato saplings today and I'm excited to see them grow.",
       },
-      { role: "user", content: "I'm not sure how often I should water my tomato plants during this dry spell?" },
+      {
+        role: "user",
+        content: "I'm not sure how often I should water my tomato plants during this dry spell?",
+      },
       { role: "user", content: "Can neem oil control aphids on my tomato plants?" },
       { role: "user", content: "I might use mulch to conserve water." },
       { role: "user", content: "Should I build a trellis for the cucumber plants?" },
@@ -662,12 +857,18 @@ test("runtime: relative time prioritizes reported events in the matching Episode
   );
   capture(
     graph,
-    { dimensionKey: "gardenMulching", value: "Gardening plan: considering mulch for water conservation" },
+    {
+      dimensionKey: "gardenMulching",
+      value: "Gardening plan: considering mulch for water conservation",
+    },
     { ...ctx, source_refs: ["s:garden-target"], createdAt: "2023-04-21" },
   );
   capture(
     graph,
-    { dimensionKey: "gardenPestControl", value: "Gardening pest control with neem oil for tomato plant aphids" },
+    {
+      dimensionKey: "gardenPestControl",
+      value: "Gardening pest control with neem oil for tomato plant aphids",
+    },
     { ...ctx, source_refs: ["s:garden-target"], createdAt: "2023-04-21" },
   );
 
@@ -711,7 +912,12 @@ test("runtime: core:about expands a direct Claim to a bounded related Slot", asy
   assert.ok(summary);
   assert.ok(activity);
   graph.addEdge({ type: "core:about", from: summary.id, to: trip.id, created_by: "human:charles" });
-  graph.addEdge({ type: "core:about", from: activity.id, to: trip.id, created_by: "human:charles" });
+  graph.addEdge({
+    type: "core:about",
+    from: activity.id,
+    to: trip.id,
+    created_by: "human:charles",
+  });
 
   const lines = await contextMemoriesViaRetrieval(graph, "Tell me about the Hawaii family trip", {
     embedder: new MockEmbedder(8),
@@ -771,12 +977,39 @@ test("runtime: relevantDimensionsOf ranks matching dims first and bounds the lis
   capture(graph, { dimensionKey: "weddingsAttended", value: "Sarah" }, ctx);
   capture(graph, { dimensionKey: "apexLevel", value: 100 }, ctx);
   // 再造 40 个不相关维度，验证 limit 截断
-  for (let i = 0; i < 40; i++) capture(graph, { dimensionKey: `noise${i}Pad`, value: `noise-${i}` }, ctx);
+  for (let i = 0; i < 40; i++)
+    capture(graph, { dimensionKey: `noise${i}Pad`, value: `noise-${i}` }, ctx);
   const relevant = relevantDimensionsOf(graph, "今天下午六点去健身房锻炼", 30);
   assert.ok(relevant.length <= 30);
   assert.equal(relevant[0]?.key, "gymSchedule"); // 词面命中者登顶
-  const relevant2 = relevantDimensionsOf(graph, " completely unrelated text about quantum sailing ", 5);
+  const relevant2 = relevantDimensionsOf(
+    graph,
+    " completely unrelated text about quantum sailing ",
+    5,
+  );
   assert.ok(relevant2.length <= 5); // 零命中 → 插入序兜底，仍受 limit 约束
+});
+
+test("runtime: relevantDimensionsOf keeps extraction hints inside exact identity scope", () => {
+  const graph = new MemoryGraph();
+  const alice = { owner_id: "alice", project_id: "alpha", phase_id: "history" };
+  const bob = { owner_id: "bob", project_id: "beta", phase_id: "history" };
+  capture(
+    graph,
+    { dimensionKey: "preferredEditor", value: "Vim", description: "Alice's preferred editor" },
+    { ...ctx, scope: alice },
+  );
+  capture(
+    graph,
+    { dimensionKey: "deliveryVehicle", value: "van", description: "Bob's delivery vehicle" },
+    { ...ctx, scope: bob },
+  );
+
+  const relevant = relevantDimensionsOf(graph, "preferred editor", 30, alice);
+  assert.deepEqual(
+    relevant.map((dimension) => dimension.key),
+    ["preferredEditor"],
+  );
 });
 
 // --- A1/A5: 双端保留渲染 + scope 分组成员过滤 -----------------------------------
@@ -802,8 +1035,16 @@ test("runtime: over-cap dimensions render oldest+newest with a gap marker", asyn
 
 test("runtime: scopeSessionIds filters group members (identity, not content)", async () => {
   const graph = new MemoryGraph();
-  capture(graph, { dimensionKey: "hobby", value: "Alice 的爱好" }, { ...ctx, source_refs: ["s:alice"] });
-  capture(graph, { dimensionKey: "hobby", value: "Bob 的爱好" }, { ...ctx, source_refs: ["s:bob"] });
+  capture(
+    graph,
+    { dimensionKey: "hobby", value: "Alice 的爱好" },
+    { ...ctx, source_refs: ["s:alice"] },
+  );
+  capture(
+    graph,
+    { dimensionKey: "hobby", value: "Bob 的爱好" },
+    { ...ctx, source_refs: ["s:bob"] },
+  );
   const lines = await contextMemoriesViaRetrieval(graph, "hobby", {
     embedder: new MockEmbedder(8),
     vectors: new InMemoryVectorStore(),
@@ -819,7 +1060,11 @@ test("runtime: scopeSessionIds filters group members (identity, not content)", a
 
 test("runtime: fallback (no in-scope members) tags lines as non-user-account", async () => {
   const graph = new MemoryGraph();
-  capture(graph, { dimensionKey: "standMixerGift", value: "mixer from sister" }, { ...ctx, source_refs: ["s:twin"] });
+  capture(
+    graph,
+    { dimensionKey: "standMixerGift", value: "mixer from sister" },
+    { ...ctx, source_refs: ["s:twin"] },
+  );
   const lines = await contextMemoriesViaRetrieval(graph, "stand mixer", {
     embedder: new MockEmbedder(8),
     vectors: new InMemoryVectorStore(),
@@ -852,8 +1097,16 @@ test("runtime: over-budget fallback summaries keep the non-user-account tag", as
 
 test("runtime: in-scope members render without the non-user-account tag", async () => {
   const graph = new MemoryGraph();
-  capture(graph, { dimensionKey: "hobby", value: "Alice 的爱好" }, { ...ctx, source_refs: ["s:alice"] });
-  capture(graph, { dimensionKey: "hobby", value: "Bob 的爱好" }, { ...ctx, source_refs: ["s:bob"] });
+  capture(
+    graph,
+    { dimensionKey: "hobby", value: "Alice 的爱好" },
+    { ...ctx, source_refs: ["s:alice"] },
+  );
+  capture(
+    graph,
+    { dimensionKey: "hobby", value: "Bob 的爱好" },
+    { ...ctx, source_refs: ["s:bob"] },
+  );
   const lines = await contextMemoriesViaRetrieval(graph, "hobby", {
     embedder: new MockEmbedder(8),
     vectors: new InMemoryVectorStore(),

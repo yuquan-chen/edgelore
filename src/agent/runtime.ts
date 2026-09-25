@@ -16,7 +16,14 @@
 //                 posture and constraint verdicts attached
 
 import { scopesEqual, type GraphStore, type MemoryGraph } from "../model/store.js";
-import type { DimensionNode, EpisodeRecord, EpisodeTurn, FactNodeState, Scope, StatementNode } from "../model/types.js";
+import type {
+  DimensionNode,
+  EpisodeRecord,
+  EpisodeTurn,
+  FactNodeState,
+  Scope,
+  StatementNode,
+} from "../model/types.js";
 import { capture, type CaptureContext, type CaptureResult } from "./capture.js";
 import { runGraphEnrichment } from "./graph-enrichment.js";
 import { commitGraphWritePlan } from "./graph-write.js";
@@ -27,6 +34,10 @@ import { slotLabel } from "./slots.js";
 import type { LlmDriver } from "./llm-driver.js";
 import type { EmbeddingDriver } from "./embedding-driver.js";
 import { scanEventCandidates } from "./triggers.js";
+import {
+  applyAgentFactRelationProposal,
+  reconcileStatement,
+} from "./fact-reconciler.js";
 import {
   bigrams,
   retrieveRelevant,
@@ -59,6 +70,8 @@ export interface TurnOutcome {
     warnings?: string[];
     error?: string;
   };
+  /** Fully-awaited conflict adjudication for Claims captured this turn. */
+  resolution?: ConflictResolutionOutcome;
 }
 
 /** Options for {@link processTurn}. */
@@ -71,6 +84,31 @@ export interface ProcessTurnOptions {
   /** Optional third pass: organize immutable extracted facts into entities,
    * events, and Statement-originating relations. */
   graphEnrichment?: GraphEnrichmentConfig;
+  /** Optional Agent adjudication. Only captures that opened a conflict call
+   * the Agent; every call is awaited before processTurn resolves. */
+  conflictResolution?: ConflictResolutionConfig;
+}
+
+export interface ConflictResolutionConfig {
+  /** Defaults to the gate/extract driver. */
+  driver?: LlmDriver;
+  /** Audit principal recorded on applied supersession edges. */
+  resolvedBy: string;
+  /** Safe-apply threshold (default 0.85). */
+  minConfidence?: number;
+  /** Bounded live neighbors shown to the reconciler (default 12). */
+  maxCandidates?: number;
+}
+
+export interface ConflictResolutionOutcome {
+  attempted: number;
+  resolved: number;
+  escalated: number;
+  cases: Array<{
+    statementId: string;
+    status: "resolved" | "escalated";
+    reason: string;
+  }>;
 }
 
 export interface GraphEnrichmentConfig {
@@ -126,6 +164,19 @@ export type RetrievalReadConfig = Omit<Partial<RetrievalConfig>, "embedder" | "v
 };
 
 /**
+ * Set/aggregation questions need a wider candidate pool than point lookups.
+ * This is a local routing decision: it adds no model call and the final
+ * MemoryCapsule remains bounded by maxContextLines.
+ */
+export function retrievalLimitForQuery(query: string, baseLimit: number): number {
+  const asksForSet =
+    /\btotal\b|\bhow many\b.*\b(?:have|has|did|since|ever|all)\b|\b(?:list|name|show)\s+(?:all|every)\b/i.test(
+      query,
+    ) || /(?:总共|一共|总计|合计|全部|所有|列出所有)/.test(query);
+  return asksForSet ? Math.max(baseLimit, 30) : baseLimit;
+}
+
+/**
  * Run one conversation turn through gate -> extract -> capture.
  *
  * @param graph a concrete MemoryGraph (or SqliteGraph) — the runtime needs
@@ -145,7 +196,11 @@ export async function processTurn(
   ctx: CaptureContext,
   opts?: ProcessTurnOptions,
 ): Promise<TurnOutcome> {
-  const gate = await runGate(text, driver, opts?.extraFragments ? { extraFragments: opts.extraFragments } : undefined);
+  const gate = await runGate(
+    text,
+    driver,
+    opts?.extraFragments ? { extraFragments: opts.extraFragments } : undefined,
+  );
   if (!gate.store) {
     return { gate: { store: false, reason: gate.reason }, captures: [], indexed: 0 };
   }
@@ -155,9 +210,10 @@ export async function processTurn(
     const rc = await retrievalContext(graph, text, opts.retrieval);
     contextMemories = rc.lines;
     // 反漂移分层：检索命中的相关维度为主选，兜底为按本回合相关性选择的 top-50
-    knownDims = rc.similarDimensions.length > 0
-      ? rc.similarDimensions
-      : relevantDimensionsOf(graph, text, 50);
+    knownDims =
+      rc.similarDimensions.length > 0
+        ? rc.similarDimensions
+        : relevantDimensionsOf(graph, text, 50);
   } else {
     contextMemories = contextMemoriesOf(graph);
     knownDims = relevantDimensionsOf(graph, text, 50);
@@ -217,6 +273,15 @@ export async function processTurn(
     captures = extract.contents.map((content) => capture(graph, content, ctx));
   }
 
+  const resolution = opts?.conflictResolution
+    ? await resolveCapturedConflicts(
+        graph,
+        captures,
+        opts.conflictResolution.driver ?? driver,
+        opts.conflictResolution,
+      )
+    : undefined;
+
   // Embedding write path: after capture, index each new statement AND each
   // new dimension (so similarDimensions can find it next time). Failures
   // here must NOT fail the turn — the memory is stored; the index is stale
@@ -227,17 +292,23 @@ export async function processTurn(
     try {
       const stored = captures.filter((c) => c.statementId !== null && !c.deduplicated);
       if (stored.length > 0) {
-        const texts = stored.map((c) => statementText(graph, graph.getNode(c.statementId as string) as StatementNode));
+        const texts = stored.map((c) =>
+          statementText(graph, graph.getNode(c.statementId as string) as StatementNode),
+        );
         const vectors = await opts.retrieval.embedder.embed(texts);
-        stored.forEach((c, i) => opts.retrieval?.vectors.put(c.statementId as string, vectors[i] as number[]));
+        stored.forEach((c, i) =>
+          opts.retrieval?.vectors.put(c.statementId as string, vectors[i] as number[]),
+        );
       }
       // also embed new dimensions (key + description) for similarDimensions retrieval
       const newDims = captures.filter((c) => c.created).map((c) => c.dimensionId);
       if (newDims.length > 0) {
-        const dimTexts = newDims.map((id) => {
-          const d = graph.getNode(id) as DimensionNode | undefined;
-          return d ? `${d.key} ${d.attributes?.description ?? ""}` : "";
-        }).filter(Boolean);
+        const dimTexts = newDims
+          .map((id) => {
+            const d = graph.getNode(id) as DimensionNode | undefined;
+            return d ? `${d.key} ${d.attributes?.description ?? ""}` : "";
+          })
+          .filter(Boolean);
         if (dimTexts.length > 0) {
           const dimVectors = await opts.retrieval.embedder.embed(dimTexts);
           newDims.forEach((id, i) => opts.retrieval?.vectors.put(id, dimVectors[i] as number[]));
@@ -254,6 +325,76 @@ export async function processTurn(
     indexed,
     indexError,
     ...(graphOutcome ? { graph: graphOutcome } : {}),
+    ...(resolution ? { resolution } : {}),
+  };
+}
+
+/** Await Agent adjudication for every newly opened conflict. Failures are
+ * returned as explicit human escalations; no Promise is detached. */
+export async function resolveCapturedConflicts(
+  graph: MemoryGraph,
+  captures: readonly CaptureResult[],
+  driver: LlmDriver,
+  config: ConflictResolutionConfig,
+): Promise<ConflictResolutionOutcome> {
+  const cases: ConflictResolutionOutcome["cases"] = [];
+  for (const captured of captures) {
+    if (!captured.conflict || captured.statementId === null) continue;
+    const statementId = captured.statementId;
+    try {
+      const reconciliation = await reconcileStatement(graph, statementId, {
+        driver,
+        ...(config.maxCandidates !== undefined
+          ? { maxCandidates: config.maxCandidates }
+          : {}),
+      });
+      const supersessions = reconciliation.proposals
+        .filter((proposal) => proposal.relation === "supersedes")
+        .sort((a, b) => b.confidence - a.confidence);
+      let applied = false;
+      let lastReason = "Agent did not establish a safe supersession";
+      for (const proposal of supersessions) {
+        try {
+          applyAgentFactRelationProposal(graph, proposal, {
+            resolvedBy: config.resolvedBy,
+            ...(config.minConfidence !== undefined
+              ? { minConfidence: config.minConfidence }
+              : {}),
+          });
+          cases.push({
+            statementId,
+            status: "resolved",
+            reason: proposal.reason,
+          });
+          applied = true;
+          break;
+        } catch (error) {
+          lastReason = error instanceof Error ? error.message : String(error);
+        }
+      }
+      if (!applied) {
+        cases.push({
+          statementId,
+          status: "escalated",
+          reason:
+            reconciliation.unresolvedIds.length > 0
+              ? `${lastReason}; ${reconciliation.unresolvedIds.length} candidate(s) unresolved`
+              : lastReason,
+        });
+      }
+    } catch (error) {
+      cases.push({
+        statementId,
+        status: "escalated",
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return {
+    attempted: cases.length,
+    resolved: cases.filter((item) => item.status === "resolved").length,
+    escalated: cases.filter((item) => item.status === "escalated").length,
+    cases,
   };
 }
 
@@ -292,10 +433,18 @@ export function knownDimensionsOf(graph: GraphStore): KnownDimension[] {
  * @returns the most lexically-relevant dimension slots; falls back to the
  *   first `limit` dims (insertion order) when nothing overlaps
  */
-export function relevantDimensionsOf(graph: GraphStore, text: string, limit = 30): KnownDimension[] {
+export function relevantDimensionsOf(
+  graph: GraphStore,
+  text: string,
+  limit = 30,
+  scope?: Scope,
+): KnownDimension[] {
   const units = borrowUnits(graph);
   const queryBigrams = bigrams(text);
-  const scored = (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).map((d) => {
+  const dimensions = (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).filter(
+    (dimension) => scope === undefined || scopesEqual(dimension.scope, scope),
+  );
+  const scored = dimensions.map((d) => {
     const kd = toKnownDimension(d, units);
     const doc = bigrams(`${kd.key} ${kd.description}`);
     let hits = 0;
@@ -395,6 +544,9 @@ export interface RetrievedSlot {
   cardinality?: DimensionNode["cardinality"];
   scope?: DimensionNode["scope"];
   conflict: boolean;
+  /** Newest non-terminal user-authored Claim in an unresolved conflict.
+   * This is a read-time navigation hint, not a persisted resolution. */
+  latestUserClaimId?: string;
   claimCount: number;
   visibleClaimIds: string[];
   omittedByBudget: boolean;
@@ -411,10 +563,49 @@ export interface RetrievedEvidence {
 }
 
 const EVIDENCE_STOP_WORDS = new Set([
-  "the", "and", "that", "this", "with", "from", "what", "when", "where", "which", "who",
-  "why", "how", "did", "does", "was", "were", "are", "for", "you", "your", "their", "they",
-  "have", "has", "had", "about", "into", "would", "could", "should", "can", "our", "use",
-  "used", "kind", "remind", "mentioned", "previous", "conversation", "thinking", "assistant", "user",
+  "the",
+  "and",
+  "that",
+  "this",
+  "with",
+  "from",
+  "what",
+  "when",
+  "where",
+  "which",
+  "who",
+  "why",
+  "how",
+  "did",
+  "does",
+  "was",
+  "were",
+  "are",
+  "for",
+  "you",
+  "your",
+  "their",
+  "they",
+  "have",
+  "has",
+  "had",
+  "about",
+  "into",
+  "would",
+  "could",
+  "should",
+  "can",
+  "our",
+  "use",
+  "used",
+  "kind",
+  "remind",
+  "mentioned",
+  "previous",
+  "conversation",
+  "thinking",
+  "assistant",
+  "user",
 ]);
 
 function evidenceTerms(text: string): Set<string> {
@@ -450,7 +641,11 @@ function overlapCount(needles: ReadonlySet<string>, corpusTerms: ReadonlySet<str
 }
 
 function preferredEvidenceRole(query: string): "user" | "assistant" | undefined {
-  if (/\b(?:you|assistant)\b.{0,28}\b(?:said|told|mentioned|recommended|suggested|wrote|gave|provided|produced|created|explained|listed)\b/i.test(query)) {
+  if (
+    /\b(?:you|assistant)\b.{0,28}\b(?:said|told|mentioned|recommended|suggested|wrote|gave|provided|produced|created|explained|listed)\b/i.test(
+      query,
+    )
+  ) {
     return "assistant";
   }
   // "I'm looking back" / "remind me" is retrieval framing, not evidence
@@ -462,9 +657,12 @@ function preferredEvidenceRole(query: string): "user" | "assistant" | undefined 
   return undefined;
 }
 
-const NUMBER_WORD = "(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|hundred|thousand)";
+const NUMBER_WORD =
+  "(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|hundred|thousand)";
 const NUMERIC_PAYLOAD_RE = new RegExp(`(?:\\d|\\b${NUMBER_WORD}\\b)`, "i");
 const NUMERIC_QUESTION_RE = /\b(?:how many|how much|number of|count of)\b/i;
+const MONEY_QUESTION_RE = /\b(?:how much|total(?:\s+money)?|spent|spend|cost|expenses?)\b/i;
+const CURRENCY_PAYLOAD_RE = /(?:[$€£¥]|\b(?:usd|eur|gbp|cny|rmb|dollars?|euros?|pounds?|yuan)\b)/i;
 const ORDINAL_QUESTION_RE = /\b(\d+)(?:st|nd|rd|th)\b/i;
 
 function ordinalPayloadFit(query: string, content: string): number {
@@ -485,15 +683,29 @@ function numericPayloadFit(
   if (ordinalFit > 0) return ordinalFit;
   if (!NUMERIC_QUESTION_RE.test(query) || !NUMERIC_PAYLOAD_RE.test(content)) return 0;
   if (overlapCount(queryTerms, unitTerms) === 0) return 0;
+  // A monetary total must prefer an actual price over nearby counts, dates,
+  // mileage, model numbers, and other numerals in the same Episode.
+  if (MONEY_QUESTION_RE.test(query) && CURRENCY_PAYLOAD_RE.test(content)) return 4;
   const firstLine = content.split(/\r?\n/, 1)[0] ?? content;
-  return NUMERIC_PAYLOAD_RE.test(firstLine) && overlapCount(queryTerms, evidenceTerms(firstLine)) > 0
+  return NUMERIC_PAYLOAD_RE.test(firstLine) &&
+    overlapCount(queryTerms, evidenceTerms(firstLine)) > 0
     ? 2
     : 1;
 }
 
 const RELATIVE_AMOUNT = new Map<string, number>([
-  ["one", 1], ["two", 2], ["three", 3], ["four", 4], ["five", 5], ["six", 6],
-  ["seven", 7], ["eight", 8], ["nine", 9], ["ten", 10], ["eleven", 11], ["twelve", 12],
+  ["one", 1],
+  ["two", 2],
+  ["three", 3],
+  ["four", 4],
+  ["five", 5],
+  ["six", 6],
+  ["seven", 7],
+  ["eight", 8],
+  ["nine", 9],
+  ["ten", 10],
+  ["eleven", 11],
+  ["twelve", 12],
 ]);
 
 function relativeEpisodeTarget(
@@ -501,8 +713,10 @@ function relativeEpisodeTarget(
   referenceDay: string | undefined,
 ): { timestamp: number; toleranceDays: number } | undefined {
   if (!referenceDay) return undefined;
-  const match = new RegExp(`\\b(\\d+|${[...RELATIVE_AMOUNT.keys()].join("|")})\\s+(day|week|month|year)s?\\s+ago\\b`, "i")
-    .exec(query);
+  const match = new RegExp(
+    `\\b(\\d+|${[...RELATIVE_AMOUNT.keys()].join("|")})\\s+(day|week|month|year)s?\\s+ago\\b`,
+    "i",
+  ).exec(query);
   if (!match) return undefined;
   const amount = /^\d+$/.test(match[1]!)
     ? Number(match[1])
@@ -541,10 +755,14 @@ function episodeEvidenceUnits(content: string, maxChars: number): string[] {
   if (!text) return [];
   if (text.length <= maxChars) return [text];
 
-  const blocks = text.split(/\r?\n\s*\r?\n/).map((block) => block.trim()).filter(Boolean);
+  const blocks = text
+    .split(/\r?\n\s*\r?\n/)
+    .map((block) => block.trim())
+    .filter(Boolean);
   const units: string[] = [];
   let pendingHeading: string | undefined;
-  const headingOnly = /^(?:#{1,6}\s+.+|\*\*[^\n*]+\*\*:|[-*+]\s+.+:|(?:verse|chorus|bridge|outro)\s*:)$/i;
+  const headingOnly =
+    /^(?:#{1,6}\s+.+|\*\*[^\n*]+\*\*:|[-*+]\s+.+:|(?:verse|chorus|bridge|outro)\s*:)$/i;
   const listLine = /^(?:[-*+]\s+|\d+[.)]\s+)/;
 
   const pushNatural = (raw: string) => {
@@ -554,7 +772,10 @@ function episodeEvidenceUnits(content: string, maxChars: number): string[] {
       units.push(value);
       return;
     }
-    const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const lines = value
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
     if (lines.length > 1) {
       let sectionHeading: string | undefined;
       for (const line of lines) {
@@ -562,9 +783,10 @@ function episodeEvidenceUnits(content: string, maxChars: number): string[] {
           sectionHeading = line;
           continue;
         }
-        const candidate = sectionHeading && (listLine.test(line) || line.length <= maxChars)
-          ? `${sectionHeading}\n${line}`
-          : line;
+        const candidate =
+          sectionHeading && (listLine.test(line) || line.length <= maxChars)
+            ? `${sectionHeading}\n${line}`
+            : line;
         if (candidate.length <= maxChars) units.push(candidate);
       }
       return;
@@ -654,7 +876,8 @@ function coldEpisodeEvidence(
     if (!statement || statement.type !== "core:statement") return;
     for (const sourceRef of statement.source_refs ?? []) {
       const episode = graph.getEpisode(sourceRef);
-      if (!episode || (exactScope !== undefined && !scopesEqual(episode.scope, exactScope))) continue;
+      if (!episode || (exactScope !== undefined && !scopesEqual(episode.scope, exactScope)))
+        continue;
       const current = anchors.get(sourceRef) ?? {
         sourceRef,
         rank,
@@ -675,14 +898,16 @@ function coldEpisodeEvidence(
   // the caller's Episode scope (or the single-tenant library when unscoped)
   // as a sparse, cold fallback. Requiring two meaningful query terms keeps
   // generic questions from turning this into a transcript dump.
-  const episodeCandidates = scopeSet && scopeSet.size > 0
-    ? [...scopeSet]
-        .map((sourceRef) => graph.getEpisode(sourceRef))
-        .filter((episode): episode is EpisodeRecord => Boolean(episode))
-    : graph.getAllEpisodes();
-  const scopedEpisodeCandidates = exactScope === undefined
-    ? episodeCandidates
-    : episodeCandidates.filter((episode) => scopesEqual(episode.scope, exactScope));
+  const episodeCandidates =
+    scopeSet && scopeSet.size > 0
+      ? [...scopeSet]
+          .map((sourceRef) => graph.getEpisode(sourceRef))
+          .filter((episode): episode is EpisodeRecord => Boolean(episode))
+      : graph.getAllEpisodes();
+  const scopedEpisodeCandidates =
+    exactScope === undefined
+      ? episodeCandidates
+      : episodeCandidates.filter((episode) => scopesEqual(episode.scope, exactScope));
   const minimumFallbackMatches = queryTerms.size <= 2 ? 1 : 2;
   for (const episode of scopedEpisodeCandidates) {
     let queryMatches = 0;
@@ -755,9 +980,10 @@ function coldEpisodeEvidence(
     // its own. This preserves details adjacent to a concise Claim (breed near
     // a collar choice, a count inside a long encounter, etc.) instead of
     // letting the broadest Claim monopolize every local result.
-    const roleCompatibleClaims = preferredRole && anchor.claims.some((claim) => claim.role === preferredRole)
-      ? anchor.claims.filter((claim) => claim.role === preferredRole)
-      : anchor.claims;
+    const roleCompatibleClaims =
+      preferredRole && anchor.claims.some((claim) => claim.role === preferredRole)
+        ? anchor.claims.filter((claim) => claim.role === preferredRole)
+        : anchor.claims;
     const bestClaimRank = Math.min(...roleCompatibleClaims.map((claim) => claim.rank));
     const nearbyClaims = roleCompatibleClaims.filter((claim) => claim.rank <= bestClaimRank + 2);
     const claimsByQueryFit = nearbyClaims
@@ -765,12 +991,13 @@ function coldEpisodeEvidence(
       .sort((a, b) => b.queryFit - a.queryFit || a.claim.rank - b.claim.rank);
     const queryMatchingClaims = claimsByQueryFit.filter((entry) => entry.queryFit > 0);
     const bestQueryFit = queryMatchingClaims[0]?.queryFit ?? 0;
-    const focusedClaims = bestQueryFit > 0
-      ? queryMatchingClaims.filter((entry) => entry.queryFit >= Math.max(1, Math.ceil(bestQueryFit * 0.6)))
-      : claimsByQueryFit;
-    const nominatedClaims = focusedClaims
-      .slice(0, 3)
-      .map((entry) => entry.claim);
+    const focusedClaims =
+      bestQueryFit > 0
+        ? queryMatchingClaims.filter(
+            (entry) => entry.queryFit >= Math.max(1, Math.ceil(bestQueryFit * 0.6)),
+          )
+        : claimsByQueryFit;
+    const nominatedClaims = focusedClaims.slice(0, 3).map((entry) => entry.claim);
 
     const lanes: RankedEpisodeUnit[][] = nominatedClaims.map((claim) => {
       const rankWeight = Number.isFinite(claim.rank) ? 1 / Math.sqrt(claim.rank + 1) : 0.25;
@@ -779,9 +1006,7 @@ function coldEpisodeEvidence(
           const queryFit = localLexicalScore(queryTerms, unit.terms, termWeights);
           const claimFit = localLexicalScore(claim.terms, unit.terms, termWeights);
           const numericFit = numericPayloadFit(query, unit.turn.content, queryTerms, unit.terms);
-          const eventFit = temporalTarget
-            ? reportedEventFit(unit.turn.content, unit.turn.role)
-            : 0;
+          const eventFit = temporalTarget ? reportedEventFit(unit.turn.content, unit.turn.role) : 0;
           const speakerFit = claim.role === unit.turn.role ? 6 : 0;
           const preferredSpeakerFit = preferredRole === unit.turn.role ? 2 : 0;
           return {
@@ -823,10 +1048,7 @@ function coldEpisodeEvidence(
           }))
           .filter((candidate) => candidate.score > 0)
           .sort(
-            (a, b) =>
-              b.score - a.score ||
-              a.turnIndex - b.turnIndex ||
-              a.unitIndex - b.unitIndex,
+            (a, b) => b.score - a.score || a.turnIndex - b.turnIndex || a.unitIndex - b.unitIndex,
           ),
       );
     }
@@ -860,9 +1082,10 @@ function coldEpisodeEvidence(
     }
     if (rankedUnits.length > 0) {
       const episodeTime = new Date(`${episode.created_at.slice(0, 10)}T00:00:00.000Z`).getTime();
-      const distanceDays = temporalTarget && Number.isFinite(episodeTime)
-        ? Math.abs(episodeTime - temporalTarget.timestamp) / 86_400_000
-        : Number.POSITIVE_INFINITY;
+      const distanceDays =
+        temporalTarget && Number.isFinite(episodeTime)
+          ? Math.abs(episodeTime - temporalTarget.timestamp) / 86_400_000
+          : Number.POSITIVE_INFINITY;
       perSource.push({
         evidence: rankedUnits,
         quotaWeight: distanceDays <= (temporalTarget?.toleranceDays ?? -1) ? 2 : 1,
@@ -962,7 +1185,9 @@ function aboutRelatedHits(
     .filter((statement) => !config.states || config.states.includes(statement.state))
     .filter((statement) => {
       const day = statement.created_at.slice(0, 10).replace(/\//g, "-");
-      return (!config.dateFrom || day >= config.dateFrom) && (!config.dateTo || day <= config.dateTo);
+      return (
+        (!config.dateFrom || day >= config.dateFrom) && (!config.dateTo || day <= config.dateTo)
+      );
     })
     .map((statement) => ({
       statement,
@@ -972,10 +1197,11 @@ function aboutRelatedHits(
   const inScope = candidates.filter((candidate) => candidate.inScope);
   const pool = scopeSet && inScope.length > 0 ? inScope : candidates;
   return pool
-    .sort((a, b) =>
-      Number(b.inScope) - Number(a.inScope) ||
-      b.lexical - a.lexical ||
-      b.statement.created_at.localeCompare(a.statement.created_at),
+    .sort(
+      (a, b) =>
+        Number(b.inScope) - Number(a.inScope) ||
+        b.lexical - a.lexical ||
+        b.statement.created_at.localeCompare(a.statement.created_at),
     )
     .slice(0, limit)
     .map(({ statement, lexical }) => {
@@ -1037,7 +1263,9 @@ export async function retrievalContext(
   });
   const dimById = new Map(
     (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[])
-      .filter((dimension) => config.scope === undefined || scopesEqual(dimension.scope, config.scope))
+      .filter(
+        (dimension) => config.scope === undefined || scopesEqual(dimension.scope, config.scope),
+      )
       .map((d) => [d.id, d]),
   );
   const directStatementHits = hits
@@ -1164,7 +1392,11 @@ export async function retrievalContext(
         ? { turnIndex: node.attributes.turn_index }
         : {}),
       text: value,
-      ...(node.scope ? { scope: node.scope } : sourceEpisode?.scope ? { scope: sourceEpisode.scope } : {}),
+      ...(node.scope
+        ? { scope: node.scope }
+        : sourceEpisode?.scope
+          ? { scope: sourceEpisode.scope }
+          : {}),
       outOfScope: fallbackOut,
     });
     lines.push(
@@ -1173,21 +1405,27 @@ export async function retrievalContext(
   }
 
   const hitDims = [...new Set(statementHits.map((h) => h.dimensionId))];
-  for (const dimId of hitDims) {
+  for (let dimIndex = 0; dimIndex < hitDims.length; dimIndex += 1) {
+    if (lines.length >= maxLines) break;
+    const dimId = hitDims[dimIndex] as string;
     const allMembers = membersByDim.get(dimId) ?? [];
-    const exactMembers = config.scope === undefined
-      ? allMembers
-      : allMembers.filter((member) => scopesEqual(member.scope, config.scope));
+    const exactMembers =
+      config.scope === undefined
+        ? allMembers
+        : allMembers.filter((member) => scopesEqual(member.scope, config.scope));
     const scoped = scopeSet ? exactMembers.filter(inScopeOf) : [];
-    const members = config.scope !== undefined
-      ? (scopeSet ? scoped : exactMembers)
-      : scopeSet && scoped.length > 0
-        ? scoped
-        : allMembers;
+    const members =
+      config.scope !== undefined
+        ? scopeSet
+          ? scoped
+          : exactMembers
+        : scopeSet && scoped.length > 0
+          ? scoped
+          : allMembers;
     const dimension = dimById.get(dimId);
     const key = dimension
       ? slotLabel(graph, dimension)
-      : statementHits.find((h) => h.dimensionId === dimId)?.dimensionKey ?? "?";
+      : (statementHits.find((h) => h.dimensionId === dimId)?.dimensionKey ?? "?");
     // Double-ended selection: oldest half + newest half. Oldest-only rendering
     // systematically hid the LATEST value of fast-growing dimensions (the
     // exact entries knowledge-update questions need).
@@ -1199,6 +1437,18 @@ export async function retrievalContext(
     const gapCount = overCap ? members.length - headN - tailN : 0;
     const shownLines = head.length + tail.length + (gapCount > 0 ? 1 : 0);
     const fallbackOut = scopeSet !== undefined && scoped.length === 0 && scopeSet.size > 0;
+    const slotConflict =
+      members.some((member) => member.state === "conflict") || dimension?.state === "conflict";
+    const latestUserClaim = slotConflict
+      ? [...members]
+          .reverse()
+          .find(
+            (member) =>
+              member.saidBy !== "assistant" &&
+              member.state !== "superseded" &&
+              member.state !== "rejected",
+          )
+      : undefined;
     const slot: RetrievedSlot = {
       id: dimId,
       key: dimension?.key ?? key,
@@ -1206,13 +1456,15 @@ export async function retrievalContext(
       state: dimension?.state ?? "accepted",
       ...(dimension?.cardinality ? { cardinality: dimension.cardinality } : {}),
       ...(dimension?.scope ? { scope: dimension.scope } : {}),
-      conflict: members.some((member) => member.state === "conflict") || dimension?.state === "conflict",
+      conflict: slotConflict,
+      ...(latestUserClaim ? { latestUserClaimId: latestUserClaim.id } : {}),
       claimCount: members.length,
       visibleClaimIds: [],
       omittedByBudget: false,
     };
     capsuleSlots.push(slot);
-    if (lines.length + shownLines + 1 > maxLines) {
+    const remainingDimensions = hitDims.length - dimIndex - 1;
+    if (lines.length + shownLines + 1 + remainingDimensions > maxLines) {
       // Over budget: degrade to a one-line summary — the COUNT survives even
       // when the entries do not (counting questions read the header).
       const tag = fallbackOut ? " (non-user-account)" : "";
@@ -1245,13 +1497,30 @@ export async function retrievalContext(
         via: hit?.via ?? ["slot-group"],
       });
       slot.visibleClaimIds.push(m.id);
+      const conflictRole =
+        latestUserClaim?.id === m.id
+          ? " (latest user statement; current for recall)"
+          : slotConflict && m.state === "accepted"
+            ? " (conflicting incumbent; unresolved history)"
+            : "";
       lines.push(
-        `  = ${JSON.stringify(m.value)}${m.unit ? ` ${m.unit}` : ""} [${m.state} @${m.created_at.slice(0, 10)}]${speaker}${tag}`,
+        `  = ${JSON.stringify(m.value)}${m.unit ? ` ${m.unit}` : ""} [${m.state} @${m.created_at.slice(0, 10)}]${conflictRole}${speaker}${tag}`,
       );
     };
-    for (const m of head) renderMember(m);
-    if (gapCount > 0) lines.push(`  ⋯ ${gapCount} more entries in between`);
-    for (const m of tail) renderMember(m);
+    const selectedMembers = [...head, ...tail];
+    if (latestUserClaim && selectedMembers.some((member) => member.id === latestUserClaim.id)) {
+      selectedMembers.sort((left, right) => {
+        if (left.id === latestUserClaim.id) return -1;
+        if (right.id === latestUserClaim.id) return 1;
+        return right.created_at.localeCompare(left.created_at);
+      });
+      for (const m of selectedMembers) renderMember(m);
+      if (gapCount > 0) lines.push(`  ⋯ ${gapCount} more entries in between`);
+    } else {
+      for (const m of head) renderMember(m);
+      if (gapCount > 0) lines.push(`  ⋯ ${gapCount} more entries in between`);
+      for (const m of tail) renderMember(m);
+    }
     for (const c of activeConstraints) {
       if (Object.values(c.bindings).includes(dimId) || c.participants.includes(dimId)) {
         lines.push(`  rule "${c.name ?? c.id}" -> ${graph.evaluateConstraint(c.id)}`);

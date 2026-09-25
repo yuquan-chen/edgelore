@@ -10,7 +10,12 @@
 import type { MemoryGraph } from "../model/store.js";
 import type { LlmDriver } from "./llm-driver.js";
 import type { DecisionDriver } from "./decision.js";
-import { contextMemoriesOf, retrievalContext, type RetrievalConfig } from "./runtime.js";
+import {
+  contextMemoriesOf,
+  retrievalContext,
+  retrievalLimitForQuery,
+  type RetrievalConfig,
+} from "./runtime.js";
 
 export const ABSTAIN = "不知道";
 
@@ -23,7 +28,11 @@ export const ABSTAIN = "不知道";
  * string transform — never `new Date()`, whose UTC conversion shifts
  * pre-08:00 timestamps a day back on UTC+8 machines).
  */
-export function buildAskPrompt(question: string, memories: readonly string[], now?: string): string {
+export function buildAskPrompt(
+  question: string,
+  memories: readonly string[],
+  now?: string,
+): string {
   const context =
     memories.length > 0
       ? memories.map((m) => `- ${m}`).join("\n")
@@ -46,7 +55,9 @@ export function buildAskPrompt(question: string, memories: readonly string[], no
     "   outside your strict window still counts if it clearly matches.",
     "3. When entries describe the same slot at different dates, the LATEST USER-stated",
     "   entry is current truth — even if it is still tentative (pending review is not",
-    "   rejection); you may briefly note the outdated value. An assistant's tentative",
+    "   rejection). In a conflict group, `(latest user statement; current for recall)`,",
+    "   identifies that value; `(conflicting incumbent; unresolved history)` is the older",
+    "   accepted value, not the current answer. An assistant's tentative",
     "   suggestion never overrides an accepted user value. Apply this across differently",
     "   named groups when their entries plainly express the same real-world property;",
     "   grouping/key drift must not make an older value current again.",
@@ -134,7 +145,7 @@ export async function answerQuestion(
         ...(opts.scopeSessionIds ? { scopeSessionIds: opts.scopeSessionIds } : {}),
       }
     : undefined;
-  let effectiveK = opts?.k ?? opts?.retrieval?.k ?? 10;
+  let effectiveK = retrievalLimitForQuery(question, opts?.k ?? opts?.retrieval?.k ?? 10);
   // 决策层（可选）：聚合类问题自动放大检索窗口。失败不阻塞主链路——
   // 决策层是增强，不是依赖。
   if (opts?.decision && retrievalConfig) {

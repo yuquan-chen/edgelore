@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  applyAgentFactRelationProposal,
   applyFactRelationProposal,
   reconcileStatement,
   type FactRelationProposal,
@@ -156,6 +157,35 @@ test("fact reconciler: prompt fixes relation direction as new Statement to candi
   assert.match(prompt, /New Statement -> Candidate/);
   assert.match(prompt, /New Statement adds compatible detail to the Candidate/);
   assert.match(prompt, /Candidate contains details omitted by the New Statement/);
+  assert.match(prompt, /Judge memory truth relative to provenance/);
+  assert.match(prompt, /"dimensionId":/);
+  assert.match(prompt, /"createdBy":"agent:test:1"/);
+  assert.match(prompt, /"sourceRefs":\["session:test"\]/);
+  assert.match(prompt, /"scope":\{"owner_id":"actor:alice"\}/);
+});
+
+test("fact reconciler: malformed Agent rows are ignored and remain unresolved", async () => {
+  const graph = new MemoryGraph();
+  const dimension = addDimension(graph, "homeCity", "single");
+  const old = addStatement(graph, dimension, "Shenzhen");
+  const fresh = addStatement(graph, dimension, "Shanghai", "tentative");
+  const driver = new MockDriver([
+    JSON.stringify({
+      decisions: [
+        {
+          statementId: "hallucinated-id",
+          relation: "supersedes",
+          confidence: 0.99,
+          reason: "invalid row",
+        },
+      ],
+    }),
+  ]);
+
+  const result = await reconcileStatement(graph, fresh.id, { driver });
+
+  assert.deepEqual(result.proposals, []);
+  assert.deepEqual(result.unresolvedIds, [old.id]);
 });
 
 test("fact reconciler: omitted Agent decisions stay unresolved", async () => {
@@ -285,6 +315,108 @@ test("fact reconciler: an Agent can turn capture's conflict flag into an approve
   assert.equal(result.objectState, "superseded");
   assert.equal(graph.getNode(old.dimensionId)?.state, "accepted");
   assert.deepEqual(listConflicts(graph), []);
+});
+
+test("fact reconciler: provenance-gated Agent resolution can apply a newer trusted value", () => {
+  const graph = new MemoryGraph();
+  const old = capture(
+    graph,
+    { dimensionKey: "homeCity", value: "Shenzhen", cardinality: "single", saidBy: "user" },
+    {
+      created_by: "agent:ingestion:1",
+      source_refs: ["session:old"],
+      createdAt: "2024-01-01T00:00:00.000Z",
+      scope: actorScope,
+    },
+  );
+  const fresh = capture(
+    graph,
+    { dimensionKey: "homeCity", value: "Shanghai", cardinality: "single", saidBy: "user" },
+    {
+      created_by: "agent:ingestion:1",
+      source_refs: ["session:new"],
+      createdAt: "2024-02-01T00:00:00.000Z",
+      scope: actorScope,
+    },
+  );
+  const proposal: FactRelationProposal = {
+    subjectId: fresh.statementId as string,
+    objectId: old.statementId as string,
+    relation: "supersedes",
+    basis: "agent",
+    confidence: 0.92,
+    reason: "later claim from the same trusted provenance channel",
+    requiresApproval: true,
+  };
+
+  const result = applyAgentFactRelationProposal(graph, proposal, {
+    resolvedBy: "agent:edgelore:reconciler",
+  });
+
+  assert.equal(result.subjectState, "accepted");
+  assert.equal(result.objectState, "superseded");
+  assert.equal(graph.getNode(old.dimensionId)?.state, "accepted");
+  assert.deepEqual(listConflicts(graph), []);
+  const edge = graph.queryEdges({
+    type: "core:supersedes",
+    from: proposal.subjectId,
+    to: proposal.objectId,
+  })[0];
+  assert.equal(edge?.created_by, "agent:edgelore:reconciler");
+});
+
+test("fact reconciler: Agent resolution refuses weak or mismatched provenance", () => {
+  const graph = new MemoryGraph();
+  const dimension = addDimension(graph, "homeCity", "single");
+  const old = graph.addNode({
+    type: "core:statement",
+    dimension_id: dimension.id,
+    value: "Shenzhen",
+    state: "accepted",
+    scope: actorScope,
+    saidBy: "user",
+    created_by: "agent:ingestion:old",
+    source_refs: ["session:old"],
+    created_at: "2024-01-01T00:00:00.000Z",
+  }) as StatementNode;
+  const fresh = graph.addNode({
+    type: "core:statement",
+    dimension_id: dimension.id,
+    value: "Shanghai",
+    state: "tentative",
+    scope: actorScope,
+    saidBy: "user",
+    created_by: "agent:ingestion:new",
+    source_refs: ["session:new"],
+    created_at: "2024-02-01T00:00:00.000Z",
+  }) as StatementNode;
+  const proposal: FactRelationProposal = {
+    subjectId: fresh.id,
+    objectId: old.id,
+    relation: "supersedes",
+    basis: "agent",
+    confidence: 0.8,
+    reason: "untrusted replacement",
+    requiresApproval: true,
+  };
+
+  assert.throws(
+    () =>
+      applyAgentFactRelationProposal(graph, proposal, {
+        resolvedBy: "agent:edgelore:reconciler",
+      }),
+    /below 0.85/,
+  );
+  proposal.confidence = 0.95;
+  assert.throws(
+    () =>
+      applyAgentFactRelationProposal(graph, proposal, {
+        resolvedBy: "agent:edgelore:reconciler",
+      }),
+    /same authority and speaker channel/,
+  );
+  assert.equal(graph.getNode(old.id)?.state, "accepted");
+  assert.equal(graph.getNode(fresh.id)?.state, "tentative");
 });
 
 test("fact reconciler: shared core:about target links candidates across Dimensions", async () => {

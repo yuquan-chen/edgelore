@@ -39,10 +39,13 @@ if (!Number.isInteger(limit) || limit <= 0) {
 const dbPath = resolve(option("--db", join(dataDir, "memory-graph-smoke.db")));
 const outputPath = resolve(option("--out", join(dataDir, "reconcile-dry-run.json")));
 const { cfg } = boot();
+const forcedThinking = /glm-5\.3/i.test(cfg.llm?.model ?? "");
 const driver = requireChat(cfg, {
   maxTokens: 5000,
   maxRetries: 3,
-  extraBody: { thinking: { type: "disabled" } },
+  extraBody: forcedThinking
+    ? { reasoning_effort: "low" }
+    : { thinking: { type: "disabled" } },
 });
 const graph = new SqliteGraph(dbPath);
 

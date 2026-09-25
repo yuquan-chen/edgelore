@@ -7,6 +7,7 @@ dist/
 benchmark/longmemeval/data/
 benchmark/longmemeval/.venv-mem0/
 benchmark/longmemeval/data/mem0-qdrant/
+benchmark/memoryagentbench/data/
 
 # 本地工作底稿，不进仓库
 HANDOFF*.md

@@ -726,6 +726,43 @@ test("runtime: core:about expands a direct Claim to a bounded related Slot", asy
   assert.match(joined, /Snorkeling at Hanauma Bay/);
 });
 
+test("runtime: core:about defaults to two related Claims", async () => {
+  const graph = new MemoryGraph();
+  const trip = graph.addNode({
+    type: "travel:trip",
+    key: "hawaii-trip-default-bound",
+    value: "Hawaii family trip",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const facts = [
+    ["familyTripSummary", "Family trip to Hawaii"],
+    ["tripSnorkeling", "Hawaii snorkeling"],
+    ["tripHiking", "Hawaii hiking"],
+    ["tripDinner", "Hawaii dinner"],
+  ];
+  for (const [dimensionKey, value] of facts) {
+    const result = capture(graph, { dimensionKey, value }, ctx);
+    const statement = graph.getNode(result.statementId!);
+    assert.ok(statement);
+    graph.addEdge({
+      type: "core:about",
+      from: statement.id,
+      to: trip.id,
+      created_by: "human:charles",
+    });
+  }
+
+  const lines = await contextMemoriesViaRetrieval(graph, "Hawaii family trip", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+    k: 1,
+  });
+  const relatedHeaders = lines.filter((line) => /^trip(?:Snorkeling|Hiking|Dinner) —/.test(line));
+  assert.equal(relatedHeaders.length, 2);
+});
+
 // --- 相关维度选择（批量抽取的 O(维度数) prompt 爆炸修复） -----------------------
 
 test("runtime: relevantDimensionsOf ranks matching dims first and bounds the list", () => {

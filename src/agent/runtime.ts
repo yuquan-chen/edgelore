@@ -100,7 +100,7 @@ export interface RetrievalConfig {
   /** Per-excerpt character cap for cold Episode evidence (default 1,600). */
   maxEpisodeExcerptChars?: number;
   /** Additional Claims reached through one shared core:about target
-   * (default 4; 0 disables graph expansion). */
+   * (default 2; 0 disables graph expansion). */
   maxGraphExpansionHits?: number;
   /** Candidate state filter (default: ALL states — counting questions need
    * superseded/tentative visible; narrow deliberately, never by default). */
@@ -870,7 +870,10 @@ function aboutRelatedHits(
   directHits: readonly RetrievalHit[],
   config: RetrievalConfig,
 ): RetrievalHit[] {
-  const limit = config.maxGraphExpansionHits ?? 4;
+  // The v7 retrieval ablation found sharply diminishing evidence gains after
+  // two related Claims while context size kept growing. Keep the graph useful
+  // without turning every entity neighborhood into prompt payload.
+  const limit = config.maxGraphExpansionHits ?? 2;
   if (limit <= 0 || directHits.length === 0) return [];
   const directIds = new Set(directHits.map((hit) => hit.statementId));
   const directDims = new Set(directHits.map((hit) => hit.dimensionId));

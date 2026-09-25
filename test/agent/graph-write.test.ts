@@ -213,6 +213,149 @@ test("graph write: resolves plan-local fact subjects into durable Slot identity"
   });
 });
 
+test("graph write: repairs unique typed aliases used by facts and relations", () => {
+  forBackend((graph) => {
+    const result = commitGraphWritePlan(
+      graph,
+      {
+        entities: [
+          {
+            ref: "kingdom-of-ireland",
+            type: "world:place",
+            key: "Kingdom of Ireland",
+            value: "Kingdom of Ireland",
+          },
+        ],
+        facts: [
+          {
+            ref: "religion",
+            content: {
+              dimensionKey: "religion",
+              subjectRef: "world:place:kingdom-of-ireland",
+              value: "Christianity",
+            },
+          },
+        ],
+        relations: [
+          {
+            type: "core:about",
+            from: "religion",
+            to: "world:place:kingdom-of-ireland",
+          },
+        ],
+      },
+      aliceCtx,
+    );
+
+    const slot = graph.getNode(result.captures[0]?.dimensionId as string);
+    assert.equal(slot?.attributes.subjectRef, result.refs["kingdom-of-ireland"]);
+    assert.equal(graph.queryEdges({ type: "core:about" })[0]?.to, result.refs["kingdom-of-ireland"]);
+  });
+});
+
+test("graph write: reuses a unique acronym identity but not a broader place name", () => {
+  forBackend((graph) => {
+    const usa = commitGraphWritePlan(
+      graph,
+      {
+        entities: [
+          {
+            ref: "country",
+            type: "world:country",
+            key: "United States of America",
+            value: "United States of America",
+            scope: "global",
+          },
+        ],
+        facts: [],
+        relations: [],
+      },
+      aliceCtx,
+    );
+    const acronym = commitGraphWritePlan(
+      graph,
+      {
+        entities: [
+          { ref: "country", type: "world:country", key: "USA", value: "USA", scope: "global" },
+        ],
+        facts: [],
+        relations: [],
+      },
+      aliceCtx,
+    );
+    assert.equal(acronym.refs.country, usa.refs.country);
+
+    const washington = commitGraphWritePlan(
+      graph,
+      {
+        entities: [
+          { ref: "place", type: "world:place", key: "Washington", scope: "global" },
+        ],
+        facts: [],
+        relations: [],
+      },
+      aliceCtx,
+    );
+    const dc = commitGraphWritePlan(
+      graph,
+      {
+        entities: [
+          { ref: "place", type: "world:place", key: "Washington, D.C.", scope: "global" },
+        ],
+        facts: [],
+        relations: [],
+      },
+      aliceCtx,
+    );
+    assert.notEqual(dc.refs.place, washington.refs.place);
+  });
+});
+
+test("graph write: a later batch may reference one uniquely stored entity by key", () => {
+  forBackend((graph) => {
+    const first = commitGraphWritePlan(
+      graph,
+      {
+        entities: [
+          {
+            ref: "musician",
+            type: "world:person",
+            key: "michael-mantler",
+            value: "Michael Mantler",
+          },
+        ],
+        facts: [],
+        relations: [],
+      },
+      aliceCtx,
+    );
+    const later = commitGraphWritePlan(
+      graph,
+      {
+        entities: [],
+        facts: [
+          {
+            ref: "genre",
+            content: {
+              dimensionKey: "musicGenre",
+              subjectRef: "michael-mantler",
+              value: "post-punk",
+            },
+          },
+        ],
+        relations: [
+          { type: "core:about", from: "genre", to: "michael-mantler" },
+        ],
+      },
+      { ...aliceCtx, source_refs: ["session:later"] },
+    );
+
+    const slot = graph.getNode(later.captures[0]?.dimensionId as string);
+    assert.equal(slot?.attributes.subjectRef, first.refs.musician);
+    assert.equal(graph.queryEdges({ type: "core:about" })[0]?.to, first.refs.musician);
+  });
+});
+
 test("graph write: a failed relation rolls the whole plan back", () => {
   forBackend((graph) => {
     const bad = hawaiiPlan();

@@ -10,7 +10,12 @@ import { scopesEqual } from "../model/store.js";
 import type { DimensionNode, GraphNode, NamespacedType, Scope, StatementNode } from "../model/types.js";
 import type { CaptureContent } from "./capture.js";
 import { AgentError } from "./errors.js";
-import type { EntityDraft, GraphWritePlan, RelationDraft } from "./graph-write.js";
+import {
+  canonicalEntityKey,
+  type EntityDraft,
+  type GraphWritePlan,
+  type RelationDraft,
+} from "./graph-write.js";
 import { parseJsonReply, type LlmDriver } from "./llm-driver.js";
 import type { KnownDimension } from "./prompt.js";
 import { SCOPE_OWNER_SUBJECT, slotSubjectLabel, slotSubjectRef } from "./slots.js";
@@ -78,10 +83,11 @@ export async function runGraphEnrichment(input: GraphEnrichmentInput): Promise<G
     return { entities: [], facts: [], relations: [], warnings: [] };
   }
 
-  const hints = entityHintsOf(
+  const hints = relevantEntityHintsOf(
     input.graph,
+    input.text,
+    input.maxEntityHints ?? 10,
     input.scope,
-    input.maxEntityHints ?? 40,
   );
   const prompt = buildGraphEnrichmentPrompt({
     text: input.text,
@@ -322,21 +328,44 @@ function normalizeRelationDraft(raw: unknown, refs: ReadonlySet<string>): Relati
   };
 }
 
-function entityHintsOf(graph: GraphStore, scope: Scope | undefined, limit: number): EntityHint[] {
-  const hints: EntityHint[] = [];
+/** Return only entities whose existing labels overlap the current input.
+ * This gives the existing extraction call useful reuse candidates without a
+ * second model call or a growing dump of unrelated graph nodes. */
+export function relevantEntityHintsOf(
+  graph: GraphStore,
+  text: string,
+  limit = 10,
+  scope?: Scope,
+): EntityHint[] {
+  const query = canonicalEntityKey(text);
+  const queryTokens = new Set(keyTokens(text));
+  const scored: Array<{ hint: EntityHint; score: number; index: number }> = [];
+  let index = 0;
   for (const node of graph.queryNodes({})) {
     if (node.type === "core:dimension" || node.type === "core:statement" || !node.key) continue;
     const kind = entityScopeKind(node, scope);
     if (!kind) continue;
-    hints.push({
+    const labels = [node.key, ...(typeof node.value === "string" ? [node.value] : [])];
+    let score = 0;
+    for (const label of labels) {
+      const canonical = canonicalEntityKey(label);
+      if (canonical.length >= 3 && query.includes(canonical)) score = Math.max(score, 12);
+      const overlap = [...keyTokens(label)].filter((token) => queryTokens.has(token)).length;
+      score = Math.max(score, overlap * 3);
+    }
+    if (score === 0) continue;
+    scored.push({ hint: {
       type: node.type,
       key: node.key,
       ...(node.value !== undefined ? { value: node.value } : {}),
       scope: kind,
-    });
-    if (hints.length >= limit) break;
+    }, score, index });
+    index += 1;
   }
-  return hints;
+  return scored
+    .sort((left, right) => right.score - left.score || right.index - left.index)
+    .slice(0, Math.max(0, limit))
+    .map(({ hint }) => hint);
 }
 
 function dimensionHintsOf(

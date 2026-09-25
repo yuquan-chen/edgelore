@@ -6,7 +6,7 @@
 // Statement storage primitive. Constraint proposals stay on their governed
 // path and are deliberately not authored by this writer.
 
-import type { FactNodeState, NamespacedType, Scope } from "../model/types.js";
+import type { FactNodeState, GraphNode, NamespacedType, Scope } from "../model/types.js";
 import type { GraphStore } from "../model/store.js";
 import { scopesEqual } from "../model/store.js";
 import { capture, type CaptureContent, type CaptureContext, type CaptureResult } from "./capture.js";
@@ -59,7 +59,7 @@ export interface GraphWriteResult {
   createdEdgeIds: string[];
 }
 
-function validatePlan(plan: GraphWritePlan): void {
+function validatePlan(plan: GraphWritePlan, graph: GraphStore): void {
   const refs = new Set<string>();
   const addRef = (ref: string, label: string) => {
     if (!ref) throw new AgentError(`${label}.ref must be non-empty`);
@@ -72,10 +72,10 @@ function validatePlan(plan: GraphWritePlan): void {
   }
   for (const fact of plan.facts) addRef(fact.ref, "fact");
   for (const relation of plan.relations) {
-    if (!refs.has(relation.from)) {
+    if (!refs.has(relation.from) && !graph.getNode(relation.from)) {
       throw new AgentError(`relation ${relation.type} has unknown from ref: ${relation.from}`);
     }
-    if (!refs.has(relation.to)) {
+    if (!refs.has(relation.to) && !graph.getNode(relation.to)) {
       throw new AgentError(`relation ${relation.type} has unknown to ref: ${relation.to}`);
     }
   }
@@ -97,19 +97,171 @@ export function canonicalEntityKey(key: string): string {
     .replace(/^-+|-+$/gu, "");
 }
 
+function referenceAliases(draft: EntityDraft): string[] {
+  const values = [draft.ref, draft.key];
+  if (typeof draft.value === "string") values.push(draft.value);
+  const aliases = new Set<string>();
+  for (const value of values) {
+    const canonical = canonicalEntityKey(value);
+    if (canonical) aliases.add(canonical);
+    for (const prefix of [`${draft.type}:`, `${draft.type}/`]) {
+      if (value.toLocaleLowerCase("en-US").startsWith(prefix.toLocaleLowerCase("en-US"))) {
+        const withoutType = canonicalEntityKey(value.slice(prefix.length));
+        if (withoutType) aliases.add(withoutType);
+      }
+    }
+  }
+  const key = canonicalEntityKey(draft.key);
+  aliases.add(canonicalEntityKey(`${draft.type}:${key}`));
+  aliases.add(canonicalEntityKey(`${draft.type}/${key}`));
+  return [...aliases].filter(Boolean);
+}
+
+/** Models sometimes spell one plan-local reference as `place`, `place-key`,
+ * or `world:place:place-key` inside the same JSON object. Resolve only a
+ * unique alias; ambiguity is deliberately left as an error. */
+function storedEntityByReference(
+  graph: GraphStore,
+  ref: string,
+  contextScope?: Scope,
+): GraphNode | undefined {
+  const matches = graph.queryNodes({}).filter((node) => {
+    if (node.type === "core:dimension" || node.type === "core:statement" || !node.key) return false;
+    if (!scopesEqual(node.scope, contextScope) && !scopesEqual(node.scope, undefined)) return false;
+    const requested = canonicalEntityKey(ref);
+    const key = canonicalEntityKey(node.key);
+    const aliases = [
+      key,
+      canonicalEntityKey(`${node.type}:${key}`),
+      canonicalEntityKey(`${node.type}/${key}`),
+      ...(typeof node.value === "string" ? [canonicalEntityKey(node.value)] : []),
+    ];
+    return aliases.includes(requested);
+  });
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function normalizePlanReferences(
+  plan: GraphWritePlan,
+  graph: GraphStore,
+  contextScope?: Scope,
+): GraphWritePlan {
+  const declaredRefs = new Set([
+    ...plan.entities.map((entity) => entity.ref),
+    ...plan.facts.map((fact) => fact.ref),
+  ]);
+  const aliases = new Map<string, Set<string>>();
+  for (const entity of plan.entities) {
+    for (const alias of referenceAliases(entity)) {
+      const refs = aliases.get(alias) ?? new Set<string>();
+      refs.add(entity.ref);
+      aliases.set(alias, refs);
+    }
+  }
+  const resolve = (ref: string): string => {
+    if (declaredRefs.has(ref) || ref === SCOPE_OWNER_SUBJECT) return ref;
+    const matches = aliases.get(canonicalEntityKey(ref));
+    if (matches?.size === 1) return [...matches][0] as string;
+    return storedEntityByReference(graph, ref, contextScope)?.id ?? ref;
+  };
+  return {
+    entities: plan.entities,
+    facts: plan.facts.map((fact) => ({
+      ...fact,
+      content: fact.content.subjectRef
+        ? { ...fact.content, subjectRef: resolve(fact.content.subjectRef) }
+        : fact.content,
+    })),
+    relations: plan.relations.map((relation) => ({
+      ...relation,
+      from: resolve(relation.from),
+      to: resolve(relation.to),
+    })),
+  };
+}
+
+const ACRONYM_STOP_WORDS = new Set(["a", "an", "and", "of", "the"]);
+
+function words(value: string): string[] {
+  return value
+    .normalize("NFKC")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLocaleLowerCase("en-US")
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+}
+
+function acronym(value: string): string | undefined {
+  const tokens = words(value).filter((token) => !ACRONYM_STOP_WORDS.has(token));
+  if (tokens.length < 2) return undefined;
+  return tokens.map((token) => [...token][0]).join("");
+}
+
+function entitySurfaces(value: Pick<EntityDraft, "ref" | "key" | "value"> | GraphNode): string[] {
+  const surfaces = new Set<string>();
+  if ("ref" in value) surfaces.add(value.ref);
+  if (value.key) surfaces.add(value.key);
+  if (typeof value.value === "string") surfaces.add(value.value);
+  return [...surfaces].filter(Boolean);
+}
+
+function isAcronymPair(left: string, right: string): boolean {
+  const leftCanonical = canonicalEntityKey(left).replace(/-/g, "");
+  const rightCanonical = canonicalEntityKey(right).replace(/-/g, "");
+  const leftAcronym = acronym(left);
+  const rightAcronym = acronym(right);
+  return (
+    (leftAcronym !== undefined && leftAcronym === rightCanonical) ||
+    (rightAcronym !== undefined && rightAcronym === leftCanonical)
+  );
+}
+
+function resolveExistingEntity(
+  graph: GraphStore,
+  draft: EntityDraft,
+  scope: Scope | undefined,
+): GraphNode | undefined {
+  const candidates = graph
+    .queryNodes({ type: draft.type })
+    .filter((node) => node.key !== undefined && scopesEqual(node.scope, scope));
+  const exact = candidates.filter(
+    (node) => canonicalEntityKey(node.key as string) === canonicalEntityKey(draft.key),
+  );
+  if (exact.length > 1) {
+    throw new AgentError(
+      `ambiguous entity identity for ${draft.type}:${draft.key} in the requested scope`,
+    );
+  }
+  if (exact[0]) return exact[0];
+
+  const draftSurfaces = entitySurfaces(draft);
+  const labelMatches = candidates.filter((node) => {
+    const nodeSurfaces = entitySurfaces(node);
+    return draftSurfaces.some((left) =>
+      nodeSurfaces.some(
+        (right) =>
+          canonicalEntityKey(left) === canonicalEntityKey(right) || isAcronymPair(left, right),
+      ),
+    );
+  });
+  if (labelMatches.length === 1) return labelMatches[0];
+  return undefined;
+}
+
 /**
  * Resolve and atomically commit one graph write plan.
  *
  * The LLM never supplies ids, provenance, or states for statements. Entity
- * identity is exact type + key + scope here; semantic candidate selection
- * belongs to EntityResolver before this boundary.
+ * reuse is conservative: type and scope are hard boundaries; exact labels or
+ * unique acronyms may match directly. Semantic similarity never auto-merges.
  */
 export function commitGraphWritePlan(
   graph: GraphStore,
-  plan: GraphWritePlan,
+  inputPlan: GraphWritePlan,
   ctx: CaptureContext,
 ): GraphWriteResult {
-  validatePlan(plan);
+  const plan = normalizePlanReferences(inputPlan, graph, ctx.scope);
+  validatePlan(plan, graph);
 
   return graph.transaction(() => {
     const refs: Record<string, string> = {};
@@ -125,20 +277,7 @@ export function commitGraphWritePlan(
       const scope = entityScope(draft, ctx.scope);
       const key = canonicalEntityKey(draft.key);
       if (!key) throw new AgentError(`entity "${draft.ref}" has no usable identity key`);
-      const matches = graph
-        .queryNodes({ type: draft.type })
-        .filter(
-          (node) =>
-            node.key !== undefined &&
-            canonicalEntityKey(node.key) === key &&
-            scopesEqual(node.scope, scope),
-        );
-      if (matches.length > 1) {
-        throw new AgentError(
-          `ambiguous entity identity for ${draft.type}:${draft.key} in the requested scope`,
-        );
-      }
-      const existing = matches[0];
+      const existing = resolveExistingEntity(graph, draft, scope);
       if (existing) {
         refs[draft.ref] = existing.id;
         continue;
@@ -195,8 +334,8 @@ export function commitGraphWritePlan(
     }
 
     for (const draft of plan.relations) {
-      const from = refs[draft.from];
-      const to = refs[draft.to];
+      const from = refs[draft.from] ?? (graph.getNode(draft.from) ? draft.from : undefined);
+      const to = refs[draft.to] ?? (graph.getNode(draft.to) ? draft.to : undefined);
       if (!from || !to) throw new AgentError(`unresolved relation refs: ${draft.from} -> ${draft.to}`);
       const duplicate = graph
         .queryEdges({ type: draft.type, from, to })

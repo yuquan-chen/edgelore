@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   normalizeGraphEnrichment,
+  relevantEntityHintsOf,
   runGraphEnrichment,
 } from "../../src/agent/graph-enrichment.js";
 import { commitGraphWritePlan } from "../../src/agent/graph-write.js";
@@ -53,6 +54,44 @@ function reply(): string {
     ],
   });
 }
+
+test("graph enrichment: entity hints are relevant and bounded", () => {
+  const graph = new MemoryGraph();
+  const provenance = {
+    created_by: "agent:test:1",
+    created_at: "2024-01-01T00:00:00.000Z",
+    source_refs: ["episode:test"],
+  };
+  graph.addNode({
+    type: "world:place",
+    key: "kingdom-of-ireland",
+    value: "Kingdom of Ireland",
+    scope: { owner_id: "actor:alice" },
+    ...provenance,
+  });
+  graph.addNode({
+    type: "world:place",
+    key: "paris",
+    value: "Paris",
+    scope: { owner_id: "actor:alice" },
+    ...provenance,
+  });
+  graph.addNode({
+    type: "world:person",
+    key: "alice",
+    value: "Alice",
+    scope: { owner_id: "actor:bob" },
+    ...provenance,
+  });
+
+  const hints = relevantEntityHintsOf(
+    graph,
+    "The Kingdom of Ireland retained its own parliament.",
+    1,
+    { owner_id: "actor:alice" },
+  );
+  assert.deepEqual(hints.map((hint) => hint.key), ["kingdom-of-ireland"]);
+});
 
 test("graph enrichment: collapses event-specific keys without rewriting facts", async () => {
   const graph = new MemoryGraph();

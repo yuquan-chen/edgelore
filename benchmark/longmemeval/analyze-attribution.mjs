@@ -20,6 +20,9 @@ const dataDir = join(here, "data");
 const tag = process.argv.includes("--tag")
   ? process.argv[process.argv.indexOf("--tag") + 1]
   : "v7-episode-graph-read-20260923";
+const verdictTag = process.argv.includes("--verdict-tag")
+  ? process.argv[process.argv.indexOf("--verdict-tag") + 1]
+  : tag;
 const dbPath = resolve(
   process.argv.includes("--db")
     ? process.argv[process.argv.indexOf("--db") + 1]
@@ -42,7 +45,9 @@ const hypotheses = new Map(
       return [row.question_id, row.hypothesis];
     }),
 );
-const verdicts = JSON.parse(readFileSync(join(dataDir, `judge-verdicts-${tag}.json`), "utf8"));
+const verdicts = JSON.parse(
+  readFileSync(join(dataDir, `judge-verdicts-${verdictTag}.json`), "utf8"),
+);
 
 function verdictFor(questionId, hypothesis) {
   const digest = createHash("sha256").update(hypothesis).digest("hex").slice(0, 12);
@@ -136,6 +141,7 @@ writeFileSync(
   JSON.stringify(
     {
       tag,
+      verdictTag,
       database: dbPath,
       generatedAt: new Date().toISOString(),
       note: lexicalOnly

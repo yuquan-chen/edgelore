@@ -553,6 +553,84 @@ test("runtime: long Episode evidence uses complete semantic units under the fixe
   assert.ok(evidence.every((line) => line.length <= 420), "metadata plus each semantic unit stays bounded");
 });
 
+test("runtime: ordinal questions recover the matching item from an assistant list", async () => {
+  const graph = new MemoryGraph();
+  const list = Array.from(
+    { length: 40 },
+    (_, index) => `${index + 1}. ${index === 26 ? "Sound effects (ambient, diegetic, non-diegetic)" : `Parameter ${index + 1}`}`,
+  ).join("\n");
+  archiveConversationEpisode(
+    graph,
+    [
+      { role: "user", content: "Give me 100 prompt parameters that influence your output." },
+      { role: "assistant", content: `Here is the requested list:\n${list}` },
+    ],
+    { created_by: "human:charles", source_ref: "s:parameters", createdAt: "2023-05-25" },
+  );
+  capture(
+    graph,
+    {
+      dimensionKey: "promptParameters",
+      value: "Requested and received a list of 100 prompt parameters",
+    },
+    { ...ctx, source_refs: ["s:parameters"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "You provided a list of 100 prompt parameters. What was the 27th parameter?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:parameters"],
+      maxEpisodeEvidenceLines: 3,
+    },
+  );
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /27\. Sound effects/);
+});
+
+test("runtime: exact assistant payload outranks the user request that produced it", async () => {
+  const graph = new MemoryGraph();
+  archiveConversationEpisode(
+    graph,
+    [
+      {
+        role: "user",
+        content: "Review the submission To Adapt or Not to Adapt? Real-Time Adaptation for Semantic Segmentation.",
+      },
+      {
+        role: "assistant",
+        content: "The experimental results report an average improvement in framerate of approximately 20% when using the Hardware-Aware Modular Training (HAMT) agent.",
+      },
+    ],
+    { created_by: "human:charles", source_ref: "s:hamt", createdAt: "2023-05-25" },
+  );
+  capture(
+    graph,
+    {
+      dimensionKey: "paperReviewTask",
+      value: "Reviewed the Real-Time Adaptation for Semantic Segmentation submission",
+    },
+    { ...ctx, source_refs: ["s:hamt"] },
+  );
+
+  const lines = await contextMemoriesViaRetrieval(
+    graph,
+    "What was the average improvement in framerate when using the HAMT agent?",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      scopeSessionIds: ["s:hamt"],
+      maxEpisodeEvidenceLines: 2,
+    },
+  );
+  const evidence = lines.filter((line) => line.startsWith("conversationEvidence")).join("\n");
+  assert.match(evidence, /approximately 20%/);
+});
+
 test("runtime: relative time prioritizes reported events in the matching Episode", async () => {
   const graph = new MemoryGraph();
   archiveConversationEpisode(
@@ -712,6 +790,27 @@ test("runtime: fallback (no in-scope members) tags lines as non-user-account", a
   });
   assert.match(lines[0] ?? "", /standMixerGift — 1 entry:/);
   assert.match(lines[1] ?? "", /\(non-user-account\)/);
+});
+
+test("runtime: over-budget fallback summaries keep the non-user-account tag", async () => {
+  const graph = new MemoryGraph();
+  for (let i = 0; i < 3; i++) {
+    capture(
+      graph,
+      { dimensionKey: "foreignSubscriptions", value: `subscription-${i}` },
+      { ...ctx, source_refs: ["s:foreign"] },
+    );
+  }
+  const lines = await contextMemoriesViaRetrieval(graph, "foreign subscriptions", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    scopeSessionIds: ["s:current"],
+    maxContextLines: 1,
+  });
+  assert.match(
+    lines[0] ?? "",
+    /foreignSubscriptions: 3 entries \(omitted — context budget\) \(non-user-account\)/,
+  );
 });
 
 test("runtime: in-scope members render without the non-user-account tag", async () => {

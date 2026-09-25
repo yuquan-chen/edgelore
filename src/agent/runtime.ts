@@ -396,7 +396,7 @@ function overlapCount(needles: ReadonlySet<string>, corpusTerms: ReadonlySet<str
 }
 
 function preferredEvidenceRole(query: string): "user" | "assistant" | undefined {
-  if (/\b(?:you|assistant)\b.{0,28}\b(?:said|told|mentioned|recommended|suggested|wrote|gave)\b/i.test(query)) {
+  if (/\b(?:you|assistant)\b.{0,28}\b(?:said|told|mentioned|recommended|suggested|wrote|gave|provided|produced|created|explained|listed)\b/i.test(query)) {
     return "assistant";
   }
   // "I'm looking back" / "remind me" is retrieval framing, not evidence
@@ -411,6 +411,15 @@ function preferredEvidenceRole(query: string): "user" | "assistant" | undefined 
 const NUMBER_WORD = "(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|hundred|thousand)";
 const NUMERIC_PAYLOAD_RE = new RegExp(`(?:\\d|\\b${NUMBER_WORD}\\b)`, "i");
 const NUMERIC_QUESTION_RE = /\b(?:how many|how much|number of|count of)\b/i;
+const ORDINAL_QUESTION_RE = /\b(\d+)(?:st|nd|rd|th)\b/i;
+
+function ordinalPayloadFit(query: string, content: string): number {
+  const ordinal = ORDINAL_QUESTION_RE.exec(query)?.[1];
+  if (!ordinal) return 0;
+  return new RegExp(`(?:^|\\n)\\s*(?:[-*+]\\s*)?${ordinal}[.)](?:\\s|$)`, "m").test(content)
+    ? 3
+    : 0;
+}
 
 function numericPayloadFit(
   query: string,
@@ -418,6 +427,8 @@ function numericPayloadFit(
   queryTerms: ReadonlySet<string>,
   unitTerms: ReadonlySet<string>,
 ): number {
+  const ordinalFit = ordinalPayloadFit(query, content);
+  if (ordinalFit > 0) return ordinalFit;
   if (!NUMERIC_QUESTION_RE.test(query) || !NUMERIC_PAYLOAD_RE.test(content)) return 0;
   if (overlapCount(queryTerms, unitTerms) === 0) return 0;
   const firstLine = content.split(/\r?\n/, 1)[0] ?? content;
@@ -730,8 +741,8 @@ function coldEpisodeEvidence(
         .filter((candidate) => candidate.score > 0)
         .sort(
           (a, b) =>
-            Number(b.turn.role === claim.role) - Number(a.turn.role === claim.role) ||
             b.score - a.score ||
+            Number(b.turn.role === claim.role) - Number(a.turn.role === claim.role) ||
             a.turnIndex - b.turnIndex ||
             a.unitIndex - b.unitIndex,
         );
@@ -1084,10 +1095,12 @@ export async function retrievalContext(
     const tail = overCap ? members.slice(members.length - tailN) : [];
     const gapCount = overCap ? members.length - headN - tailN : 0;
     const shownLines = head.length + tail.length + (gapCount > 0 ? 1 : 0);
+    const fallbackOut = scopeSet !== undefined && scoped.length === 0 && scopeSet.size > 0;
     if (lines.length + shownLines + 1 > maxLines) {
       // Over budget: degrade to a one-line summary — the COUNT survives even
       // when the entries do not (counting questions read the header).
-      lines.push(`${key}: ${members.length} entries (omitted — context budget)`);
+      const tag = fallbackOut ? " (non-user-account)" : "";
+      lines.push(`${key}: ${members.length} entries (omitted — context budget)${tag}`);
       continue;
     }
     lines.push(`${key} — ${members.length} ${members.length === 1 ? "entry" : "entries"}:`);
@@ -1096,7 +1109,6 @@ export async function retrievalContext(
     // tagged so the answering layer can keep them out of aggregates. Mixed
     // dimensions never reach here — when scoped members exist, only they are
     // rendered (untagged: they ARE the account).
-    const fallbackOut = scopeSet !== undefined && scoped.length === 0 && scopeSet.size > 0;
     const renderMember = (m: StatementNode) => {
       const speaker = m.saidBy === "assistant" ? " (assistant)" : "";
       const tag = fallbackOut ? " (non-user-account)" : "";

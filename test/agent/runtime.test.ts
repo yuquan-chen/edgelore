@@ -1051,7 +1051,7 @@ test("runtime: bounded graph traversal follows object Entities into their subjec
   );
   assert.deepEqual(
     result.claims.map((claim) => claim.via),
-    [["lexical"], ["graph:about:1"], ["graph:about:2"]],
+    [["lexical"], ["graph:about:2"], ["graph:about:3"]],
   );
 });
 

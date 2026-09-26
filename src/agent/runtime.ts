@@ -1172,11 +1172,11 @@ function aboutRelatedHits(
   const directIds = new Set(directHits.map((hit) => hit.statementId));
   const directDims = new Set(directHits.map((hit) => hit.dimensionId));
   const visitedEntities = new Set<string>();
-  let frontier = new Set<string>();
+  const directTargets = new Set<string>();
   for (const hit of directHits.slice(0, 6)) {
     for (const edge of graph.queryEdges({ type: "core:about", from: hit.statementId })) {
       if (config.scope !== undefined && !scopesEqual(edge.scope, config.scope)) continue;
-      frontier.add(edge.to);
+      directTargets.add(edge.to);
     }
   }
   const canonicalQuery = canonicalEntityKey(query);
@@ -1210,8 +1210,14 @@ function aboutRelatedHits(
     })
     .filter((candidate): candidate is { node: GraphNode; label: string } => Boolean(candidate.label))
     .sort((a, b) => b.label.length - a.label.length)
-    .slice(0, 6);
-  for (const anchor of entityAnchors) frontier.add(anchor.node.id);
+    .slice(0, 4);
+  // Explicitly named Entities are stronger anchors than objects reached from
+  // broad lexical hits. Mixing both frontiers lets unrelated high-overlap
+  // Claims steal the tiny graph budget from the coherent named-entity path.
+  let frontier =
+    entityAnchors.length > 0
+      ? new Set(entityAnchors.map((anchor) => anchor.node.id))
+      : directTargets;
   if (frontier.size === 0) return [];
 
   const dimensions = (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).filter(
@@ -1255,11 +1261,9 @@ function aboutRelatedHits(
       }
     }
 
-    const candidates = [...candidateIds]
-      .filter((id) => !seenStatements.has(id))
+    const traversable = [...candidateIds]
       .map((id) => graph.getNode(id))
       .filter((node): node is StatementNode => Boolean(node && node.type === "core:statement"))
-      .filter((statement) => !directDims.has(statement.dimension_id))
       .filter(
         (statement) => config.scope === undefined || scopesEqual(statement.scope, config.scope),
       )
@@ -1287,14 +1291,22 @@ function aboutRelatedHits(
           b.lexical - a.lexical ||
           b.statement.created_at.localeCompare(a.statement.created_at),
       );
-    if (candidates.length === 0) break;
+    if (traversable.length === 0) break;
+    const candidates = traversable.filter(
+      (candidate) =>
+        !seenStatements.has(candidate.statement.id) &&
+        !directDims.has(candidate.statement.dimension_id),
+    );
     const inScope = candidates.filter((candidate) => candidate.inScope);
     const layer = scopeSet && inScope.length > 0 ? inScope : candidates;
-    layers.push(layer);
+    if (layer.length > 0) layers.push(layer);
     for (const candidate of layer) seenStatements.add(candidate.statement.id);
 
+    const traversableInScope = traversable.filter((candidate) => candidate.inScope);
+    const expansionPool =
+      scopeSet && traversableInScope.length > 0 ? traversableInScope : traversable;
     const next = new Set<string>();
-    for (const candidate of layer.slice(0, beamWidth)) {
+    for (const candidate of expansionPool.slice(0, beamWidth)) {
       for (const edge of graph.queryEdges({ type: "core:about", from: candidate.statement.id })) {
         if (config.scope !== undefined && !scopesEqual(edge.scope, config.scope)) continue;
         if (!visitedEntities.has(edge.to)) next.add(edge.to);

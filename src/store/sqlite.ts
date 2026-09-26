@@ -77,13 +77,21 @@ interface DataRow {
  */
 export class SqliteGraph extends MemoryGraph {
   private db: DatabaseSync;
+  private readonly readOnly: boolean;
 
-  constructor(path: string) {
+  constructor(path: string, options: { readOnly?: boolean } = {}) {
     super();
-    this.db = new DatabaseSync(path);
-    this.db.exec("PRAGMA journal_mode = WAL");
-    this.db.exec(SCHEMA_SQL);
+    this.readOnly = options.readOnly ?? false;
+    this.db = new DatabaseSync(path, { readOnly: this.readOnly });
+    if (!this.readOnly) {
+      this.db.exec("PRAGMA journal_mode = WAL");
+      this.db.exec(SCHEMA_SQL);
+    }
     this.loadAll();
+  }
+
+  private assertWritable(): void {
+    if (this.readOnly) throw new Error("database opened in read-only mode");
   }
 
   /** Close the underlying database (tests / CLI shutdown). */
@@ -117,6 +125,7 @@ export class SqliteGraph extends MemoryGraph {
   // -------------------------------------------------------- write-through
 
   override addNode(input: AddNodeInput): GraphNode {
+    this.assertWritable();
     const n = super.addNode(input);
     const dimensionId = n.type === "core:statement" ? (n as StatementNode).dimension_id : null;
     this.db
@@ -128,6 +137,7 @@ export class SqliteGraph extends MemoryGraph {
   }
 
   override addEdge(input: AddEdgeInput): GraphEdge {
+    this.assertWritable();
     const e = super.addEdge(input);
     this.db
       .prepare(
@@ -138,12 +148,14 @@ export class SqliteGraph extends MemoryGraph {
   }
 
   override addConstraint(input: AddConstraintInput): Constraint {
+    this.assertWritable();
     const c = super.addConstraint(input);
     this.persistConstraint(c);
     return c;
   }
 
   override putEpisode(input: PutEpisodeInput): EpisodeRecord {
+    this.assertWritable();
     const episode = super.putEpisode(input);
     this.db
       .prepare("INSERT OR REPLACE INTO episodes (id, created_at, data) VALUES (?, ?, ?)")
@@ -152,6 +164,7 @@ export class SqliteGraph extends MemoryGraph {
   }
 
   override transitionNodeState(id: string, to: FactNodeState): GraphNode {
+    this.assertWritable();
     const n = super.transitionNodeState(id, to);
     this.db
       .prepare(
@@ -172,12 +185,14 @@ export class SqliteGraph extends MemoryGraph {
     to: ConstraintState,
     opts?: { approved_by?: string },
   ): Constraint {
+    this.assertWritable();
     const c = super.transitionConstraintState(id, to, opts);
     this.persistConstraint(c);
     return c;
   }
 
   override transaction<T>(fn: () => T): T {
+    this.assertWritable();
     const nodesBefore = structuredClone(this.nodes);
     const edgesBefore = structuredClone(this.edges);
     const constraintsBefore = structuredClone(this.constraints);
@@ -213,6 +228,7 @@ export class SqliteGraph extends MemoryGraph {
 
   /** Store (or replace) the vector for one node id. */
   putVector(nodeId: string, vector: number[]): void {
+    this.assertWritable();
     const blob = Buffer.from(new Float32Array(vector).buffer);
     this.db
       .prepare("INSERT OR REPLACE INTO embeddings (node_id, dim, vector) VALUES (?, ?, ?)")

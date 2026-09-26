@@ -10,7 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { SqliteGraph } from "../src/store/sqlite.js";
 import type { ExpressionNode } from "../src/model/types.js";
 
@@ -73,6 +73,30 @@ test("sqlite: fact-node state machine is enforced", () => {
     assert.equal(g.getNode(dim.id)?.state, "accepted");
     assert.throws(() => g.transitionNodeState(dim.id, "tentative"), /illegal fact-node transition/);
     g.close();
+  } finally {
+    cleanup();
+  }
+});
+
+test("sqlite: read-only explorer connection rejects writes and never creates a missing DB", () => {
+  const { path, cleanup } = tempDb();
+  try {
+    const writable = new SqliteGraph(path);
+    const { dimId } = seed(writable);
+    writable.close();
+
+    const readOnly = new SqliteGraph(path, { readOnly: true });
+    assert.equal(readOnly.getNode(dimId)?.type, "core:dimension");
+    assert.throws(
+      () => readOnly.addNode({ type: "core:dimension", key: "blocked", created_by: "human:test" }),
+      /read-only mode/,
+    );
+    readOnly.close();
+
+    const reopened = new SqliteGraph(path, { readOnly: true });
+    assert.equal(reopened.queryNodes({ type: "core:dimension" }).length, 1);
+    reopened.close();
+    assert.throws(() => new SqliteGraph(join(dirname(path), "missing.db"), { readOnly: true }));
   } finally {
     cleanup();
   }

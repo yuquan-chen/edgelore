@@ -57,10 +57,12 @@ See [`docs/`](docs/) for the specs:
   (dedup + conflict flagging, never silent overwrite).
 - **Hybrid retrieval** — vector + lexical (F1-balanced, anti-attractor) + RRF
   + graph expansion; dimension-grouped context where the graph itself supplies
-  entry counts; scope/date/state filters; bounded, cached for speed.
+    entry counts; scope/date/state filters; bounded, cached for speed.
 - **Conflict adjudication** — `resolve` (human), `autoresolve`
   (constraint-guided referee), `confirm` (promote assistant statements).
 - **Surfaces** — CLI + MCP server (8 tools, works with Claude Code / Codex).
+- **Memory Explorer** — local, read-only browser UI for Slots, Entities,
+  bounded neighborhoods, Claim provenance / Episode evidence, and conflicts.
 - **Evaluation harness** — seeded/reproducible LongMemEval runs, ingestion
   quality gate, shard merge with per-key reconciliation.
 
@@ -83,6 +85,17 @@ npm install
 npm test      # tsc + node --test (unit + contract tests)
 npm run build # emit dist/
 ```
+
+Start the local read-only Memory Explorer against an existing database:
+
+```bash
+edgelore ui --db ./edgelore.db
+# optional port override (default 4173)
+edgelore ui --db ./edgelore.db --port 4180
+```
+
+The UI binds only to `127.0.0.1`, opens SQLite in read-only mode, and serves
+bounded JSON endpoints and the page from the same process.
 
 ## License
 

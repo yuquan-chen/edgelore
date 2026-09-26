@@ -18,6 +18,7 @@ import { answerQuestion } from "./agent/ask.js";
 import { chatDriver, configFromEnv, decisionDriver, embeddingDriver, loadDotEnv, type EdgeloreConfig } from "./config.js";
 import type { AddConstraintInput, AddEdgeInput, AddNodeInput } from "./model/store.js";
 import type { DimensionNode, ExpressionNode, StatementNode } from "./model/types.js";
+import { startMemoryExplorer } from "./ui/server.js";
 
 /** Parse `--key value` pairs (value-less flags become "true"). */
 function parseFlags(args: string[]): Map<string, string> {
@@ -100,6 +101,16 @@ async function main(): Promise<void> {
   const pos = positionals(argv);
   const dbPath = flags.get("db") ?? "./edgelore.db";
 
+  if (pos[0] === "ui") {
+    const rawPort = flags.get("port") ?? "4173";
+    const port = Number(rawPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535)
+      throw new Error("--port must be an integer from 1 to 65535");
+    startMemoryExplorer(dbPath, port);
+    process.stdout.write(`Memory Explorer: http://localhost:${port}\n`);
+    return;
+  }
+
   // One env load + config resolution for the whole process; local-only
   // commands never touch cfg.llm/cfg.embedding, so they work with no .env.
   loadDotEnv(".env.local");
@@ -108,7 +119,7 @@ async function main(): Promise<void> {
   const [entity, action, target] = pos;
   if (!entity) {
     throw new Error(
-      "missing command (node|edge|constraint|evaluate|get|capture|remember|search|ask|conflicts|resolve|autoresolve|confirm|digest|mcp)",
+      "missing command (node|edge|constraint|evaluate|get|capture|remember|search|ask|conflicts|resolve|autoresolve|confirm|digest|mcp|ui)",
     );
   }
 
@@ -399,7 +410,7 @@ async function main(): Promise<void> {
 
       default:
         throw new Error(
-          `unknown command: ${entity} (node|edge|constraint|evaluate|get|capture|remember|search|ask|conflicts|resolve|autoresolve|confirm|digest|mcp)`,
+          `unknown command: ${entity} (node|edge|constraint|evaluate|get|capture|remember|search|ask|conflicts|resolve|autoresolve|confirm|digest|mcp|ui)`,
         );
     }
   } finally {

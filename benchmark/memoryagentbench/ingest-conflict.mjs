@@ -23,6 +23,7 @@ import {
   buildIntegratedGraphExtractionPrompt,
   capture,
   commitGraphWritePlan,
+  decisionDriver,
   embeddingDriver,
   normalizeBatchExtractionReply,
   normalizeIntegratedGraphExtractionReply,
@@ -117,6 +118,7 @@ const metadata = resume
       start_batch: startBatch,
       model: cfg.llm?.model ?? null,
       embedding_model: cfg.embedding?.model ?? null,
+      decision_model: resolveConflicts ? (cfg.decision?.model ?? null) : null,
       resolve_conflicts: resolveConflicts,
       started_at: new Date().toISOString(),
     };
@@ -146,6 +148,7 @@ const driver = requireChat(cfg, {
 const graph = new SqliteGraph(databasePath);
 const vectors = new SqliteVectorStore(graph);
 const embedder = cfg.embedding ? embeddingDriver(cfg) : undefined;
+const reconcilerDecision = resolveConflicts && cfg.decision ? decisionDriver(cfg) : undefined;
 const checkpoint = existsSync(checkpointPath)
   ? JSON.parse(readFileSync(checkpointPath, "utf8"))
   : { done: [], captures: 0, resolved_conflicts: 0, escalated_conflicts: 0 };
@@ -264,6 +267,7 @@ for (let batchIndex = startBatch; batchIndex < batches.length; batchIndex += 1) 
     const resolution = resolveConflicts
       ? await resolveCapturedConflicts(graph, captures, driver, {
           resolvedBy: "agent:edgelore:reconciler",
+          ...(reconcilerDecision ? { decision: reconcilerDecision } : {}),
         })
       : { attempted: 0, resolved: 0, escalated: 0, cases: [] };
     totalCaptures += captures.length;

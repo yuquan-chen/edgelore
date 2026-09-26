@@ -18,6 +18,7 @@ import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   SqliteGraph,
+  decisionDriver,
   reconcileStatement,
   usageTotals,
 } from "../../dist/src/index.js";
@@ -36,8 +37,21 @@ const limit = Number(option("--limit", "10"));
 if (!Number.isInteger(limit) || limit <= 0) {
   throw new Error("--limit must be a positive integer");
 }
+const decisionMinConfidence = Number(option("--decision-min-confidence", "0.85"));
+if (
+  !Number.isFinite(decisionMinConfidence) ||
+  decisionMinConfidence < 0 ||
+  decisionMinConfidence > 1
+) {
+  throw new Error("--decision-min-confidence must be between 0 and 1");
+}
 const dbPath = resolve(option("--db", join(dataDir, "memory-graph-smoke.db")));
 const outputPath = resolve(option("--out", join(dataDir, "reconcile-dry-run.json")));
+const requestedStatementIds = (option("--statement-ids", "") ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+const sameDimensionOnly = args.includes("--same-dimension-only");
 const { cfg } = boot();
 const forcedThinking = /glm-5\.3/i.test(cfg.llm?.model ?? "");
 const driver = requireChat(cfg, {
@@ -47,6 +61,7 @@ const driver = requireChat(cfg, {
     ? { reasoning_effort: "low" }
     : { thinking: { type: "disabled" } },
 });
+const decision = cfg.decision ? decisionDriver(cfg) : undefined;
 const graph = new SqliteGraph(dbPath);
 
 function graphFingerprint() {
@@ -150,7 +165,22 @@ function relationDenseSubjects() {
 }
 
 const before = graphFingerprint();
-const selected = relationDenseSubjects();
+const selected =
+  requestedStatementIds.length > 0
+    ? requestedStatementIds.map((id) => {
+        const statement = graph.getNode(id);
+        if (!statement || statement.type !== "core:statement") {
+          throw new Error(`requested Statement not found: ${id}`);
+        }
+        return {
+          statement,
+          sameDimension: 0,
+          sharedAbout: 0,
+          contradictions: 0,
+          score: 0,
+        };
+      })
+    : relationDenseSubjects();
 const results = [];
 console.log(`FactReconciler dry run: ${selected.length} real Statement groups from ${dbPath}`);
 
@@ -159,6 +189,9 @@ for (const [index, selectedSubject] of selected.entries()) {
   try {
     const result = await reconcileStatement(graph, subject.id, {
       driver,
+      ...(decision ? { decision } : {}),
+      decisionMinConfidence,
+      sameDimensionOnly,
       maxCandidates: 12,
     });
     const proposals = result.proposals.map((proposal) => {
@@ -178,6 +211,7 @@ for (const [index, selectedSubject] of selected.entries()) {
       },
       proposals,
       unresolvedIds: result.unresolvedIds,
+      readRequests: result.readRequests,
     });
     const summary = proposals.map((proposal) => proposal.relation).join(", ") || "no proposals";
     console.log(
@@ -207,9 +241,17 @@ if (after !== before) {
 }
 
 const relationCounts = {};
+const readCounts = {};
+const routeCounts = { jev: 0, chat: 0, deterministic: 0 };
 for (const result of results) {
   for (const proposal of result.proposals ?? []) {
     relationCounts[proposal.relation] = (relationCounts[proposal.relation] ?? 0) + 1;
+    if (proposal.basis === "deterministic") routeCounts.deterministic += 1;
+    else if (proposal.reason.startsWith("Jev classified")) routeCounts.jev += 1;
+    else routeCounts.chat += 1;
+  }
+  for (const request of result.readRequests ?? []) {
+    readCounts[request.tool] = (readCounts[request.tool] ?? 0) + 1;
   }
 }
 const report = {
@@ -218,6 +260,8 @@ const report = {
   selectedGroups: selected.length,
   graphUnchanged: true,
   relationCounts,
+  routeCounts,
+  readCounts,
   usage: usageTotals(),
   results,
 };
@@ -225,6 +269,8 @@ writeFileSync(outputPath, `${JSON.stringify(report, null, 2)}\n`);
 graph.close();
 
 console.log(`relations: ${JSON.stringify(relationCounts)}`);
+console.log(`routes: ${JSON.stringify(routeCounts)}`);
+console.log(`read-only tools: ${JSON.stringify(readCounts)}`);
 console.log(`graph unchanged: yes`);
 console.log(
   `API usage: ${report.usage.calls} calls, ${report.usage.inputTokens} input tokens, ${report.usage.outputTokens} output tokens, ${report.usage.errors} errors`,

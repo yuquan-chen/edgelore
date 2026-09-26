@@ -32,6 +32,7 @@ import { runExtract } from "./extract.js";
 import type { KnownDimension } from "./prompt.js";
 import { slotLabel } from "./slots.js";
 import type { LlmDriver } from "./llm-driver.js";
+import type { DecisionDriver } from "./decision.js";
 import type { EmbeddingDriver } from "./embedding-driver.js";
 import { scanEventCandidates } from "./triggers.js";
 import {
@@ -92,6 +93,10 @@ export interface ProcessTurnOptions {
 export interface ConflictResolutionConfig {
   /** Defaults to the gate/extract driver. */
   driver?: LlmDriver;
+  /** Optional fast typed classifier. Low-confidence results fall back to driver. */
+  decision?: DecisionDriver;
+  /** Minimum typed-classifier confidence (default 0.85). */
+  decisionMinConfidence?: number;
   /** Audit principal recorded on applied supersession edges. */
   resolvedBy: string;
   /** Safe-apply threshold (default 0.85). */
@@ -344,6 +349,11 @@ export async function resolveCapturedConflicts(
     try {
       const reconciliation = await reconcileStatement(graph, statementId, {
         driver,
+        sameDimensionOnly: true,
+        ...(config.decision ? { decision: config.decision } : {}),
+        ...(config.decisionMinConfidence !== undefined
+          ? { decisionMinConfidence: config.decisionMinConfidence }
+          : {}),
         ...(config.maxCandidates !== undefined
           ? { maxCandidates: config.maxCandidates }
           : {}),

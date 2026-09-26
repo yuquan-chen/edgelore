@@ -12,12 +12,37 @@ import {
 } from "../../src/agent/fact-reconciler.js";
 import { capture } from "../../src/agent/capture.js";
 import { listConflicts } from "../../src/agent/conflicts.js";
+import type {
+  ChoiceDecision,
+  ChoiceQuestion,
+  DecisionDriver,
+} from "../../src/agent/decision.js";
 import { MockDriver } from "../../src/agent/llm-driver.js";
 import { MemoryGraph, type GraphStore } from "../../src/model/store.js";
 import type { DimensionNode, StatementNode } from "../../src/model/types.js";
 import { SqliteGraph } from "../../src/store/sqlite.js";
 
 const actorScope = { owner_id: "actor:alice" };
+
+function fakeDecision(
+  choose: (
+    state: string,
+    questions: Record<string, ChoiceQuestion>,
+  ) => Promise<Record<string, ChoiceDecision>>,
+): DecisionDriver {
+  return {
+    async noul(): Promise<number> {
+      return 0;
+    },
+    async choice(): Promise<string> {
+      return "";
+    },
+    async noulFanOut(): Promise<Record<string, number>> {
+      return {};
+    },
+    choiceFanOut: choose,
+  };
+}
 
 function addDimension(
   graph: GraphStore,
@@ -130,6 +155,109 @@ test("fact reconciler: Agent classification is a proposal and cannot mutate the 
   assert.equal(graph.getNode(fresh.id)?.state, "accepted");
 });
 
+test("fact reconciler: high-confidence Jev choice skips the chat fallback", async () => {
+  const graph = new MemoryGraph();
+  const dimension = addDimension(graph, "homeCity", "single");
+  const old = addStatement(graph, dimension, "Shenzhen", "accepted", "2024-01-01");
+  const fresh = addStatement(graph, dimension, "Shanghai", "tentative", "2024-02-01");
+  const chat = new MockDriver(["unused"]);
+  let calls = 0;
+  const decision = fakeDecision(async (state, questions) => {
+    calls += 1;
+    assert.match(state, /Shenzhen/);
+    assert.match(state, /Shanghai/);
+    assert.equal(Object.keys(questions).length, 1);
+    return {
+      candidate_0: { choice: "supersedes", confidence: 0.96 },
+    };
+  });
+
+  const result = await reconcileStatement(graph, fresh.id, {
+    decision,
+    driver: chat,
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(chat.remaining, 1);
+  assert.equal(result.proposals[0]?.objectId, old.id);
+  assert.equal(result.proposals[0]?.relation, "supersedes");
+  assert.equal(result.proposals[0]?.confidence, 0.96);
+  assert.deepEqual(result.unresolvedIds, []);
+  assert.equal(graph.getNode(old.id)?.state, "accepted");
+  assert.equal(graph.getNode(fresh.id)?.state, "tentative");
+});
+
+test("fact reconciler: uncertain Jev choice falls back to the read-capable Agent", async () => {
+  const graph = new MemoryGraph();
+  const dimension = addDimension(graph, "homeCity", "single");
+  const old = addStatement(graph, dimension, "Shenzhen", "accepted", "2024-01-01");
+  const fresh = addStatement(graph, dimension, "Shanghai", "tentative", "2024-02-01");
+  const decision = fakeDecision(async () => ({
+    candidate_0: { choice: "supersedes", confidence: 0.62 },
+  }));
+  const chat = new MockDriver([
+    JSON.stringify({
+      decisions: [
+        {
+          statementId: old.id,
+          relation: "supersedes",
+          confidence: 0.95,
+          reason: "later value from the same authority and speaker",
+        },
+      ],
+    }),
+  ]);
+
+  const result = await reconcileStatement(graph, fresh.id, {
+    decision,
+    driver: chat,
+  });
+
+  assert.equal(chat.remaining, 0);
+  assert.equal(result.proposals[0]?.relation, "supersedes");
+  assert.equal(result.proposals[0]?.confidence, 0.95);
+  assert.deepEqual(result.unresolvedIds, []);
+});
+
+test("fact reconciler: conflict mode excludes related Claims outside the exact Slot", async () => {
+  const graph = new MemoryGraph();
+  const city = addDimension(graph, "homeCity", "single");
+  const job = addDimension(graph, "employer", "single");
+  const oldCity = addStatement(graph, city, "Shenzhen", "accepted", "2024-01-01");
+  const relatedJob = addStatement(graph, job, "Acme", "accepted", "2024-01-15");
+  const fresh = addStatement(graph, city, "Shanghai", "tentative", "2024-02-01");
+  const person = graph.addNode({
+    type: "world:person",
+    value: "Alice",
+    state: "accepted",
+    scope: actorScope,
+    created_by: "agent:test:1",
+  });
+  for (const statement of [fresh, oldCity, relatedJob]) {
+    graph.addEdge({
+      type: "core:about",
+      from: statement.id,
+      to: person.id,
+      scope: actorScope,
+      created_by: "agent:test:1",
+    });
+  }
+  let questionCount = 0;
+  const decision = fakeDecision(async (_state, questions) => {
+    questionCount = Object.keys(questions).length;
+    return { candidate_0: { choice: "supersedes", confidence: 0.96 } };
+  });
+
+  const result = await reconcileStatement(graph, fresh.id, {
+    decision,
+    sameDimensionOnly: true,
+  });
+
+  assert.equal(questionCount, 1);
+  assert.equal(result.proposals[0]?.objectId, oldCity.id);
+  assert.ok(!result.proposals.some((proposal) => proposal.objectId === relatedJob.id));
+});
+
 test("fact reconciler: prompt fixes relation direction as new Statement to candidate", async () => {
   const graph = new MemoryGraph();
   const dimension = addDimension(graph, "mortgagePreapproval");
@@ -159,9 +287,171 @@ test("fact reconciler: prompt fixes relation direction as new Statement to candi
   assert.match(prompt, /Candidate contains details omitted by the New Statement/);
   assert.match(prompt, /Judge memory truth relative to provenance/);
   assert.match(prompt, /"dimensionId":/);
+  assert.match(prompt, /"propertyKey":"mortgagePreapproval"/);
+  assert.match(prompt, /"subjectRef":"\$scopeOwner"/);
   assert.match(prompt, /"createdBy":"agent:test:1"/);
   assert.match(prompt, /"sourceRefs":\["session:test"\]/);
   assert.match(prompt, /"scope":\{"owner_id":"actor:alice"\}/);
+});
+
+test("fact reconciler: Agent can request bounded read-only evidence before deciding", async () => {
+  const graph = new MemoryGraph();
+  graph.putEpisode({
+    id: "session:test",
+    turns: [
+      {
+        role: "user",
+        content: "I used to live in Shenzhen. I have now moved to Shanghai.",
+      },
+    ],
+    created_by: "human:alice",
+    scope: actorScope,
+  });
+  const dimension = addDimension(graph, "homeCity", "single");
+  const old = addStatement(
+    graph,
+    dimension,
+    "Shenzhen",
+    "accepted",
+    "2024-01-01T00:00:00.000Z",
+  );
+  const fresh = addStatement(
+    graph,
+    dimension,
+    "Shanghai",
+    "tentative",
+    "2024-02-01T00:00:00.000Z",
+  );
+  const prompts: string[] = [];
+  const replies = [
+    JSON.stringify({
+      reads: [{ tool: "episode_evidence", statementId: old.id }],
+    }),
+    JSON.stringify({
+      decisions: [
+        {
+          statementId: old.id,
+          relation: "supersedes",
+          confidence: 0.97,
+          reason: "the source explicitly says the user moved",
+        },
+      ],
+    }),
+  ];
+  const driver = {
+    async complete(prompt: string): Promise<string> {
+      prompts.push(prompt);
+      const reply = replies.shift();
+      if (!reply) throw new Error("unexpected extra Agent call");
+      return reply;
+    },
+  };
+
+  const result = await reconcileStatement(graph, fresh.id, { driver });
+
+  assert.equal(prompts.length, 2);
+  assert.deepEqual(result.readRequests, [
+    { tool: "episode_evidence", statementId: old.id },
+  ]);
+  assert.equal(result.proposals[0]?.relation, "supersedes");
+  assert.match(prompts[1] ?? "", /READ-ONLY requests/);
+  assert.match(prompts[1] ?? "", /moved to Shanghai/);
+  assert.equal(graph.getNode(old.id)?.state, "accepted");
+  assert.equal(graph.getNode(fresh.id)?.state, "tentative");
+  assert.equal(graph.queryEdges({ type: "core:supersedes" }).length, 0);
+});
+
+test("fact reconciler: unsupported write-like requests cannot access the graph", async () => {
+  const graph = new MemoryGraph();
+  const dimension = addDimension(graph, "homeCity", "single");
+  const old = addStatement(graph, dimension, "Shenzhen");
+  const fresh = addStatement(graph, dimension, "Shanghai", "tentative");
+  const driver = new MockDriver([
+    JSON.stringify({
+      reads: [{ tool: "transition_state", statementId: old.id }],
+    }),
+  ]);
+
+  await assert.rejects(
+    () => reconcileStatement(graph, fresh.id, { driver }),
+    /field "decisions" must be an array/,
+  );
+  assert.equal(graph.getNode(old.id)?.state, "accepted");
+  assert.equal(graph.getNode(fresh.id)?.state, "tentative");
+  assert.equal(graph.queryEdges({}).length, 0);
+});
+
+test("fact reconciler: read-only local graph never crosses scope", async () => {
+  const graph = new MemoryGraph();
+  const person = graph.addNode({
+    type: "world:person",
+    key: "shared-person",
+    created_by: "agent:test:1",
+  });
+  const visible = graph.addNode({
+    type: "world:organization",
+    key: "visible-company",
+    scope: actorScope,
+    created_by: "agent:test:1",
+  });
+  const hidden = graph.addNode({
+    type: "world:organization",
+    key: "bob-secret-company",
+    scope: { owner_id: "actor:bob" },
+    created_by: "agent:test:1",
+  });
+  graph.addEdge({
+    type: "world:employed_by",
+    from: person.id,
+    to: visible.id,
+    scope: actorScope,
+    created_by: "agent:test:1",
+  });
+  graph.addEdge({
+    type: "world:employed_by",
+    from: person.id,
+    to: hidden.id,
+    scope: { owner_id: "actor:bob" },
+    created_by: "agent:test:1",
+  });
+  const dimension = graph.addNode({
+    type: "core:dimension",
+    key: "employer",
+    cardinality: "single",
+    state: "conflict",
+    scope: actorScope,
+    attributes: { propertyKey: "employer", subjectRef: person.id },
+    created_by: "agent:test:1",
+  }) as DimensionNode;
+  const old = addStatement(graph, dimension, "Old Company");
+  const fresh = addStatement(graph, dimension, "New Company", "tentative");
+  const prompts: string[] = [];
+  const replies = [
+    JSON.stringify({ reads: [{ tool: "local_graph", statementId: old.id }] }),
+    JSON.stringify({
+      decisions: [
+        {
+          statementId: old.id,
+          relation: "contradicts",
+          confidence: 0.8,
+          reason: "the relationship remains ambiguous",
+        },
+      ],
+    }),
+  ];
+  const driver = {
+    async complete(prompt: string): Promise<string> {
+      prompts.push(prompt);
+      const reply = replies.shift();
+      if (!reply) throw new Error("unexpected extra Agent call");
+      return reply;
+    },
+  };
+
+  await reconcileStatement(graph, fresh.id, { driver });
+
+  assert.match(prompts[1] ?? "", /visible-company/);
+  assert.doesNotMatch(prompts[1] ?? "", /bob-secret-company/);
 });
 
 test("fact reconciler: malformed Agent rows are ignored and remain unresolved", async () => {

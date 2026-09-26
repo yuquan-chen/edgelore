@@ -7,10 +7,18 @@
 
 import type { GraphStore } from "../model/store.js";
 import { scopesEqual } from "../model/store.js";
-import type { DimensionNode, GraphEdge, StatementNode } from "../model/types.js";
+import type {
+  Constraint,
+  DimensionNode,
+  GraphEdge,
+  GraphNode,
+  StatementNode,
+} from "../model/types.js";
 import { valuesEqual } from "./capture.js";
+import type { DecisionDriver } from "./decision.js";
 import { AgentError } from "./errors.js";
 import { parseJsonReply, type LlmDriver } from "./llm-driver.js";
+import { SCOPE_OWNER_SUBJECT, slotPropertyKey, slotSubjectRef } from "./slots.js";
 
 export type FactRelationKind =
   | "duplicate"
@@ -38,11 +46,34 @@ export interface ReconcileResult {
   /** Candidate ids left undecided when no Agent driver was supplied or when
    * the Agent omitted a pair. Nothing is guessed. */
   unresolvedIds: string[];
+  /** Read-only context selected by the Agent before its final decision. */
+  readRequests: FactReconciliationReadRequest[];
 }
 
 export interface ReconcileOptions {
+  /** Fast typed classifier (for example Jev). Uncertain rows fall through to driver. */
+  decision?: DecisionDriver;
   driver?: LlmDriver;
   maxCandidates?: number;
+  /** Restrict candidates to the exact Slot. Conflict resolution enables this. */
+  sameDimensionOnly?: boolean;
+  /** Minimum Jev confidence accepted as a proposal. Defaults to 0.85. */
+  decisionMinConfidence?: number;
+  /** Zero disables self-directed reads. Defaults to 3 and is capped at 3. */
+  maxReadRequests?: number;
+}
+
+export type FactReconciliationReadTool =
+  | "slot_context"
+  | "episode_evidence"
+  | "local_graph"
+  | "relation_history"
+  | "constraint_summary";
+
+export interface FactReconciliationReadRequest {
+  tool: FactReconciliationReadTool;
+  /** Must be one of the supplied Candidate statement ids. */
+  statementId: string;
 }
 
 export interface ApplyFactRelationOptions {
@@ -102,6 +133,7 @@ export async function reconcileStatement(
     graph,
     subject,
     options.maxCandidates ?? 12,
+    options.sameDimensionOnly ?? false,
   );
   const proposals: FactRelationProposal[] = [];
   const ambiguous: ReconciliationCandidate[] = [];
@@ -112,31 +144,82 @@ export async function reconcileStatement(
       subjectDimension,
       candidate.statement,
       candidate.dimension,
-      !options.driver,
+      !options.driver && !options.decision,
     );
     if (deterministic) proposals.push(deterministic);
     else ambiguous.push(candidate);
   }
 
-  if (!options.driver || ambiguous.length === 0) {
+  if (ambiguous.length === 0) {
     return {
       statementId,
       proposals,
       unresolvedIds: ambiguous.map((candidate) => candidate.statement.id),
+      readRequests: [],
     };
   }
 
-  const reply = parseJsonReply(
-    await options.driver.complete(
-      buildFactReconciliationPrompt(subject, subjectDimension, ambiguous),
-    ),
+  let remaining = ambiguous;
+  if (options.decision) {
+    try {
+      const fast = await classifyWithDecisionDriver(
+        graph,
+        subject,
+        subjectDimension,
+        ambiguous,
+        options.decision,
+        normalizeDecisionMinConfidence(options.decisionMinConfidence),
+      );
+      proposals.push(...fast.proposals);
+      remaining = fast.unresolved;
+    } catch {
+      // The decision layer is an optimization, never a dependency. The full
+      // Agent below remains the correctness fallback.
+      remaining = ambiguous;
+    }
+  }
+
+  if (!options.driver || remaining.length === 0) {
+    return {
+      statementId,
+      proposals,
+      unresolvedIds: remaining.map((candidate) => candidate.statement.id),
+      readRequests: [],
+    };
+  }
+
+  const maxReadRequests = normalizeMaxReadRequests(options.maxReadRequests);
+  const initialPrompt = buildFactReconciliationPrompt(
+    graph,
+    subject,
+    subjectDimension,
+    remaining,
+    maxReadRequests > 0,
   );
-  const agent = normalizeAgentDecisions(reply, subject.id, ambiguous);
+  const initialReply = parseJsonReply(await options.driver.complete(initialPrompt));
+  const readRequests = normalizeReadRequests(
+    initialReply,
+    remaining,
+    maxReadRequests,
+  );
+  const decisionReply =
+    readRequests.length === 0
+      ? initialReply
+      : parseJsonReply(
+          await options.driver.complete(
+            buildFactReconciliationFollowupPrompt(
+              initialPrompt,
+              executeReadRequests(graph, subject, remaining, readRequests),
+            ),
+          ),
+        );
+  const agent = normalizeAgentDecisions(decisionReply, subject.id, remaining);
   proposals.push(...agent.proposals);
   return {
     statementId,
     proposals,
     unresolvedIds: agent.unresolvedIds,
+    readRequests,
   };
 }
 
@@ -287,6 +370,7 @@ function reconciliationCandidates(
   graph: GraphStore,
   subject: StatementNode,
   limit: number,
+  sameDimensionOnly: boolean,
 ): ReconciliationCandidate[] {
   const live = (graph.queryNodes({ type: "core:statement" }) as StatementNode[]).filter(
     (statement) =>
@@ -299,6 +383,7 @@ function reconciliationCandidates(
   const candidates: ReconciliationCandidate[] = [];
   for (const statement of live) {
     if (alreadyReconciled(graph, subject.id, statement.id)) continue;
+    if (sameDimensionOnly && statement.dimension_id !== subject.dimension_id) continue;
     const sharedAbout = aboutTargets(graph, statement.id).filter((id) => subjectAbout.includes(id));
     if (statement.dimension_id !== subject.dimension_id && sharedAbout.length === 0) continue;
     candidates.push({
@@ -417,20 +502,106 @@ function validateApplicableProposal(
   }
 }
 
-function buildFactReconciliationPrompt(
+function normalizeDecisionMinConfidence(value: number | undefined): number {
+  if (value === undefined) return 0.85;
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new AgentError("fact reconciler decisionMinConfidence must be between 0 and 1");
+  }
+  return value;
+}
+
+async function classifyWithDecisionDriver(
+  graph: GraphStore,
   subject: StatementNode,
   subjectDimension: DimensionNode,
   candidates: readonly ReconciliationCandidate[],
-): string {
-  const row = (
-    statement: StatementNode,
-    dimension: DimensionNode,
-    sharedAbout: string[],
-    preFlaggedContradiction = false,
-  ) => ({
+  driver: DecisionDriver,
+  minConfidence: number,
+): Promise<{
+  proposals: FactRelationProposal[];
+  unresolved: ReconciliationCandidate[];
+}> {
+  const questions: Record<
+    string,
+    { instructions: string; criteria: Record<string, string> }
+  > = {};
+  const keyed = new Map<string, ReconciliationCandidate>();
+  candidates.forEach((candidate, index) => {
+    const key = `candidate_${index}`;
+    keyed.set(key, candidate);
+    questions[key] = {
+      instructions: [
+        `Classify New Statement -> Candidate ${candidate.statement.id}.`,
+        "Use only the supplied memory state and provenance.",
+        "For the exact same single-value Slot, a later value from the same recording authority and speaker is a supersession even when source record ids differ.",
+        "Choose needs_context when original wording, subject identity, source order, graph relations, or constraints must be inspected before deciding.",
+      ].join(" "),
+      criteria: {
+        duplicate: "Materially the same core claim.",
+        refines: "The New Statement adds compatible detail to the Candidate.",
+        supersedes: "The New Statement is a later replacement for the Candidate.",
+        contradicts: "They cannot both be true, but provenance does not establish replacement.",
+        independent: "They are related in topic but are separate facts.",
+        needs_context: "The bounded state is insufficient; inspect read-only memory context.",
+      },
+    };
+  });
+  const state = JSON.stringify({
+    direction: "New Statement -> Candidate",
+    newStatement: reconciliationRow(graph, subject, subjectDimension, []),
+    candidates: candidates.map((candidate) =>
+      reconciliationRow(
+        graph,
+        candidate.statement,
+        candidate.dimension,
+        candidate.sharedAbout,
+        candidate.preFlaggedContradiction,
+      ),
+    ),
+  });
+  const answers = await driver.choiceFanOut(state, questions);
+  const proposals: FactRelationProposal[] = [];
+  const unresolved: ReconciliationCandidate[] = [];
+  for (const [key, candidate] of keyed) {
+    const answer = answers[key];
+    if (
+      !answer ||
+      answer.choice === "needs_context" ||
+      !isFactRelationKind(answer.choice) ||
+      !Number.isFinite(answer.confidence) ||
+      answer.confidence < minConfidence
+    ) {
+      unresolved.push(candidate);
+      continue;
+    }
+    proposals.push(
+      proposal(
+        subject.id,
+        candidate.statement.id,
+        answer.choice,
+        "agent",
+        answer.confidence,
+        `Jev classified the bounded memory state as ${answer.choice}`,
+      ),
+    );
+  }
+  return { proposals, unresolved };
+}
+
+function reconciliationRow(
+  graph: GraphStore,
+  statement: StatementNode,
+  dimension: DimensionNode,
+  sharedAbout: string[],
+  preFlaggedContradiction = false,
+): unknown {
+  return {
     statementId: statement.id,
     dimensionId: dimension.id,
     dimensionKey: dimension.key,
+    propertyKey: slotPropertyKey(dimension),
+    subjectRef: slotSubjectRef(dimension),
+    subjectLabel: slotSubjectLabel(graph, dimension),
     cardinality: dimension.cardinality,
     value: statement.value,
     state: statement.state,
@@ -441,8 +612,23 @@ function buildFactReconciliationPrompt(
     scope: statement.scope,
     sharedAbout,
     preFlaggedContradiction,
-  });
-  return [
+  };
+}
+
+function buildFactReconciliationPrompt(
+  graph: GraphStore,
+  subject: StatementNode,
+  subjectDimension: DimensionNode,
+  candidates: readonly ReconciliationCandidate[],
+  readsEnabled: boolean,
+): string {
+  const row = (
+    statement: StatementNode,
+    dimension: DimensionNode,
+    sharedAbout: string[],
+    preFlaggedContradiction = false,
+  ) => reconciliationRow(graph, statement, dimension, sharedAbout, preFlaggedContradiction);
+  const prompt = [
     "You are a Fact Reconciler. Compare one new Statement with existing live Statements.",
     "Every relation is directional: New Statement -> Candidate. Never reverse that direction.",
     "Judge memory truth relative to provenance, not from your own world knowledge. createdBy identifies the recording authority, saidBy identifies the speaker, sourceRefs identify source records, createdAt establishes order, and scope establishes the memory boundary.",
@@ -455,8 +641,342 @@ function buildFactReconciliationPrompt(
     "Do not decide which contradictory fact wins. Do not output provenance, state changes, or graph ids other than the supplied statementId.",
     `New Statement:\n${JSON.stringify(row(subject, subjectDimension, []))}`,
     `Candidates:\n${JSON.stringify(candidates.map((candidate) => row(candidate.statement, candidate.dimension, candidate.sharedAbout, candidate.preFlaggedContradiction)))}`,
-    'Respond with ONLY: {"decisions":[{"statementId":"<candidate id>","relation":"duplicate|refines|supersedes|contradicts|independent","confidence":0.0,"reason":"short evidence-based reason"}]}',
+  ];
+  if (readsEnabled) {
+    prompt.push(
+      "If the supplied context is insufficient, you may request read-only context instead of deciding. You may only target supplied Candidate statementIds. The runtime—not you—executes these reads, and no read can modify memory.",
+      "Available read tools: slot_context = exact subject/property coordinates; episode_evidence = bounded original source excerpts; local_graph = bounded one-hop subject/about relationships; relation_history = prior epistemic edges; constraint_summary = relevant active constraint verdicts.",
+      "For an exact same-dimensionId pair, request the smallest relevant read before returning contradicts or independent when the uncertainty is source wording, subject identity, or within-source order. Do not request reads merely to reconfirm a clear provenance-based supersession.",
+      'Either respond with final decisions, or ONLY: {"reads":[{"tool":"slot_context|episode_evidence|local_graph|relation_history|constraint_summary","statementId":"<candidate id>"}]}. Request only information needed to decide.',
+    );
+  }
+  prompt.push(
+    'Final decision format: {"decisions":[{"statementId":"<candidate id>","relation":"duplicate|refines|supersedes|contradicts|independent","confidence":0.0,"reason":"short evidence-based reason"}]}',
+  );
+  return prompt.join("\n\n");
+}
+
+type ReconciliationReadStore = Pick<
+  GraphStore,
+  "getNode" | "queryNodes" | "queryEdges" | "getEpisode"
+> & {
+  getAllConstraints?: () => Constraint[];
+  evaluateConstraint?: (id: string) => string;
+};
+
+interface FactReconciliationReadResult {
+  tool: FactReconciliationReadTool;
+  statementId: string;
+  data: unknown;
+}
+
+function normalizeMaxReadRequests(value: number | undefined): number {
+  if (value === undefined) return 3;
+  if (!Number.isInteger(value) || value < 0) {
+    throw new AgentError("fact reconciler maxReadRequests must be a non-negative integer");
+  }
+  return Math.min(value, 3);
+}
+
+function normalizeReadRequests(
+  raw: unknown,
+  candidates: readonly ReconciliationCandidate[],
+  limit: number,
+): FactReconciliationReadRequest[] {
+  if (limit === 0 || typeof raw !== "object" || raw === null || Array.isArray(raw)) return [];
+  const reads = (raw as Record<string, unknown>).reads;
+  if (!Array.isArray(reads)) return [];
+  const candidateIds = new Set(candidates.map((candidate) => candidate.statement.id));
+  const allowedTools = new Set<FactReconciliationReadTool>([
+    "slot_context",
+    "episode_evidence",
+    "local_graph",
+    "relation_history",
+    "constraint_summary",
+  ]);
+  const normalized: FactReconciliationReadRequest[] = [];
+  const seen = new Set<string>();
+  for (const rawRead of reads) {
+    if (normalized.length >= limit) break;
+    if (typeof rawRead !== "object" || rawRead === null || Array.isArray(rawRead)) continue;
+    const read = rawRead as Record<string, unknown>;
+    if (typeof read.tool !== "string" || !allowedTools.has(read.tool as FactReconciliationReadTool)) {
+      continue;
+    }
+    if (typeof read.statementId !== "string" || !candidateIds.has(read.statementId)) continue;
+    const key = `${read.tool}\u0000${read.statementId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push({
+      tool: read.tool as FactReconciliationReadTool,
+      statementId: read.statementId,
+    });
+  }
+  return normalized;
+}
+
+function executeReadRequests(
+  graph: ReconciliationReadStore,
+  subject: StatementNode,
+  candidates: readonly ReconciliationCandidate[],
+  requests: readonly FactReconciliationReadRequest[],
+): FactReconciliationReadResult[] {
+  const byId = new Map(candidates.map((candidate) => [candidate.statement.id, candidate]));
+  return requests.flatMap((request) => {
+    const candidate = byId.get(request.statementId);
+    if (!candidate) return [];
+    return [
+      {
+        ...request,
+        data: executeReadTool(graph, subject, candidate, request.tool),
+      },
+    ];
+  });
+}
+
+function executeReadTool(
+  graph: ReconciliationReadStore,
+  subject: StatementNode,
+  candidate: ReconciliationCandidate,
+  tool: FactReconciliationReadTool,
+): unknown {
+  if (tool === "slot_context") {
+    return {
+      newStatement: slotSnapshot(graph, subject),
+      candidate: slotSnapshot(graph, candidate.statement),
+    };
+  }
+  if (tool === "episode_evidence") {
+    return {
+      newStatement: episodeEvidence(graph, subject),
+      candidate: episodeEvidence(graph, candidate.statement),
+    };
+  }
+  if (tool === "local_graph") {
+    return localGraphSnapshot(graph, subject, candidate.statement);
+  }
+  if (tool === "relation_history") {
+    return relationHistory(graph, subject, candidate.statement);
+  }
+  return constraintSummary(graph, subject, candidate.statement);
+}
+
+function buildFactReconciliationFollowupPrompt(
+  initialPrompt: string,
+  results: readonly FactReconciliationReadResult[],
+): string {
+  return [
+    initialPrompt,
+    "The runtime completed your approved READ-ONLY requests. These results are bounded to the current conflict and cannot modify memory:",
+    JSON.stringify(results),
+    "This is the final round. Do not request more reads. Return ONLY the final decisions object in the previously specified format. If evidence is still insufficient, use contradicts or independent instead of guessing supersedes.",
   ].join("\n\n");
+}
+
+function slotSnapshot(graph: ReconciliationReadStore, statement: StatementNode): unknown {
+  const dimension = readDimension(graph, statement.dimension_id);
+  const subjectRef = slotSubjectRef(dimension);
+  const subject = subjectRef === SCOPE_OWNER_SUBJECT ? undefined : graph.getNode(subjectRef);
+  return {
+    dimensionId: dimension.id,
+    propertyKey: slotPropertyKey(dimension),
+    description:
+      typeof dimension.attributes.description === "string"
+        ? dimension.attributes.description
+        : null,
+    subjectRef,
+    subject: subject ? nodeSnapshot(subject) : subjectRef,
+    cardinality: dimension.cardinality ?? "multi",
+    claimState: statement.state,
+    sourceOrder: {
+      turnIndex: numericAttribute(statement, "turnIndex"),
+      sourceOrdinal: numericAttribute(statement, "sourceOrdinal"),
+    },
+  };
+}
+
+function episodeEvidence(graph: ReconciliationReadStore, statement: StatementNode): unknown[] {
+  const dimension = readDimension(graph, statement.dimension_id);
+  const tokens = evidenceTokens(`${slotPropertyKey(dimension)} ${stringValue(statement.value)}`);
+  const results: unknown[] = [];
+  for (const sourceRef of statement.source_refs.slice(0, 2)) {
+    const episode = graph.getEpisode(sourceRef);
+    if (!episode || !scopesEqual(episode.scope, statement.scope)) continue;
+    const ranked = episode.turns
+      .map((turn, turnIndex) => ({
+        turn,
+        turnIndex,
+        score: tokens.reduce(
+          (score, token) => score + (turn.content.toLocaleLowerCase("en-US").includes(token) ? 1 : 0),
+          0,
+        ),
+      }))
+      .sort((a, b) => b.score - a.score || a.turnIndex - b.turnIndex)
+      .slice(0, 2);
+    results.push({
+      sourceRef,
+      episodeCreatedAt: episode.created_at,
+      turns: ranked.map(({ turn, turnIndex }) => ({
+        turnIndex,
+        role: turn.role,
+        excerpt: focusedExcerpt(turn.content, tokens, 900),
+      })),
+    });
+  }
+  return results;
+}
+
+function localGraphSnapshot(
+  graph: ReconciliationReadStore,
+  subject: StatementNode,
+  object: StatementNode,
+): unknown {
+  const subjectDimension = readDimension(graph, subject.dimension_id);
+  const objectDimension = readDimension(graph, object.dimension_id);
+  const subjectRefs = [...new Set([slotSubjectRef(subjectDimension), slotSubjectRef(objectDimension)])]
+    .filter((id) => id !== SCOPE_OWNER_SUBJECT);
+  const subjectAbout = aboutTargets(graph, subject.id);
+  const objectAbout = aboutTargets(graph, object.id);
+  const sharedAbout = subjectAbout.filter((id) => objectAbout.includes(id));
+  const aboutIds = [...new Set([...subjectAbout, ...objectAbout])].slice(0, 12);
+  const oneHop = subjectRefs.flatMap((id) => [
+    ...graph.queryEdges({ from: id }),
+    ...graph.queryEdges({ to: id }),
+  ]).filter((edge) => scopesEqual(edge.scope, subject.scope));
+  const uniqueEdges = [...new Map(oneHop.map((edge) => [edge.id, edge])).values()].slice(0, 12);
+  return {
+    slotSubjects: subjectRefs.map((id) => nodeSnapshotOrId(graph, id)),
+    sharedAbout: sharedAbout.map((id) => nodeSnapshotOrId(graph, id)),
+    aboutTargets: aboutIds.map((id) => ({
+      role: subjectRefs.includes(id)
+        ? "slot_subject"
+        : sharedAbout.includes(id)
+          ? "shared_related"
+          : "claim_value_or_context",
+      node: nodeSnapshotOrId(graph, id),
+    })),
+    oneHopEdges: uniqueEdges.map((edge) => ({
+      type: edge.type,
+      from: nodeSnapshotOrId(graph, edge.from),
+      to: nodeSnapshotOrId(graph, edge.to),
+    })),
+  };
+}
+
+function relationHistory(
+  graph: ReconciliationReadStore,
+  subject: StatementNode,
+  object: StatementNode,
+): unknown[] {
+  const dimensionIds = new Set([subject.dimension_id, object.dimension_id]);
+  const statementIds = new Set(
+    (graph.queryNodes({ type: "core:statement" }) as StatementNode[])
+      .filter((statement) => dimensionIds.has(statement.dimension_id))
+      .map((statement) => statement.id),
+  );
+  return graph
+    .queryEdges({})
+    .filter(
+      (edge) =>
+        EPISTEMIC_EDGE_TYPES.includes(edge.type as (typeof EPISTEMIC_EDGE_TYPES)[number]) &&
+        (statementIds.has(edge.from) || statementIds.has(edge.to)) &&
+        scopesEqual(edge.scope, subject.scope),
+    )
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    .slice(0, 12)
+    .map((edge) => ({
+      type: edge.type,
+      from: edge.from,
+      to: edge.to,
+      createdBy: edge.created_by,
+      createdAt: edge.created_at,
+      reason: typeof edge.attributes.reason === "string" ? edge.attributes.reason : null,
+    }));
+}
+
+function constraintSummary(
+  graph: ReconciliationReadStore,
+  subject: StatementNode,
+  object: StatementNode,
+): unknown {
+  if (!graph.getAllConstraints || !graph.evaluateConstraint) {
+    return { available: false, constraints: [] };
+  }
+  const dimensionIds = new Set([subject.dimension_id, object.dimension_id]);
+  const constraints = graph
+    .getAllConstraints()
+    .filter(
+      (constraint) =>
+        constraint.activation_state === "active" &&
+        constraint.participants.some((id) => dimensionIds.has(id)) &&
+        scopesEqual(constraint.scope, subject.scope),
+    )
+    .slice(0, 8)
+    .map((constraint) => ({
+      id: constraint.id,
+      name: constraint.name ?? null,
+      participants: constraint.participants,
+      currentEvaluation: graph.evaluateConstraint?.(constraint.id) ?? "unavailable",
+    }));
+  return { available: true, constraints };
+}
+
+function readDimension(graph: ReconciliationReadStore, id: string): DimensionNode {
+  const node = graph.getNode(id);
+  if (!node || node.type !== "core:dimension") throw new AgentError(`dimension not found: ${id}`);
+  return node as DimensionNode;
+}
+
+function slotSubjectLabel(graph: ReconciliationReadStore, dimension: DimensionNode): string | null {
+  const ref = slotSubjectRef(dimension);
+  if (ref === SCOPE_OWNER_SUBJECT) return null;
+  const subject = graph.getNode(ref);
+  if (!subject) return ref;
+  const snapshot = nodeSnapshot(subject);
+  return typeof snapshot.label === "string" ? snapshot.label : ref;
+}
+
+function nodeSnapshotOrId(graph: ReconciliationReadStore, id: string): unknown {
+  const node = graph.getNode(id);
+  return node ? nodeSnapshot(node) : { id };
+}
+
+function nodeSnapshot(node: GraphNode): { id: string; type: string; label: string } {
+  return {
+    id: node.id,
+    type: node.type,
+    label:
+      typeof node.value === "string" && node.value.trim().length > 0
+        ? node.value.trim().slice(0, 240)
+        : node.key ?? node.id,
+  };
+}
+
+function numericAttribute(statement: StatementNode, key: string): number | null {
+  const value = statement.attributes[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function evidenceTokens(text: string): string[] {
+  return [...new Set(text.toLocaleLowerCase("en-US").match(/[\p{L}\p{N}]{3,}/gu) ?? [])].slice(
+    0,
+    16,
+  );
+}
+
+function focusedExcerpt(content: string, tokens: readonly string[], limit: number): string {
+  if (content.length <= limit) return content;
+  const lower = content.toLocaleLowerCase("en-US");
+  const positions = tokens.map((token) => lower.indexOf(token)).filter((index) => index >= 0);
+  const anchor = positions.length > 0 ? Math.min(...positions) : 0;
+  const start = Math.max(0, anchor - Math.floor(limit / 3));
+  const end = Math.min(content.length, start + limit);
+  return `${start > 0 ? "…" : ""}${content.slice(start, end)}${end < content.length ? "…" : ""}`;
+}
+
+function stringValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  return JSON.stringify(value) ?? String(value);
 }
 
 function normalizeAgentDecisions(
@@ -524,7 +1044,10 @@ function normalizedValue(value: unknown): string {
   return JSON.stringify(value) ?? String(value);
 }
 
-function aboutTargets(graph: GraphStore, statementId: string): string[] {
+function aboutTargets(
+  graph: Pick<GraphStore, "queryEdges">,
+  statementId: string,
+): string[] {
   return graph.queryEdges({ type: "core:about", from: statementId }).map((edge) => edge.to);
 }
 

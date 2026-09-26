@@ -18,6 +18,23 @@ export interface DecisionDriver {
   choice(state: string, instructions: string, criteria: Record<string, string>): Promise<string>;
   /** Many yes/no questions about ONE state, answered in a single call (fan-out). */
   noulFanOut(state: string, questions: Record<string, string>): Promise<Record<string, number>>;
+  /** Many multiple-choice questions about ONE state, answered in a single call. */
+  choiceFanOut(
+    state: string,
+    questions: Record<string, ChoiceQuestion>,
+  ): Promise<Record<string, ChoiceDecision>>;
+}
+
+export interface ChoiceQuestion {
+  instructions: string;
+  criteria: Record<string, string>;
+}
+
+export interface ChoiceDecision {
+  choice: string;
+  /** Provider confidence, or the selected option probability when omitted. */
+  confidence: number;
+  probabilities?: Record<string, number>;
 }
 
 export interface TypeSafeDecisionOptions {
@@ -30,7 +47,15 @@ export interface TypeSafeDecisionOptions {
   post?: typeof postJsonWithRetry;
 }
 
-type Answers = Record<string, { noul?: number; choice?: string }>;
+type Answers = Record<
+  string,
+  {
+    noul?: number;
+    choice?: string;
+    confidence?: number;
+    probabilities?: Record<string, number>;
+  }
+>;
 
 export class TypeSafeDecisionDriver implements DecisionDriver {
   private readonly baseUrl: string;
@@ -77,6 +102,32 @@ export class TypeSafeDecisionDriver implements DecisionDriver {
     const answers = await this.ask(state, typed);
     const out: Record<string, number> = {};
     for (const [name, a] of Object.entries(answers)) out[name] = a?.noul ?? 0;
+    return out;
+  }
+
+  async choiceFanOut(
+    state: string,
+    questions: Record<string, ChoiceQuestion>,
+  ): Promise<Record<string, ChoiceDecision>> {
+    const typed: Record<
+      string,
+      { type: "choice"; instructions: string; criteria: Record<string, string> }
+    > = {};
+    for (const [name, question] of Object.entries(questions)) {
+      typed[name] = { type: "choice", ...question };
+    }
+    const answers = await this.ask(state, typed);
+    const out: Record<string, ChoiceDecision> = {};
+    for (const [name, answer] of Object.entries(answers)) {
+      if (!answer?.choice) continue;
+      const selectedProbability = answer.probabilities?.[answer.choice];
+      const confidence = answer.confidence ?? selectedProbability ?? 0;
+      out[name] = {
+        choice: answer.choice,
+        confidence,
+        ...(answer.probabilities ? { probabilities: answer.probabilities } : {}),
+      };
+    }
     return out;
   }
 

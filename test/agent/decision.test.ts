@@ -54,6 +54,35 @@ test("decision: fan-out maps one call to many named yes/no answers", async () =>
   assert.deepEqual(out, { a: 1, b: 0 });
 });
 
+test("decision: choice fan-out preserves confidence and probabilities", async () => {
+  const { post, bodies } = makeFakePost({
+    answers: {
+      first: {
+        choice: "supersedes",
+        confidence: 0.96,
+        probabilities: { supersedes: 0.92, contradicts: 0.08 },
+      },
+      second: {
+        choice: "independent",
+        probabilities: { independent: 0.88, refines: 0.12 },
+      },
+    },
+  });
+  const d = driver(post);
+  const out = await d.choiceFanOut("state", {
+    first: { instructions: "one", criteria: { supersedes: "newer", contradicts: "clash" } },
+    second: { instructions: "two", criteria: { independent: "separate", refines: "detail" } },
+  });
+
+  assert.equal(out.first?.choice, "supersedes");
+  assert.equal(out.first?.confidence, 0.96);
+  assert.equal(out.second?.confidence, 0.88);
+  assert.deepEqual(
+    (bodies[0] as { questions: { first: { type: string } } }).questions.first.type,
+    "choice",
+  );
+});
+
 test("decision: fromEnv throws without TYPESAFE_API_KEY", () => {
   assert.throws(() => TypeSafeDecisionDriver.fromEnv({}), AgentError);
 });

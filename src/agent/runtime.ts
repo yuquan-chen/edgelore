@@ -12,7 +12,7 @@
 //   - default:    "latest 50" digest (zero config, works with no embedding
 //                 provider — the frozen decision #4 starting point)
 //   - retrieval:  hybrid retrieval (vector + lexical, RRF-fused) with
-//                 one-hop graph expansion — relevant context with conflict
+//                 bounded graph expansion — relevant context with conflict
 //                 posture and constraint verdicts attached
 
 import { scopesEqual, type GraphStore, type MemoryGraph } from "../model/store.js";
@@ -21,16 +21,17 @@ import type {
   EpisodeRecord,
   EpisodeTurn,
   FactNodeState,
+  GraphNode,
   Scope,
   StatementNode,
 } from "../model/types.js";
 import { capture, type CaptureContext, type CaptureResult } from "./capture.js";
 import { runGraphEnrichment } from "./graph-enrichment.js";
-import { commitGraphWritePlan } from "./graph-write.js";
+import { canonicalEntityKey, commitGraphWritePlan } from "./graph-write.js";
 import { runGate } from "./gate.js";
 import { runExtract } from "./extract.js";
 import type { KnownDimension } from "./prompt.js";
-import { slotLabel } from "./slots.js";
+import { slotLabel, slotSubjectRef } from "./slots.js";
 import type { LlmDriver } from "./llm-driver.js";
 import type { DecisionDriver } from "./decision.js";
 import type { EmbeddingDriver } from "./embedding-driver.js";
@@ -142,7 +143,7 @@ export interface RetrievalConfig {
   maxEpisodeEvidenceLines?: number;
   /** Per-excerpt character cap for cold Episode evidence (default 1,600). */
   maxEpisodeExcerptChars?: number;
-  /** Additional Claims reached through one shared core:about target
+  /** Additional Claims reached through bounded local graph traversal
    * (default 2; 0 disables graph expansion). */
   maxGraphExpansionHits?: number;
   /** Candidate state filter (default: ALL states — counting questions need
@@ -1155,7 +1156,8 @@ function coldEpisodeEvidence(
   return selected;
 }
 
-/** Strictly bounded one-hop expansion through a shared core:about target. */
+/** Strictly bounded local traversal through Claim -> Entity -> subject Slot.
+ * Shared core:about neighbors remain available for event-style memories. */
 function aboutRelatedHits(
   graph: MemoryGraph,
   query: string,
@@ -1163,58 +1165,170 @@ function aboutRelatedHits(
   config: RetrievalReadConfig,
 ): RetrievalHit[] {
   // The v7 retrieval ablation found sharply diminishing evidence gains after
-  // two related Claims while context size kept growing. Keep the graph useful
-  // without turning every entity neighborhood into prompt payload.
+  // a few related Claims while context size kept growing. The output budget is
+  // unchanged; deeper traversal only helps choose which Claims occupy it.
   const limit = config.maxGraphExpansionHits ?? 2;
-  if (limit <= 0 || directHits.length === 0) return [];
+  if (limit <= 0) return [];
   const directIds = new Set(directHits.map((hit) => hit.statementId));
   const directDims = new Set(directHits.map((hit) => hit.dimensionId));
-  const targets = new Set<string>();
+  const visitedEntities = new Set<string>();
+  let frontier = new Set<string>();
   for (const hit of directHits.slice(0, 6)) {
     for (const edge of graph.queryEdges({ type: "core:about", from: hit.statementId })) {
       if (config.scope !== undefined && !scopesEqual(edge.scope, config.scope)) continue;
-      targets.add(edge.to);
+      frontier.add(edge.to);
     }
   }
-  if (targets.size === 0) return [];
+  const canonicalQuery = canonicalEntityKey(query);
+  const entityAnchors = graph
+    .queryNodes({})
+    .filter(
+      (node) =>
+        node.type !== "core:dimension" &&
+        node.type !== "core:statement" &&
+        node.type !== "core:constraint" &&
+        node.type !== "core:message" &&
+        node.key &&
+        (config.scope === undefined ||
+          scopesEqual(node.scope, config.scope) ||
+          scopesEqual(node.scope, undefined)),
+    )
+    .map((node) => {
+      const labels = [node.key, ...(typeof node.value === "string" ? [node.value] : [])]
+        .filter((value): value is string => typeof value === "string")
+        .map(canonicalEntityKey)
+        .filter(Boolean);
+      const label = labels
+        .filter(
+          (candidate) =>
+            candidate.length >= 2 &&
+            (canonicalQuery === candidate ||
+              `-${canonicalQuery}-`.includes(`-${candidate}-`)),
+        )
+        .sort((a, b) => b.length - a.length)[0];
+      return { node, label };
+    })
+    .filter((candidate): candidate is { node: GraphNode; label: string } => Boolean(candidate.label))
+    .sort((a, b) => b.label.length - a.label.length)
+    .slice(0, 6);
+  for (const anchor of entityAnchors) frontier.add(anchor.node.id);
+  if (frontier.size === 0) return [];
 
-  const candidateIds = new Set<string>();
-  for (const target of targets) {
-    for (const edge of graph.queryEdges({ type: "core:about", to: target })) {
-      if (config.scope !== undefined && !scopesEqual(edge.scope, config.scope)) continue;
-      if (!directIds.has(edge.from)) candidateIds.add(edge.from);
-    }
+  const dimensions = (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[]).filter(
+    (dimension) => config.scope === undefined || scopesEqual(dimension.scope, config.scope),
+  );
+  const dimensionsBySubject = new Map<string, string[]>();
+  for (const dimension of dimensions) {
+    const subject = slotSubjectRef(dimension);
+    if (subject === "$scopeOwner") continue;
+    const ids = dimensionsBySubject.get(subject) ?? [];
+    ids.push(dimension.id);
+    dimensionsBySubject.set(subject, ids);
   }
+  const statementsByDimension = new Map<string, StatementNode[]>();
+  for (const statement of graph.queryNodes({ type: "core:statement" }) as StatementNode[]) {
+    const rows = statementsByDimension.get(statement.dimension_id) ?? [];
+    rows.push(statement);
+    statementsByDimension.set(statement.dimension_id, rows);
+  }
+
   const queryTerms = evidenceTerms(query);
   const scopeSet = config.scopeSessionIds ? new Set(config.scopeSessionIds) : undefined;
-  const candidates = [...candidateIds]
-    .map((id) => graph.getNode(id))
-    .filter((node): node is StatementNode => Boolean(node && node.type === "core:statement"))
-    .filter((statement) => !directDims.has(statement.dimension_id))
-    .filter((statement) => config.scope === undefined || scopesEqual(statement.scope, config.scope))
-    .filter((statement) => !config.states || config.states.includes(statement.state))
-    .filter((statement) => {
-      const day = statement.created_at.slice(0, 10).replace(/\//g, "-");
-      return (
-        (!config.dateFrom || day >= config.dateFrom) && (!config.dateTo || day <= config.dateTo)
+  const layers: Array<
+    Array<{ statement: StatementNode; lexical: number; inScope: boolean; depth: number }>
+  > = [];
+  const seenStatements = new Set(directIds);
+  const beamWidth = Math.max(limit * 3, 8);
+  const maxDepth = 3;
+  for (let depth = 1; depth <= maxDepth && frontier.size > 0; depth += 1) {
+    const candidateIds = new Set<string>();
+    for (const entityId of frontier) {
+      visitedEntities.add(entityId);
+      for (const edge of graph.queryEdges({ type: "core:about", to: entityId })) {
+        if (config.scope !== undefined && !scopesEqual(edge.scope, config.scope)) continue;
+        candidateIds.add(edge.from);
+      }
+      for (const dimensionId of dimensionsBySubject.get(entityId) ?? []) {
+        for (const statement of statementsByDimension.get(dimensionId) ?? []) {
+          candidateIds.add(statement.id);
+        }
+      }
+    }
+
+    const candidates = [...candidateIds]
+      .filter((id) => !seenStatements.has(id))
+      .map((id) => graph.getNode(id))
+      .filter((node): node is StatementNode => Boolean(node && node.type === "core:statement"))
+      .filter((statement) => !directDims.has(statement.dimension_id))
+      .filter(
+        (statement) => config.scope === undefined || scopesEqual(statement.scope, config.scope),
+      )
+      .filter((statement) =>
+        config.states
+          ? config.states.includes(statement.state)
+          : statement.state !== "superseded" && statement.state !== "rejected",
+      )
+      .filter((statement) => {
+        const day = statement.created_at.slice(0, 10).replace(/\//g, "-");
+        return (
+          (!config.dateFrom || day >= config.dateFrom) &&
+          (!config.dateTo || day <= config.dateTo)
+        );
+      })
+      .map((statement) => ({
+        statement,
+        lexical: overlapCount(queryTerms, evidenceTerms(statementText(graph, statement))),
+        inScope: !scopeSet || statement.source_refs.some((ref) => scopeSet.has(ref)),
+        depth,
+      }))
+      .sort(
+        (a, b) =>
+          Number(b.inScope) - Number(a.inScope) ||
+          b.lexical - a.lexical ||
+          b.statement.created_at.localeCompare(a.statement.created_at),
       );
-    })
-    .map((statement) => ({
-      statement,
-      lexical: overlapCount(queryTerms, evidenceTerms(statementText(graph, statement))),
-      inScope: !scopeSet || statement.source_refs.some((ref) => scopeSet.has(ref)),
-    }));
-  const inScope = candidates.filter((candidate) => candidate.inScope);
-  const pool = scopeSet && inScope.length > 0 ? inScope : candidates;
-  return pool
+    if (candidates.length === 0) break;
+    const inScope = candidates.filter((candidate) => candidate.inScope);
+    const layer = scopeSet && inScope.length > 0 ? inScope : candidates;
+    layers.push(layer);
+    for (const candidate of layer) seenStatements.add(candidate.statement.id);
+
+    const next = new Set<string>();
+    for (const candidate of layer.slice(0, beamWidth)) {
+      for (const edge of graph.queryEdges({ type: "core:about", from: candidate.statement.id })) {
+        if (config.scope !== undefined && !scopesEqual(edge.scope, config.scope)) continue;
+        if (!visitedEntities.has(edge.to)) next.add(edge.to);
+      }
+    }
+    frontier = next;
+  }
+
+  // Reserve one result for each reached depth before the remaining Claims
+  // compete globally. This preserves a complete short chain under the same
+  // fixed output budget instead of letting one dense neighborhood monopolize it.
+  const selected: Array<{
+    statement: StatementNode;
+    lexical: number;
+    inScope: boolean;
+    depth: number;
+  }> = [];
+  for (const layer of layers) {
+    const first = layer[0];
+    if (first && selected.length < limit) selected.push(first);
+  }
+  const selectedIds = new Set(selected.map((candidate) => candidate.statement.id));
+  const remainder = layers
+    .flat()
+    .filter((candidate) => !selectedIds.has(candidate.statement.id))
     .sort(
       (a, b) =>
         Number(b.inScope) - Number(a.inScope) ||
         b.lexical - a.lexical ||
+        a.depth - b.depth ||
         b.statement.created_at.localeCompare(a.statement.created_at),
-    )
-    .slice(0, limit)
-    .map(({ statement, lexical }) => {
+    );
+  selected.push(...remainder.slice(0, Math.max(0, limit - selected.length)));
+  return selected.map(({ statement, lexical, depth }) => {
       const dimension = graph.getNode(statement.dimension_id) as DimensionNode | undefined;
       return {
         nodeType: "statement" as const,
@@ -1224,7 +1338,7 @@ function aboutRelatedHits(
         value: statement.value,
         state: statement.state,
         score: lexical,
-        via: ["graph:about"],
+        via: [`graph:about:${depth}`],
       };
     });
 }

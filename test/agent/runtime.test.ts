@@ -969,6 +969,164 @@ test("runtime: core:about defaults to two related Claims", async () => {
   assert.equal(relatedHeaders.length, 2);
 });
 
+test("runtime: bounded graph traversal follows object Entities into their subject Slots", async () => {
+  const graph = new MemoryGraph();
+  const work = graph.addNode({
+    type: "world:work",
+    key: "our-mutual-friend",
+    value: "Our Mutual Friend",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const author = graph.addNode({
+    type: "world:person",
+    key: "charles-darwin",
+    value: "Charles Darwin",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const spouse = graph.addNode({
+    type: "world:person",
+    key: "amala-paul",
+    value: "Amala Paul",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const country = graph.addNode({
+    type: "world:place",
+    key: "belgium",
+    value: "Belgium",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const authorFact = capture(
+    graph,
+    { dimensionKey: "author", subjectRef: work.id, value: "Charles Darwin" },
+    ctx,
+  );
+  const spouseFact = capture(
+    graph,
+    { dimensionKey: "spouse", subjectRef: author.id, value: "Amala Paul" },
+    ctx,
+  );
+  const citizenshipFact = capture(
+    graph,
+    { dimensionKey: "citizenship", subjectRef: spouse.id, value: "Belgium" },
+    ctx,
+  );
+  graph.addEdge({
+    type: "core:about",
+    from: authorFact.statementId!,
+    to: author.id,
+    created_by: "human:charles",
+  });
+  graph.addEdge({
+    type: "core:about",
+    from: spouseFact.statementId!,
+    to: spouse.id,
+    created_by: "human:charles",
+  });
+  graph.addEdge({
+    type: "core:about",
+    from: citizenshipFact.statementId!,
+    to: country.id,
+    created_by: "human:charles",
+  });
+
+  const result = await retrievalContext(
+    graph,
+    "Our Mutual Friend author spouse citizenship country",
+    {
+      embedder: new MockEmbedder(8),
+      vectors: new InMemoryVectorStore(),
+      mode: "lexical",
+      k: 1,
+      maxGraphExpansionHits: 2,
+      maxEpisodeEvidenceLines: 0,
+    },
+  );
+  assert.deepEqual(
+    result.claims.map((claim) => claim.value),
+    ["Charles Darwin", "Amala Paul", "Belgium"],
+  );
+  assert.deepEqual(
+    result.claims.map((claim) => claim.via),
+    [["lexical"], ["graph:about:1"], ["graph:about:2"]],
+  );
+});
+
+test("runtime: an Entity named in the query anchors traversal when direct Claim ranking misses", async () => {
+  const graph = new MemoryGraph();
+  const twitter = graph.addNode({
+    type: "world:organization",
+    key: "twitter",
+    value: "Twitter",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const ceo = graph.addNode({
+    type: "world:person",
+    key: "bernard-arnault",
+    value: "Bernard Arnault",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const country = graph.addNode({
+    type: "world:place",
+    key: "france",
+    value: "France",
+    state: "accepted",
+    created_by: "human:charles",
+  });
+  const ceoFact = capture(
+    graph,
+    { dimensionKey: "ceo", subjectRef: twitter.id, value: "Bernard Arnault" },
+    ctx,
+  );
+  const citizenshipFact = capture(
+    graph,
+    { dimensionKey: "citizenship", subjectRef: ceo.id, value: "France" },
+    ctx,
+  );
+  graph.addEdge({
+    type: "core:about",
+    from: ceoFact.statementId!,
+    to: ceo.id,
+    created_by: "human:charles",
+  });
+  graph.addEdge({
+    type: "core:about",
+    from: citizenshipFact.statementId!,
+    to: country.id,
+    created_by: "human:charles",
+  });
+  capture(
+    graph,
+    {
+      dimensionKey: "retrievalDistractor",
+      value: "Twitter current CEO country citizenship answer lookup",
+    },
+    ctx,
+  );
+
+  const result = await retrievalContext(graph, "Twitter current CEO country citizenship", {
+    embedder: new MockEmbedder(8),
+    vectors: new InMemoryVectorStore(),
+    mode: "lexical",
+    k: 1,
+    maxGraphExpansionHits: 2,
+    maxEpisodeEvidenceLines: 0,
+  });
+  assert.deepEqual(
+    result.claims.map((claim) => claim.value),
+    ["Twitter current CEO country citizenship answer lookup", "Bernard Arnault", "France"],
+  );
+  assert.deepEqual(
+    result.claims.map((claim) => claim.via),
+    [["lexical"], ["graph:about:1"], ["graph:about:2"]],
+  );
+});
+
 // --- 相关维度选择（批量抽取的 O(维度数) prompt 爆炸修复） -----------------------
 
 test("runtime: relevantDimensionsOf ranks matching dims first and bounds the list", () => {

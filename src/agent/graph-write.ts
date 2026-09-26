@@ -248,6 +248,32 @@ function resolveExistingEntity(
   return undefined;
 }
 
+function exactEntityObjectTarget(
+  graph: GraphStore,
+  value: unknown,
+  subjectId: string | undefined,
+  scope: Scope | undefined,
+): GraphNode | undefined {
+  if (typeof value !== "string") return undefined;
+  const wanted = canonicalEntityKey(value);
+  if (!wanted) return undefined;
+  const matches = graph.queryNodes({}).filter((node) => {
+    if (
+      node.id === subjectId ||
+      node.type === "core:dimension" ||
+      node.type === "core:statement" ||
+      node.type === "core:constraint" ||
+      node.type === "core:message" ||
+      !node.key
+    ) {
+      return false;
+    }
+    if (!scopesEqual(node.scope, scope) && !scopesEqual(node.scope, undefined)) return false;
+    return entitySurfaces(node).some((surface) => canonicalEntityKey(surface) === wanted);
+  });
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
 /**
  * Resolve and atomically commit one graph write plan.
  *
@@ -348,6 +374,37 @@ export function commitGraphWritePlan(
         scope: ctx.scope,
         attributes: draft.attributes,
         tags: draft.tags,
+        created_by: ctx.created_by,
+        created_at: ctx.createdAt,
+        source_refs: ctx.source_refs,
+      });
+      createdEdgeIds.push(edge.id);
+    }
+
+    // The organizer is asked to connect every relational fact to its object,
+    // but a model may occasionally omit an otherwise unambiguous core:about
+    // edge. Complete only the safest case here: the Claim value exactly names
+    // one in-scope (or global) Entity. Explicit model relations above win and
+    // keep their metadata. No fuzzy or semantic matching is used.
+    for (const draft of plan.facts) {
+      const statementId = refs[draft.ref];
+      if (!statementId) continue;
+      const requestedSubject = draft.content.subjectRef;
+      const subjectId = requestedSubject
+        ? refs[requestedSubject] ?? (graph.getNode(requestedSubject) ? requestedSubject : undefined)
+        : undefined;
+      const target = exactEntityObjectTarget(graph, draft.content.value, subjectId, ctx.scope);
+      if (!target) continue;
+      const duplicate = graph
+        .queryEdges({ type: "core:about", from: statementId, to: target.id })
+        .find((edge) => scopesEqual(edge.scope, ctx.scope));
+      if (duplicate) continue;
+      const edge = graph.addEdge({
+        type: "core:about",
+        from: statementId,
+        to: target.id,
+        scope: ctx.scope,
+        attributes: { inferred_by: "exact_entity_value" },
         created_by: ctx.created_by,
         created_at: ctx.createdAt,
         source_refs: ctx.source_refs,

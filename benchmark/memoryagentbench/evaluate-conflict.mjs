@@ -63,14 +63,15 @@ const scope = {
   phase_id: "history",
 };
 const sessionIds = graph.getAllEpisodes().map((episode) => episode.id);
+const maxGraphExpansionHits = Number(argValue("--graph-hits") ?? 4);
 const retrieval = cfg.embedding
   ? {
       ...cfg.retrieval,
       embedder: embeddingDriver(cfg),
       vectors: new SqliteVectorStore(graph),
-      maxGraphExpansionHits: Number(argValue("--graph-hits") ?? 4),
+      maxGraphExpansionHits,
     }
-  : { ...cfg.retrieval, mode: "lexical" };
+  : { ...cfg.retrieval, mode: "lexical", maxGraphExpansionHits };
 const forcedThinking = /glm-5\.3/i.test(cfg.llm?.model ?? "");
 const driver = recallOnly
   ? undefined

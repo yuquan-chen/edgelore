@@ -356,6 +356,64 @@ test("graph write: a later batch may reference one uniquely stored entity by key
   });
 });
 
+test("graph write: completes an omitted object edge for one exact Entity value", () => {
+  forBackend((graph) => {
+    const result = commitGraphWritePlan(
+      graph,
+      {
+        entities: [
+          { ref: "darwin", type: "world:person", key: "charles-darwin", value: "Charles Darwin" },
+          { ref: "amala", type: "world:person", key: "amala-paul", value: "Amala Paul" },
+        ],
+        facts: [
+          {
+            ref: "spouse",
+            content: {
+              dimensionKey: "spouse",
+              subjectRef: "darwin",
+              value: "Amala Paul",
+              cardinality: "single",
+            },
+          },
+        ],
+        relations: [],
+      },
+      aliceCtx,
+    );
+
+    const edges = graph.queryEdges({
+      type: "core:about",
+      from: result.refs.spouse,
+      to: result.refs.amala,
+    });
+    assert.equal(edges.length, 1);
+    assert.equal(edges[0]?.attributes.inferred_by, "exact_entity_value");
+  });
+});
+
+test("graph write: exact object completion skips substring and ambiguous identities", () => {
+  forBackend((graph) => {
+    commitGraphWritePlan(
+      graph,
+      {
+        entities: [
+          { ref: "usa", type: "world:place", key: "usa", value: "USA" },
+          { ref: "mercuryPerson", type: "world:person", key: "mercury", value: "Mercury" },
+          { ref: "mercuryPlace", type: "world:place", key: "mercury", value: "Mercury" },
+        ],
+        facts: [
+          { ref: "place", content: { dimensionKey: "place", value: "Jerusalem" } },
+          { ref: "name", content: { dimensionKey: "name", value: "Mercury" } },
+        ],
+        relations: [],
+      },
+      aliceCtx,
+    );
+
+    assert.equal(graph.queryEdges({ type: "core:about" }).length, 0);
+  });
+});
+
 test("graph write: a failed relation rolls the whole plan back", () => {
   forBackend((graph) => {
     const bad = hawaiiPlan();

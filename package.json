@@ -6,7 +6,7 @@
   "type": "module",
   "bin": {
     "edgelore": "dist/src/cli.js",
-    "edgelore-mcp": "dist/src/mcp/server.js"
+    "edgelore-mcp": "dist/src/mcp/main.js"
   },
   "engines": {
     "node": ">=22"

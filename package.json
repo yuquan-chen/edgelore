@@ -30,6 +30,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "cytoscape": "^3.34.3",
     "zod": "^3.25.76"
   }
 }

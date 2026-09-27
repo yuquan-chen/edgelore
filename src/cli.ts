@@ -101,6 +101,7 @@ async function main(): Promise<void> {
   const pos = positionals(argv);
   const dbPath = flags.get("db") ?? "./edgelore.db";
 
+  loadDotEnv(".env.local");
   if (pos[0] === "ui") {
     const rawPort = flags.get("port") ?? "4173";
     const port = Number(rawPort);

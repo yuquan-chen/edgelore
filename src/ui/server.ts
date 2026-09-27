@@ -1,13 +1,20 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { realpathSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { appendFileSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
 import { SqliteGraph } from "../store/sqlite.js";
 import { listConflicts } from "../agent/conflicts.js";
 import { slotLabel, slotSubjectRef } from "../agent/slots.js";
 import type { DimensionNode, GraphNode, StatementNode } from "../model/types.js";
+import { graphBrowserPage } from "./page.js";
 
 const maxNodes = 60;
 let graph: SqliteGraph;
+const sessions = new Map<string, number>();
+const loginAttempts = new Map<string, { count: number; blockedUntil: number }>();
+const sessionLifetimeMs = 12 * 60 * 60 * 1000;
+let passwordHash = process.env.EDGELORE_UI_PASSWORD_HASH ?? "";
 const send = (res: ServerResponse, status: number, data: unknown) => {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
@@ -160,7 +167,11 @@ function neighborhood(id: string, depth: number, cap: number) {
       for (const edge of links) {
         const targetId = edge.from === currentId ? edge.to : edge.from;
         const target = graph.getNode(targetId);
-        if (!target || nodes.has(targetId)) continue;
+        if (!target) continue;
+        if (nodes.has(targetId)) {
+          edges.set(edge.id, edge);
+          continue;
+        }
         if (nodes.size >= cap) break;
         nodes.set(targetId, target);
         next.add(targetId);
@@ -193,13 +204,20 @@ function api(req: IncomingMessage, res: ServerResponse, url: URL) {
   if (url.pathname === "/api/slots") {
     const q = (url.searchParams.get("q") ?? "").toLocaleLowerCase();
     const claims = graph.queryNodes({ type: "core:statement" }) as StatementNode[];
+    const claimsBySlot = new Map<string, StatementNode[]>();
+    for (const claim of claims) {
+      const members = claimsBySlot.get(claim.dimension_id) ?? [];
+      members.push(claim);
+      claimsBySlot.set(claim.dimension_id, members);
+    }
     const rows = (graph.queryNodes({ type: "core:dimension" }) as DimensionNode[])
       .map((s) => {
-        const members = claims
-          .filter((c) => c.dimension_id === s.id)
-          .sort((a, b) => b.created_at.localeCompare(a.created_at));
+        const members = (claimsBySlot.get(s.id) ?? []).sort((a, b) =>
+          b.created_at.localeCompare(a.created_at),
+        );
         return {
           id: s.id,
+          type: s.type,
           key: s.key,
           label: slotLabel(graph, s),
           subject_id: slotSubjectRef(s),
@@ -255,11 +273,133 @@ function api(req: IncomingMessage, res: ServerResponse, url: URL) {
   return result ? send(res, 200, result) : send(res, 404, { error: "node not found" });
 }
 
-const html = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EdgeLore Memory Explorer</title><style>
-:root{color-scheme:dark;--bg:#0b1118;--panel:#111b25;--line:#263847;--text:#e6eef4;--muted:#8ea3b4;--mint:#7fe1c0;--red:#ff8291;--amber:#ffce78}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,"Segoe UI",sans-serif}header{height:62px;padding:12px 22px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}h1{font-size:17px;margin:0}.mint{color:var(--mint)}.layout{height:calc(100vh - 62px);display:grid;grid-template-columns:300px 1fr 340px}aside,.detail{background:var(--panel);overflow:auto;padding:16px;border-right:1px solid var(--line)}main{overflow:auto}.stats{display:grid;grid-template-columns:1fr 1fr;gap:7px}.stat,.item{background:#15232e;border:1px solid var(--line);border-radius:8px;padding:10px}.stat b{display:block;color:var(--mint);font-size:20px}.stat small,.muted{color:var(--muted)}.tabs,.depth{display:flex;gap:5px;margin:12px 0}.tabs button,.depth button{flex:1}button,input{background:#14222d;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px;font:inherit;cursor:pointer}button:hover,.active{border-color:var(--mint);color:var(--mint)}input{width:100%;margin-bottom:9px;cursor:text}.item{display:block;text-align:left;width:100%;margin:6px 0;cursor:pointer}.item small{display:block;color:var(--muted)}.tag{font-size:10px;color:var(--mint);margin-left:5px}.tag.conflict{color:var(--red)}.head{padding:14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between}.graph{height:58vh;min-height:340px;border-bottom:1px solid var(--line);background-image:radial-gradient(#263b4b 1px,transparent 1px);background-size:22px 22px}.graph svg{width:100%;height:100%}.edge{stroke:#496172}.node rect{fill:#172833;stroke:#4d7180;rx:9}.node.root rect{fill:#173b34;stroke:var(--mint);stroke-width:2}.node text{fill:var(--text);font-size:11px}.node{cursor:pointer}.edge-label{fill:#9ab0bf;font-size:10px}.below{padding:15px}.placeholder{height:100%;display:grid;place-items:center;color:var(--muted);text-align:center}.detail h2{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin:18px 0 7px}.detail h3{overflow-wrap:anywhere}.kv{display:grid;grid-template-columns:85px 1fr;gap:7px;padding:7px 0;border-bottom:1px solid var(--line)}.kv label{color:var(--muted)}.kv div{overflow-wrap:anywhere}.source{white-space:pre-wrap;background:#0c151c;border-left:2px solid #89bfff;padding:9px;margin:6px 0}.warn{color:var(--amber)}@media(max-width:950px){.layout{grid-template-columns:250px 1fr}.detail{grid-column:1/-1;min-height:400px;border-top:1px solid var(--line)}}@media(max-width:620px){.layout{display:block;height:auto}aside,main,.detail{min-height:400px;border-right:0;border-bottom:1px solid var(--line)}.graph{height:380px}}
-</style><header><h1>EdgeLore <span class="mint">Memory Explorer</span></h1><span class="mint">本地只读</span></header><div class="layout"><aside><div class="stats" id="stats"></div><div class="tabs"><button class="active" data-k="slots">Slots</button><button data-k="entities">Entities</button><button data-k="conflicts">Conflicts</button></div><input id="q" placeholder="搜索 Slot / Entity"><div id="list"></div><button id="more">加载更多</button></aside><main><div class="head"><div><b id="focus">选择一个记忆对象</b><div class="muted">限深 3 跳 · 最多 60 个节点</div></div><div class="depth"><button data-d="1">1</button><button data-d="2" class="active">2</button><button data-d="3">3</button></div></div><div class="graph" id="graph"><div class="placeholder">从左侧选择一个 Slot、Entity 或冲突</div></div><div class="below" id="note" class="muted">局部邻域</div></main><section class="detail" id="detail"><div class="placeholder">Claim 值、状态、时间、Episode 原文、来源和关系</div></section></div><script>
-const $=s=>document.querySelector(s);let kind='slots',offset=0,depth=2,q='',chosen=null;async function get(u){let r=await fetch(u),d=await r.json();if(!r.ok)throw Error(d.error);return d}function kv(k,v){let x=document.createElement('div');x.className='kv';let a=document.createElement('label'),b=document.createElement('div');a.textContent=k;b.textContent=typeof v==='string'?v:JSON.stringify(v??'—');x.append(a,b);return x}async function load(reset=true){if(reset){offset=0;$('#list').innerHTML=''}let d=await get(kind==='conflicts'?'/api/conflicts?offset='+offset+'&limit=30':\`/api/\${kind}?offset=\${offset}&limit=30&q=\${encodeURIComponent(q)}\`);for(let row of d.items){let b=document.createElement('button');b.className='item';if(kind==='conflicts'){b.textContent=row.dimensionKey+' · '+row.incumbents.length+' incumbent · '+row.challengers.length+' challenger';b.onclick=()=>conflict(row)}else{b.innerHTML='<b></b><small></small>';b.querySelector('b').textContent=row.label;b.querySelector('small').textContent=(row.state||row.type)+' · '+(row.claimCount??row.id);b.onclick=()=>select(row)}$('#list').append(b)}offset+=d.items.length;$('#more').hidden=offset>=d.total;if(reset&&d.items[0]&&kind!=='conflicts')select(d.items[0])}function select(r){chosen=r;$('#focus').textContent=r.label||r.key;draw(r.id);if(r.type==='core:statement')detail(r.id);else show(r)}async function draw(id){let d=await get(\`/api/neighborhood/\${encodeURIComponent(id)}?depth=\${depth}&limit=60\`),box=$('#graph');box.innerHTML='';let w=Math.max(box.clientWidth,450),h=Math.max(box.clientHeight,340),cx=w/2,cy=h/2,pos=new Map;d.nodes.forEach((n,i)=>{let a=(i-1)*Math.PI*2/Math.max(1,d.nodes.length-1),r=i?Math.min(w,h)*.34:0;pos.set(n.id,[cx+Math.cos(a)*r,cy+Math.sin(a)*r])});let s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('viewBox',\`0 0 \${w} \${h}\`);for(let e of d.edges){let a=pos.get(e.from),b=pos.get(e.to);if(!a||!b)continue;let l=document.createElementNS(s.namespaceURI,'line');l.setAttribute('x1',a[0]);l.setAttribute('y1',a[1]);l.setAttribute('x2',b[0]);l.setAttribute('y2',b[1]);l.setAttribute('class','edge');s.append(l)}for(let n of d.nodes){let [x,y]=pos.get(n.id),g=document.createElementNS(s.namespaceURI,'g');g.setAttribute('class','node '+(n.id===id?'root':''));g.setAttribute('transform',\`translate(\${x-72},\${y-22})\`);let r=document.createElementNS(s.namespaceURI,'rect');r.setAttribute('width',144);r.setAttribute('height',44);g.append(r);let t=document.createElementNS(s.namespaceURI,'text');t.setAttribute('x',8);t.setAttribute('y',18);t.textContent=String(n.label).slice(0,22);g.append(t);let st=document.createElementNS(s.namespaceURI,'text');st.setAttribute('x',8);st.setAttribute('y',34);st.textContent=n.state||n.type;g.append(st);g.onclick=()=>n.type==='core:statement'?detail(n.id):show(n);s.append(g)}box.append(s);$('#note').textContent=\`展示 \${d.nodes.length} 个节点、\${d.edges.length} 条关系\${d.truncated?' · 达到节点上限':''}\`}function show(r){let d=$('#detail');d.innerHTML='<h2></h2><h3></h3>';d.querySelector('h2').textContent=r.type;d.querySelector('h3').textContent=r.label||r.key;for(let [k,v]of Object.entries(r))d.append(kv(k,v))}async function detail(id){let x=await get('/api/claims/'+encodeURIComponent(id)),n=x.node,d=$('#detail');d.innerHTML='<h2>Claim · '+n.state+'</h2><h3></h3>';d.querySelector('h3').textContent=JSON.stringify(n.value);for(let k of ['unit','created_at','updated_at','saidBy','created_by','scope','source_refs','schema_version','attributes'])d.append(kv(k,n[k]));if(x.slot)d.append(kv('Slot',x.slot.label));d.insertAdjacentHTML('beforeend','<h2>Episode 原文</h2>');for(let ep of x.episodes){d.append(kv('Episode',ep.id+' · '+ep.created_at));for(let t of ep.turns){let p=document.createElement('div');p.className='source';p.textContent=t.role+': '+t.content;d.append(p)}}d.insertAdjacentHTML('beforeend','<h2>关系 / 裁决历史</h2>');for(let e of x.edges)d.append(kv(e.type,(e.from_node?.label||e.from)+' → '+(e.to_node?.label||e.to)+' · '+e.created_by+' · '+e.created_at))}function conflict(c){let d=$('#detail');d.innerHTML='<h2 class="warn">Conflict docket · 待裁决</h2><h3></h3><p class="muted">只读查看，不提供裁决操作</p>';d.querySelector('h3').textContent=c.dimensionKey;for(let [k,items]of [['Incumbents',c.incumbents],['Challengers',c.challengers]]){d.insertAdjacentHTML('beforeend','<h2>'+k+'</h2>');for(let x of items){let b=document.createElement('button');b.className='item';b.textContent=JSON.stringify(x.value)+' · '+x.state+' · '+x.createdAt+' · '+x.createdBy;b.onclick=()=>detail(x.statementId);d.append(b)}}}get('/api/summary').then(s=>$('#stats').innerHTML=Object.entries({Slots:s.slots,Claims:s.claims,Entities:s.entities,Conflicts:s.conflicts}).map(([k,v])=>'<div class="stat"><b>'+v+'</b><small>'+k+'</small></div>').join('')).then(load);document.querySelectorAll('[data-k]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-k]').forEach(x=>x.classList.remove('active'));b.classList.add('active');kind=b.dataset.k;load()});document.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>{depth=+b.dataset.d;document.querySelectorAll('[data-d]').forEach(x=>x.classList.remove('active'));b.classList.add('active');if(chosen)draw(chosen.id)});$('#q').oninput=e=>{q=e.target.value;clearTimeout(window.timer);window.timer=setTimeout(load,180)};$('#more').onclick=()=>load(false);
+const html = graphBrowserPage;
+const require = createRequire(import.meta.url);
+const cytoscapeModule = readFileSync(
+  resolve(dirname(require.resolve("cytoscape")), "cytoscape.esm.min.mjs"),
+  "utf8",
+);
+const cytoscapeBundle = Buffer.from(
+  `window.cytoscape=(function(){${cytoscapeModule.replace(/export\{Gh as default\};\s*$/, "return Gh;")}})();`,
+);
+const loginPage = String.raw`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EdgeLore · Login</title><style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f7fa;color:#263241;font:14px/1.5 system-ui,"Segoe UI",sans-serif}.card{width:min(390px,calc(100% - 32px));padding:30px;border:1px solid #e1e6ed;border-radius:14px;background:#fff;box-shadow:0 12px 36px #25364a0b}.brand{font-weight:750;font-size:18px}.sub{margin:7px 0 22px;color:#748194;font-size:12px}.tag{display:inline-block;margin:0 0 14px;padding:4px 8px;border-radius:999px;background:#f1f5f8;color:#657489;font-size:10px;letter-spacing:.04em}h1{margin:0;font-size:20px}p{color:#68778a;font-size:12px}label{display:block;margin:16px 0 6px;color:#526176;font-size:12px}input{width:100%;padding:11px 12px;border:1px solid #dbe2e9;border-radius:7px;background:#fbfcfe;color:#273547;font:inherit;outline:0}input:focus{border-color:#96aabd;box-shadow:0 0 0 3px #e7edf355}button{width:100%;margin-top:17px;padding:10px 12px;border:1px solid #526e88;border-radius:7px;background:#526e88;color:white;font:inherit;font-weight:650;cursor:pointer}button:hover{background:#435e78}.error{min-height:20px;margin-top:10px;color:#b85d65;font-size:12px}.fine{margin-top:18px;color:#8490a0;font-size:10px}
+</style><main class="card"><div class="brand">EdgeLore</div><div class="sub">Local Memory Graph</div><span class="tag">LOCAL · READ ONLY</span><h1 id="title">Sign in</h1><p id="description">Enter your local access credentials to open the memory graph.</p><form id="auth-form"><label for="username">Username</label><input id="username" autocomplete="username" required value="root"><div id="confirm-wrap" hidden><label for="confirm">Confirm password</label><input id="confirm" type="password" autocomplete="new-password"></div><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required minlength="6"><button id="submit" type="submit">Sign in</button><div class="error" id="error" role="alert"></div></form><div class="fine">Passwords stay on this machine. Sessions expire after 12 hours and are cleared when the server restarts.</div></main><script>
+const $=id=>document.getElementById(id);let setup=false;async function init(){const r=await fetch("/api/auth/status");const d=await r.json();setup=d.setupRequired;if(setup){$("title").textContent="Set up local access";$("description").textContent="Create the local root account. Only a password hash is stored.";$("confirm-wrap").hidden=false;$("confirm").required=true;$("confirm").autocomplete="new-password";$("password").autocomplete="new-password";$("submit").textContent="Create account"}}$("auth-form").addEventListener("submit",async e=>{e.preventDefault();$("error").textContent="";const password=$("password").value,username=$("username").value;if(setup&&password!==$("confirm").value){$("error").textContent="Passwords do not match.";return}try{const r=await fetch(setup?"/api/auth/setup":"/api/auth/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({username,password})});const d=await r.json();if(!r.ok)throw Error(d.error||"Sign in failed.");location.reload()}catch(err){$("error").textContent=err.message}});init().catch(()=>$("error").textContent="Could not reach the local server.");
 </script></html>`;
+
+function sendPage(res: ServerResponse, page: string): void {
+  res.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "content-security-policy":
+      "default-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'",
+  });
+  res.end(page);
+}
+function sessionFor(req: IncomingMessage): string | undefined {
+  const cookie = req.headers.cookie?.split(";").map((part) => part.trim()) ?? [];
+  const token = cookie.find((part) => part.startsWith("edgelore_session="))?.slice(17);
+  if (!token) return undefined;
+  const expires = sessions.get(token);
+  if (!expires || expires <= Date.now()) {
+    sessions.delete(token);
+    return undefined;
+  }
+  return token;
+}
+function passwordMatches(candidate: string): boolean {
+  const [scheme, salt, expectedHex] = passwordHash.split("$");
+  if (scheme !== "scrypt" || !salt || !expectedHex) return false;
+  const expected = Buffer.from(expectedHex, "hex");
+  const actual = scryptSync(candidate, salt, expected.length);
+  return expected.length > 0 && timingSafeEqual(actual, expected);
+}
+async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  let body = "";
+  for await (const chunk of req) {
+    body += chunk.toString();
+    if (body.length > 4096) throw new Error("request too large");
+  }
+  const parsed: unknown = JSON.parse(body || "{}");
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    throw new Error("invalid request");
+  return parsed as Record<string, unknown>;
+}
+function localOrigin(req: IncomingMessage): boolean {
+  const host = req.headers.host;
+  return !!host && req.headers.origin === `http://${host}` && /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host);
+}
+function issueSession(res: ServerResponse): void {
+  const token = randomBytes(32).toString("base64url");
+  sessions.set(token, Date.now() + sessionLifetimeMs);
+  res.setHeader("set-cookie", `edgelore_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`);
+  send(res, 200, { ok: true });
+}
+async function authRoute(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+  if (url.pathname === "/api/auth/status" && req.method === "GET") {
+    send(res, 200, { setupRequired: !passwordHash });
+    return true;
+  }
+  if (url.pathname === "/api/auth/logout" && req.method === "POST") {
+    const token = sessionFor(req);
+    if (token) sessions.delete(token);
+    res.setHeader("set-cookie", "edgelore_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    send(res, 200, { ok: true });
+    return true;
+  }
+  if ((url.pathname !== "/api/auth/login" && url.pathname !== "/api/auth/setup") || req.method !== "POST")
+    return false;
+  if (!localOrigin(req)) {
+    send(res, 403, { error: "request origin rejected" });
+    return true;
+  }
+  const address = req.socket.remoteAddress ?? "unknown";
+  const attempts = loginAttempts.get(address) ?? { count: 0, blockedUntil: 0 };
+  if (attempts.blockedUntil > Date.now()) {
+    send(res, 429, { error: "too many attempts; try again later" });
+    return true;
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = await readJson(req);
+  } catch {
+    send(res, 400, { error: "invalid request" });
+    return true;
+  }
+  const candidate = typeof body.password === "string" ? body.password : "";
+  const username = typeof body.username === "string" ? body.username : "";
+  if (url.pathname.endsWith("/setup")) {
+    if (passwordHash) {
+      send(res, 409, { error: "local access is already set up" });
+      return true;
+    }
+    if (username !== "root" || candidate.length < 6 || candidate.length > 1024) {
+      send(res, 400, { error: "username must be root and password must be between 6 and 1024 characters" });
+      return true;
+    }
+    const salt = randomBytes(16).toString("hex");
+    const derived = scryptSync(candidate, salt, 64).toString("hex");
+    passwordHash = `scrypt$${salt}$${derived}`;
+    appendFileSync(resolve(".env.local"), `\nEDGELORE_UI_PASSWORD_HASH=${passwordHash}\n`, { encoding: "utf8", mode: 0o600 });
+    issueSession(res);
+    return true;
+  }
+  if (username !== "root" || !passwordMatches(candidate)) {
+    attempts.count += 1;
+    if (attempts.count >= 8) {
+      attempts.count = 0;
+      attempts.blockedUntil = Date.now() + 5 * 60 * 1000;
+    }
+    loginAttempts.set(address, attempts);
+    send(res, 401, { error: "incorrect password" });
+    return true;
+  }
+  loginAttempts.delete(address);
+  issueSession(res);
+  return true;
+}
 
 export function startMemoryExplorer(
   dbPath: string,
@@ -268,8 +408,27 @@ export function startMemoryExplorer(
   const path = realpathSync(resolve(dbPath));
   if (!statSync(path).isFile()) throw new Error("--db must point to an existing SQLite file");
   graph = new SqliteGraph(path, { readOnly: true });
-  const server = createServer((req, res) => {
+  const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    try {
+      if (await authRoute(req, res, url)) return;
+      if (!sessionFor(req)) {
+        if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+          sendPage(res, loginPage);
+          return;
+        }
+        send(res, 401, { error: "authentication required" });
+        return;
+      }
+    if (url.pathname === "/assets/cytoscape.js" && req.method === "GET") {
+      res.writeHead(200, {
+        "content-type": "text/javascript; charset=utf-8",
+        "cache-control": "public, max-age=86400",
+        "x-content-type-options": "nosniff",
+      });
+      res.end(cytoscapeBundle);
+      return;
+    }
     if (url.pathname.startsWith("/api/")) return api(req, res, url);
     if (req.method !== "GET") return send(res, 405, { error: "read-only UI: GET only" });
     if (url.pathname !== "/" && url.pathname !== "/index.html")
@@ -279,9 +438,13 @@ export function startMemoryExplorer(
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
       "content-security-policy":
-        "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
+        "default-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'",
     });
     res.end(html);
+    } catch {
+      if (!res.headersSent) send(res, 500, { error: "local server error" });
+      else res.destroy();
+    }
   });
   server.listen(port, "127.0.0.1");
   return {
